@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "khalib"
+version = "0.1b0"
+description = "Classifier Calibration with Khiops"
+authors = [{ name = "Felipe Olmos", email = "luisfelipe.olmosmarchant@orange.com" }]
+
+[tools.setuptools]
+packages = ["khcalib"]
+requires-python = ">=3.11"
+dependencies = ["khiops>=11.0.0.0b0"]
+
+
