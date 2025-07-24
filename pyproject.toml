@@ -13,4 +13,35 @@ packages = ["khcalib"]
 requires-python = ">=3.11"
 dependencies = ["khiops>=11.0.0.0b0"]
 
-
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "N",    # pep8-naming
+    "NPY",  # numpy
+    "PD",   # pandas-vet
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "TID",  # tidy imports
+    "PT",   # flake8-pytest-style
+    "PL",   # pylint rules
+]
+ignore = [
+  "PLR0904", # too-many-public-methods
+  "PLR0911", # too-many-return-statements
+  "PLR0912", # too-many-branches
+  "PLR0913", # too-many-arguments
+  "PLR0914", # too-many-locals
+  "PLR0915", # too-many-statements
+  "PLR0916", # too-many-boolean-expressions
+  "PLR1702", # too-many-nested-blocks
+  "PLR2004", # magic-value-comparison
+  "PLW0120", # useless-else-on-loop
+  "PLW0406", # import-self
+  "PLW0603", # global-statement
+]
+# To fix by default isort fixes
+extend-safe-fixes = ["I"]

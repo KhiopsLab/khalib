@@ -1,11 +1,9 @@
-import json
 import math
 import os
+import shutil
 import tempfile
-import subprocess
 import warnings
 from bisect import bisect_left
-import shutil
 
 import numpy as np
 import pandas as pd
@@ -29,17 +27,19 @@ class KhiopsDataBinner:
             os.environ["KHIOPS_PROC_NUMBER"] = default_max_cores
 
     def compute_bins(
-        self, y_scores, y=None, method="MODL", max_parts=0, return_freqs=False, cleanup=True
+        self,
+        y_scores,
+        y=None,
+        method="MODL",
+        max_parts=0,
+        cleanup=True,
     ):
         results = self._compute_bins_with_khiops(
             y_scores, y=y, method=method, max_parts=max_parts
         )
         bins, freqs = self._extract_bins_and_freq(results)
 
-        if return_freqs:
-            return bins, freqs
-        else:
-            return bins
+        return bins, freqs
 
     def _compute_bins_with_khiops(
         self, y_scores, y=None, method="MODL", max_parts=0, cleanup=True
@@ -108,7 +108,6 @@ class KhiopsDataBinner:
 
         return results
 
-
     def _extract_bins_and_freq(self, results):
         # Recover the bins from the variable statistics objects
         score_stats = results.preparation_report.variables_statistics[0]
@@ -135,11 +134,10 @@ khiops_binner = KhiopsDataBinner()
 
 
 def robust_estimate_binary_ece(y, y_scores, y_pos, return_estimations=False):
-    global khiops_binner
-    bins = khiops_binner.compute_bins(
+    bins, _ = khiops_binner.compute_bins(
         y_scores, y, method="EqualFrequency", max_parts=math.ceil(math.sqrt(len(y)))
     )
-    return plugin_binary_ece(
+    return binary_ece_lb(
         y,
         y_scores,
         y_pos,
@@ -192,7 +190,7 @@ def find_bin(value, bins):
 def binary_ece_knn(y, y_scores, y_pos):
     k = int(math.sqrt(len(y)))
 
-    zipped_y = sorted(list(zip(y, y_scores)), key=lambda k: k[1])
+    zipped_y = sorted(zip(y, y_scores), key=lambda k: k[1])
 
     # Initialize windows sums
     win_sum_y = 0
@@ -224,7 +222,7 @@ def binary_ece_bin(y, y_scores, y_pos, bins, return_estimations=False, debias=Fa
         if y_value == y_pos:
             accuracy_by_bin[i_bin] += 1
     if return_estimations:
-        df = pd.DataFrame(
+        estimations_df = pd.DataFrame(
             {"freq": n_samples_by_bin, "freq_pos": accuracy_by_bin}, index=bins
         )
     for i in range(0, len(bins)):
@@ -233,8 +231,8 @@ def binary_ece_bin(y, y_scores, y_pos, bins, return_estimations=False, debias=Fa
             accuracy_by_bin[i] /= n_samples_by_bin[i]
 
     if return_estimations:
-        df["ave_score"] = average_score_by_bin
-        df["acc"] = accuracy_by_bin
+        estimations_df["ave_score"] = average_score_by_bin
+        estimations_df["acc"] = accuracy_by_bin
 
     ece = 0
     for i in range(0, len(bins)):
@@ -256,11 +254,12 @@ def binary_ece_bin(y, y_scores, y_pos, bins, return_estimations=False, debias=Fa
             ave_bins_abs_diffs = []
         ece = 2 * ece
         debias_samples = 100
+        rng = np.random.default_rng()
         for i in range(0, len(bins)):
             # binomial_samples = np.random.binomial(
             # size=debias_samples, n=n_samples_by_bin[i], p=accuracy_by_bin[i]
             # )
-            samples = np.random.normal(
+            samples = rng.normal(
                 size=debias_samples, loc=accuracy_by_bin[i], scale=std_devs[i]
             )
             bin_bias_abs_diffs = np.abs(samples - average_score_by_bin[i])
@@ -270,14 +269,13 @@ def binary_ece_bin(y, y_scores, y_pos, bins, return_estimations=False, debias=Fa
             if return_estimations:
                 bin_biases.append(bin_bias)
                 ave_bins_abs_diffs.append(ave_bin_abs_diff)
-        if ece <= 0.0:
-            ece = 0.0
+        ece = max(0.0, ece)
 
         if return_estimations:
-            df["bias"] = bin_biases
+            estimations_df["bias"] = bin_biases
 
     if return_estimations:
-        return ece, df
+        return ece, estimations_df
     else:
         return ece
 
@@ -295,7 +293,7 @@ def binary_ece_lb(y, y_scores, y_pos, bins, return_estimations=False):
             accuracy_by_bin[i_y_score_bin] += 1
 
     if return_estimations:
-        df = pd.DataFrame(
+        estimations_df = pd.DataFrame(
             {"freq": n_samples_by_bin, "freq_pos": accuracy_by_bin}, index=bins
         )
     for i in range(0, len(bins)):
@@ -311,21 +309,17 @@ def binary_ece_lb(y, y_scores, y_pos, bins, return_estimations=False):
             diff_ave[i] /= n_samples_by_bin[i]
 
     if return_estimations:
-        df["acc"] = accuracy_by_bin
-        df["diff_ave"] = diff_ave
+        estimations_df["acc"] = accuracy_by_bin
+        estimations_df["diff_ave"] = diff_ave
 
     ece = 0
     for i in range(0, len(bins)):
         ece += n_samples_by_bin[i] / len(y) * diff_ave[i]
 
     if return_estimations:
-        return ece, df
+        return ece, estimations_df
     else:
         return ece
-
-
-def binary_ece_lb_alt(y, y_scores, y_pos, bins, return_estimations=False):
-    pass
 
 
 # Set a single core runner for the calibration
@@ -343,7 +337,6 @@ else:
 def run_with_single_core(func):
     def _run_with_single_core(self, *args, **kwargs):
         default_runner = kh.get_runner()
-        global khcalib_runner
         kh.set_runner(khcalib_runner)
         result = func(self, *args, **kwargs)
         kh.set_runner(default_runner)
@@ -353,12 +346,13 @@ def run_with_single_core(func):
 
 
 class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
+    # noqa: N803
     def __init__(self, clf, normalize=False):
         self.clf = clf
         self.normalize = normalize
 
     @run_with_single_core
-    def fit(self, X, y):
+    def fit(self, X, y):  # noqa: N803
         probas = self.clf.predict_proba(X)
         if len(self.clf.classes_) == 2:
             self.calibrator_ = KhiopsClassifier(n_trees=0)
@@ -376,7 +370,7 @@ class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         return self
 
     @run_with_single_core
-    def predict_proba(self, X):
+    def predict_proba(self, X):  # noqa: N803
         y_scores = self.clf.predict_proba(X)
         if len(self.clf.classes_) == 2:
             with warnings.catch_warnings():
