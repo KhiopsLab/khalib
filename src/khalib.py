@@ -1,9 +1,9 @@
 import math
 import os
-import shutil
 import tempfile
 import warnings
 from bisect import bisect_left
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -13,128 +13,167 @@ from khiops.sklearn import KhiopsClassifier
 from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin
 from sklearn.preprocessing import label_binarize, normalize
 
+# Build a Khiops runner with one core
+# This is faster for the calibration use-cases
+default_max_cores = os.environ.get("KHIOPS_PROC_NUMBER")
+os.environ["KHIOPS_PROC_NUMBER"] = "1"
+with warnings.catch_warnings():
+    warnings.filterwarnings(action="ignore", message=".*Too few cores:.*")
+    khiops_single_core_runner = KhiopsLocalRunner()
+    if default_max_cores is None:
+        del os.environ["KHIOPS_PROC_NUMBER"]
+    else:
+        os.environ["KHIOPS_PROC_NUMBER"] = default_max_cores
 
-class KhiopsDataBinner:
-    def __init__(self):
-        default_max_cores = os.environ.get("KHIOPS_PROC_NUMBER")
-        os.environ["KHIOPS_PROC_NUMBER"] = "1"
-        with warnings.catch_warnings():
-            warnings.filterwarnings(action="ignore", message=".*Too few cores:.*")
-            self.runner = KhiopsLocalRunner()
-        if default_max_cores is None:
-            del os.environ["KHIOPS_PROC_NUMBER"]
-        else:
-            os.environ["KHIOPS_PROC_NUMBER"] = default_max_cores
 
-    def compute_bins(
-        self,
-        y_scores,
-        y=None,
-        method="MODL",
-        max_parts=0,
-        cleanup=True,
-    ):
-        results = self._compute_bins_with_khiops(
-            y_scores, y=y, method=method, max_parts=max_parts
-        )
-        bins, freqs = self._extract_bins_and_freq(results)
+def run_with_single_core(func):
+    """Decorator function to run Khiops with a single core
 
-        return bins, freqs
+    This is faster for many calibration calculations.
+    """
 
-    def _compute_bins_with_khiops(
-        self, y_scores, y=None, method="MODL", max_parts=0, cleanup=True
-    ):
-        assert y is None or (len(y.shape) == 1 or y.shape[1] == 1)
-        assert len(y_scores.shape) == 1 or y_scores.shape[1] == 1
+    def _run_with_single_core(self, *args, **kwargs):
+        default_runner = kh.get_runner()
+        kh.set_runner(khiops_single_core_runner)
+        result = func(self, *args, **kwargs)
+        kh.set_runner(default_runner)
+        return result
 
-        # Create Khiops dictionary
-        kdom = kh.DictionaryDomain()
-        kdic = kh.Dictionary()
-        kdic.name = "scores"
-        kdom.add_dictionary(kdic)
+    return _run_with_single_core
+
+
+@run_with_single_core
+def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
+    """Computes a binning of an 1D vector with Khiops
+
+    Parameters
+    ----------
+    y_scores : array-like of shape (n_samples,) or (n_samples, 1)
+        Input scores.
+    y : array-like of shape (n_samples,) or (n_samples, 1), optional
+        Target values. If set, then the method parameters is ignored and set to "MODL".
+    method : {"MODL", "EqualFreq", "EqualWidth"}, default="MODL"
+        Binning method:
+
+        - "MODL": A non-parametric regularized binning method.
+        - "EqualFreq": All bins have the same number of elements. If many instances have
+          too many values the algorithm will put it in its own bin, which will be larger
+          than the other ones.
+        - "EqualWidth": All bins have the same width.
+    max_bins: int, default=0
+        The maximum number of bins to be created. The algorithms usually create this
+        number of bins but they may create less. The default value 0 means that there is
+        no limit to the number of intervals.
+
+    Returns
+    -------
+    `NamedTuple`
+        A named tuple with fields:
+
+        - bins: The bins as 2-tuples.
+        - freqs: The frequencies of each bin.
+        - target_freqs: The frequencies of the target.
+    """
+    # Check inputs
+    if len(y_scores.shape) > 1 and y_scores.shape[1] > 1:
+        raise ValueError(f"y_scores must be 1-D but it has shape {y_scores.shape}.")
+    if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
+        raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
+    valid_methods = ["MODL", "EqualFreq", "EqualWidth"]
+    if method not in valid_methods:
+        raise ValueError(f"method must be in {valid_methods}. It is '{method}'")
+    if max_bins < 0:
+        raise ValueError(f"max_bins must be non-negative. It is {max_bins}")
+
+    # Create Khiops dictionary
+    kdom = kh.DictionaryDomain()
+    kdic = kh.Dictionary()
+    kdic.name = "scores"
+    kdom.add_dictionary(kdic)
+    var = kh.Variable()
+    var.name = "y_score"
+    var.type = "Numerical"
+    kdic.add_variable(var)
+    if y is not None:
         var = kh.Variable()
-        var.name = "y_score"
-        var.type = "Numerical"
+        var.name = "y"
+        var.type = "Categorical"
         kdic.add_variable(var)
-        if y is not None:
-            var = kh.Variable()
-            var.name = "y"
-            var.type = "Categorical"
-            kdic.add_variable(var)
 
-        # Create output dataframe
+    # Work in a temporary directory
+    with tempfile.TemporaryDirectory(prefix="khiops-bins_") as work_dir:
+        # Create data table file for khiops
         df_spec = {
             "y_score": y_scores if len(y_scores.shape) == 1 else y_scores.flatten()
         }
         if y is not None:
             df_spec["y"] = y if len(y.shape) == 1 else y.flatten()
         output_df = pd.DataFrame(df_spec)
-
-        # Export the output dataframe to a temporary file
-        tmp_dir = tempfile.mkdtemp()
-        output_table_path = f"{tmp_dir}/y_scores.txt"
+        output_table_path = f"{work_dir}/y_scores.txt"
         output_df.to_csv(output_table_path, sep="\t", index=False)
 
-        # Execute Khiops recover the report
+        # Capture the "no informative variable" warning
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 action="ignore",
                 message="(?s:.*No informative input variable available.*)",
             )
-            default_runner = kh.get_runner()
-            kh.set_runner(self.runner)
+
+            # Execute Khiops recover the report
             kh.train_predictor(
                 kdom,
                 "scores",
                 output_table_path,
                 "y" if y is not None else "",
-                f"{tmp_dir}/report.khj",
+                f"{work_dir}/report.khj",
                 sample_percentage=100,
                 field_separator="\t",
                 header_line=True,
                 max_trees=0,
                 discretization_method=method,
-                max_parts=max_parts,
+                max_parts=max_bins,
                 do_data_preparation_only=True,
             )
-            kh.set_runner(default_runner)
-        results = kh.read_analysis_results_file(f"{tmp_dir}/report.khj")
+            results = kh.read_analysis_results_file(f"{work_dir}/report.khj")
 
-        # Cleanup if necessary
-        if cleanup:
-            shutil.rmtree(tmp_dir)
+    # Recover the bins from the variable statistics objects
+    # Normal case: There is a data grid
+    bins = []
+    freqs = []
+    score_stats = results.preparation_report.variables_statistics[0]
+    if score_stats.data_grid is not None:
+        if score_stats.data_grid.is_supervised:
+            for part in score_stats.data_grid.dimensions[0].partition:
+                bins.append(Bin(left=part.lower_bound, right=part.upper_bound))
+                for target_freqs in score_stats.data_grid.part_target_frequencies:
+                    freqs.append(np.sum(target_freqs))
         else:
-            print(f"Khiops execution files available at {tmp_dir}")
-
-        return results
-
-    def _extract_bins_and_freq(self, results):
-        # Recover the bins from the variable statistics objects
-        score_stats = results.preparation_report.variables_statistics[0]
-        bins = []
-        freqs = []
-        if score_stats.data_grid is not None:
-            if score_stats.data_grid.is_supervised:
-                for part in score_stats.data_grid.dimensions[0].partition:
-                    bins.append((part.lower_bound, part.upper_bound))
-                    for target_freqs in score_stats.data_grid.part_target_frequencies:
-                        freqs.append(np.sum(target_freqs))
-            else:
-                for part in score_stats.data_grid.dimensions[0].partition:
-                    bins.append((part.lower_bound, part.upper_bound))
-                freqs.extend(score_stats.data_grid.frequencies)
-        # If there are no variable grids for the variable
+            for part in score_stats.data_grid.dimensions[0].partition:
+                bins.append(Bin(left=part.lower_bound, right=part.upper_bound))
+            freqs.extend(score_stats.data_grid.frequencies)
+    # Otherwise we just send an "epsilon" interval containing the only value
+    else:
+        if score_stats.min < score_stats.max:
+            bins.append(Bin(left=score_stats.min, right=score_stats.max))
         else:
-            bins.append((score_stats.min, score_stats.max + 1e-8))
-            freqs.append(results.preparation_report.instance_number)
-        return bins, freqs
+            bins.append(Bin(left=score_stats.min, right=score_stats.max + 1.0e-9))
+        freqs.append(results.preparation_report.instance_number)
+
+    return Binning(bins=bins, freqs=freqs)
 
 
-khiops_binner = KhiopsDataBinner()
+class Bin(NamedTuple):
+    left: float
+    right: float
+
+
+class Binning(NamedTuple):
+    bins: list[Bin]
+    freqs: list[int]
 
 
 def robust_estimate_binary_ece(y, y_scores, y_pos, return_estimations=False):
-    bins, _ = khiops_binner.compute_bins(
+    bins, _ = compute_khiops_bins(
         y_scores, y, method="EqualFrequency", max_parts=math.ceil(math.sqrt(len(y)))
     )
     return binary_ece_lb(
@@ -241,38 +280,6 @@ def binary_ece_bin(y, y_scores, y_pos, bins, return_estimations=False, debias=Fa
             / len(y)
             * math.fabs(average_score_by_bin[i] - accuracy_by_bin[i])
         )
-    if debias:
-        # Estimate the normal standard deviations
-        std_devs = accuracy_by_bin * (1 - accuracy_by_bin)
-        for i in range(len(std_devs)):
-            if std_devs[i] > 0:
-                std_devs[i] /= n_samples_by_bin[i]
-                std_devs[i] = math.sqrt(std_devs[i])
-
-        if return_estimations:
-            bin_biases = []
-            ave_bins_abs_diffs = []
-        ece = 2 * ece
-        debias_samples = 100
-        rng = np.random.default_rng()
-        for i in range(0, len(bins)):
-            # binomial_samples = np.random.binomial(
-            # size=debias_samples, n=n_samples_by_bin[i], p=accuracy_by_bin[i]
-            # )
-            samples = rng.normal(
-                size=debias_samples, loc=accuracy_by_bin[i], scale=std_devs[i]
-            )
-            bin_bias_abs_diffs = np.abs(samples - average_score_by_bin[i])
-            ave_bin_abs_diff = np.average(bin_bias_abs_diffs)
-            bin_bias = n_samples_by_bin[i] / len(y) * ave_bin_abs_diff
-            ece -= bin_bias
-            if return_estimations:
-                bin_biases.append(bin_bias)
-                ave_bins_abs_diffs.append(ave_bin_abs_diff)
-        ece = max(0.0, ece)
-
-        if return_estimations:
-            estimations_df["bias"] = bin_biases
 
     if return_estimations:
         return ece, estimations_df
@@ -286,11 +293,11 @@ def binary_ece_lb(y, y_scores, y_pos, bins, return_estimations=False):
     y_score_bin_indexes = []
 
     for y_value, y_score in zip(y, y_scores):
-        i_y_score_bin = find_bin(y_score, bins)
-        y_score_bin_indexes.append(i_y_score_bin)
-        n_samples_by_bin[i_y_score_bin] += 1
+        y_score_i_bin = find_bin(y_score, bins)
+        y_score_bin_indexes.append(y_score_i_bin)
+        n_samples_by_bin[y_score_i_bin] += 1
         if y_value == y_pos:
-            accuracy_by_bin[i_y_score_bin] += 1
+            accuracy_by_bin[y_score_i_bin] += 1
 
     if return_estimations:
         estimations_df = pd.DataFrame(
@@ -320,29 +327,6 @@ def binary_ece_lb(y, y_scores, y_pos, bins, return_estimations=False):
         return ece, estimations_df
     else:
         return ece
-
-
-# Set a single core runner for the calibration
-default_core_number = os.environ.get("KHIOPS_PROC_NUMBER")
-os.environ["KHIOPS_PROC_NUMBER"] = "1"
-with warnings.catch_warnings():
-    warnings.filterwarnings(action="ignore", message=".*Too few cores:.*")
-    khcalib_runner = KhiopsLocalRunner()
-if default_core_number is None:
-    del os.environ["KHIOPS_PROC_NUMBER"]
-else:
-    os.environ["KHIOPS_PROC_NUMBER"] = default_core_number
-
-
-def run_with_single_core(func):
-    def _run_with_single_core(self, *args, **kwargs):
-        default_runner = kh.get_runner()
-        kh.set_runner(khcalib_runner)
-        result = func(self, *args, **kwargs)
-        kh.set_runner(default_runner)
-        return result
-
-    return _run_with_single_core
 
 
 class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
