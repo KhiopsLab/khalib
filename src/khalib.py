@@ -247,16 +247,14 @@ class Binning:
         return tuple(self.breakpoints[i : i + 2])
 
 
-def robust_estimate_binary_ece(y, y_scores, y_pos, return_estimations=False):
+def robust_estimate_binary_ece(y, y_scores, y_pos):
     bins, _ = compute_khiops_bins(
         y_scores, y, method="EqualFrequency", max_parts=math.ceil(math.sqrt(len(y)))
     )
-    return binary_ece_lb(
-        y,
+    return binary_ece(
         y_scores,
-        y_pos,
-        bins,
-        return_estimations=return_estimations,
+        y,
+        method="label-bin",
     )
 
 
@@ -323,85 +321,59 @@ def binary_ece_knn(y, y_scores, y_pos):
     return diff_sum / (len(y) * k)
 
 
-def binary_ece_bin(y, y_scores, y_pos, bins, return_estimations=False, debias=False):
-    """Estimates the ECE_bin estimator (also known as "plugin")"""
-    accuracy_by_bin = np.zeros(len(bins))
-    average_score_by_bin = np.zeros(len(bins))
-    n_samples_by_bin = np.zeros(len(bins))
+def binary_ece(y_scores, y, method="label-bin", binning_method="MODL", max_bins=0):
+    """Estimates the ECE for a pair of score and label vectors
 
-    for y_value, y_score in zip(y, y_scores):
-        i_bin = find_bin(y_score, bins)
-        average_score_by_bin[i_bin] += y_score
-        n_samples_by_bin[i_bin] += 1
-        if y_value == y_pos:
-            accuracy_by_bin[i_bin] += 1
-    if return_estimations:
-        estimations_df = pd.DataFrame(
-            {"freq": n_samples_by_bin, "freq_pos": accuracy_by_bin}, index=bins
-        )
-    for i in range(0, len(bins)):
-        if n_samples_by_bin[i] > 0:
-            average_score_by_bin[i] /= n_samples_by_bin[i]
-            accuracy_by_bin[i] /= n_samples_by_bin[i]
+    Parameters
+    ----------
+    y_scores : array-like of shape (n_samples,) or (n_samples, 1)
+        Input scores.
+    y : array-like of shape (n_samples,) or (n_samples, 1)
+        Target values. Must have exactly 2 different values.
+    method: {"label-bin", "bin"}, default="label-bin"
+        ECE estimation method. See below for details.
+    binning_method: {"MODL", "EqualFrequency", "EqualWidth"}, default="MODL"
+        Binning method:
 
-    if return_estimations:
-        estimations_df["ave_score"] = average_score_by_bin
-        estimations_df["acc"] = accuracy_by_bin
+        - "MODL": A non-parametric regularized binning method.
+        - "EqualFrequency": All bins have the same number of elements. If many instances
+          have too many values the algorithm will put it in its own bin, which will be
+          larger than the other ones.
+        - "EqualWidth": All bins have the same width.
 
-    ece = 0
-    for i in range(0, len(bins)):
-        ece += (
-            n_samples_by_bin[i]
-            / len(y)
-            * math.fabs(average_score_by_bin[i] - accuracy_by_bin[i])
-        )
+        If the method is set to "EqualFrequency" or "EqualWidth" is set then 'y' is
+        ignored.
+    max_bins: int, default=0
+        The maximum number of bins to be created. The algorithms usually create this
+        number of bins but they may create less. The default value 0 means that there is
+        no limit to the number of intervals.
+    """
+    binning = compute_khiops_bins(
+        y_scores, y=y, method=binning_method, max_bins=max_bins
+    )
+    if (n_classes := len(binning.classes)) != 2:
+        raise ValueError(f"Target 'y' must have only 2 classes. It has {n_classes}.")
 
-    if return_estimations:
-        return ece, estimations_df
+    if method == "label-bin":
+        sum_diffs = 0
+        for y_score in y_scores:
+            i = binning.find(y_score)
+            sum_diffs += math.fabs(
+                y_score - binning.target_freqs[i][1] / binning.freqs[i]
+            )
+
+        return sum_diffs / len(y)
     else:
-        return ece
-
-
-def binary_ece_lb(y, y_scores, y_pos, bins, return_estimations=False):
-    accuracy_by_bin = np.zeros(len(bins))
-    n_samples_by_bin = np.zeros(len(bins))
-    y_score_bin_indexes = []
-
-    for y_value, y_score in zip(y, y_scores):
-        y_score_i_bin = find_bin(y_score, bins)
-        y_score_bin_indexes.append(y_score_i_bin)
-        n_samples_by_bin[y_score_i_bin] += 1
-        if y_value == y_pos:
-            accuracy_by_bin[y_score_i_bin] += 1
-
-    if return_estimations:
-        estimations_df = pd.DataFrame(
-            {"freq": n_samples_by_bin, "freq_pos": accuracy_by_bin}, index=bins
-        )
-    for i in range(0, len(bins)):
-        if n_samples_by_bin[i] > 0:
-            accuracy_by_bin[i] /= n_samples_by_bin[i]
-
-    diff_ave = np.zeros(len(bins))
-    for i, y_score in zip(y_score_bin_indexes, y_scores):
-        diff_ave[i] += abs(accuracy_by_bin[i] - y_score)
-
-    for i in range(0, len(bins)):
-        if n_samples_by_bin[i] > 0:
-            diff_ave[i] /= n_samples_by_bin[i]
-
-    if return_estimations:
-        estimations_df["acc"] = accuracy_by_bin
-        estimations_df["diff_ave"] = diff_ave
-
-    ece = 0
-    for i in range(0, len(bins)):
-        ece += n_samples_by_bin[i] / len(y) * diff_ave[i]
-
-    if return_estimations:
-        return ece, estimations_df
-    else:
-        return ece
+        assert method == "bin"
+        sum_score_by_bin = [0] * binning.n_bins
+        for y_score in y_scores:
+            sum_score_by_bin[binning.find(y_score)] += y_score
+        return sum(
+            [
+                math.fabs(sum_score_by_bin[i] - binning.target_freqs[i][1])
+                for i in range(binning.n_bins)
+            ]
+        ) / len(y)
 
 
 class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
