@@ -3,6 +3,7 @@ import os
 import tempfile
 import warnings
 from bisect import bisect_left
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -13,36 +14,39 @@ from khiops.sklearn import KhiopsClassifier
 from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin
 from sklearn.preprocessing import LabelEncoder, label_binarize, normalize
 
-# Build a Khiops runner with one core
-# This is faster for the calibration use-cases
-default_max_cores = os.environ.get("KHIOPS_PROC_NUMBER")
-os.environ["KHIOPS_PROC_NUMBER"] = "1"
-with warnings.catch_warnings():
-    warnings.filterwarnings(action="ignore", message=".*Too few cores:.*")
-    khiops_single_core_runner = KhiopsLocalRunner()
-    if default_max_cores is None:
-        del os.environ["KHIOPS_PROC_NUMBER"]
-    else:
-        os.environ["KHIOPS_PROC_NUMBER"] = default_max_cores
+khiops_single_core_runner: KhiopsLocalRunner | None = None
 
 
-def run_with_single_core(func):
-    """Decorator function to run Khiops with a single core
+def build_single_core_khiops_runner():
+    """Build a Khiops runner with one core
 
-    Running with only one core is faster for many calibration calculations.
+    Running with a single core is faster for most of the calibration use-cases
     """
+    default_max_cores = os.environ.get("KHIOPS_PROC_NUMBER")
+    os.environ["KHIOPS_PROC_NUMBER"] = "1"
+    with warnings.catch_warnings():
+        warnings.filterwarnings(action="ignore", message=".*Too few cores:.*")
+        global khiops_single_core_runner
+        khiops_single_core_runner = KhiopsLocalRunner()
+        if default_max_cores is None:
+            del os.environ["KHIOPS_PROC_NUMBER"]
+        else:
+            os.environ["KHIOPS_PROC_NUMBER"] = default_max_cores
 
-    def _run_with_single_core(self, *args, **kwargs):
-        default_runner = kh.get_runner()
-        kh.set_runner(khiops_single_core_runner)
-        result = func(self, *args, **kwargs)
+
+@contextmanager
+def single_core_khiops_runner():
+    """A context manager to run Khiops with a single core"""
+    if khiops_single_core_runner is None:
+        build_single_core_khiops_runner()
+    default_runner = kh.get_runner()
+    kh.set_runner(khiops_single_core_runner)
+    try:
+        yield
+    finally:
         kh.set_runner(default_runner)
-        return result
-
-    return _run_with_single_core
 
 
-@run_with_single_core
 def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
     """Computes a binning of an 1D vector with Khiops
 
@@ -107,8 +111,17 @@ def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
         var.type = "Categorical"
         kdic.add_variable(var)
 
-    # Work in a temporary directory
-    with tempfile.TemporaryDirectory(prefix="khiops-bins_") as work_dir:
+    # Create an execution context stack with:
+    # - A temporary directory context
+    # - A catch_warnings context
+    # - A single_core_khiops_runner context
+    with ExitStack() as ctx_stack:
+        work_dir = ctx_stack.enter_context(
+            tempfile.TemporaryDirectory(prefix="khiops-bins_")
+        )
+        ctx_stack.enter_context(warnings.catch_warnings())
+        ctx_stack.enter_context(single_core_khiops_runner())
+
         # Create data table file for khiops
         df_spec = {
             "y_score": y_scores if len(y_scores.shape) == 1 else y_scores.flatten()
@@ -119,29 +132,28 @@ def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
         output_table_path = f"{work_dir}/y_scores.txt"
         output_df.to_csv(output_table_path, sep="\t", index=False)
 
-        # Capture the "no informative variable" warning
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                action="ignore",
-                message="(?s:.*No informative input variable available.*)",
-            )
+        # Ignore the non-informative warning of Khiops
+        warnings.filterwarnings(
+            action="ignore",
+            message="(?s:.*No informative input variable available.*)",
+        )
 
-            # Execute Khiops recover the report
-            kh.train_predictor(
-                kdom,
-                "scores",
-                output_table_path,
-                "y" if y_khiops is not None else "",
-                f"{work_dir}/report.khj",
-                sample_percentage=100,
-                field_separator="\t",
-                header_line=True,
-                max_trees=0,
-                discretization_method=method,
-                max_parts=max_bins,
-                do_data_preparation_only=True,
-            )
-            results = kh.read_analysis_results_file(f"{work_dir}/report.khj")
+        # Execute Khiops recover the report
+        kh.train_predictor(
+            kdom,
+            "scores",
+            output_table_path,
+            "y" if y_khiops is not None else "",
+            f"{work_dir}/report.khj",
+            sample_percentage=100,
+            field_separator="\t",
+            header_line=True,
+            max_trees=0,
+            discretization_method=method,
+            max_parts=max_bins,
+            do_data_preparation_only=True,
+        )
+        results = kh.read_analysis_results_file(f"{work_dir}/report.khj")
 
     # Initialize the binning
     binning = Binning()
@@ -415,7 +427,6 @@ class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
                 )
         return self
 
-    @run_with_single_core
     def predict_proba(self, X):  # noqa: N803
         y_scores = self.clf.predict_proba(X)
         if len(self.clf.classes_) == 2:
