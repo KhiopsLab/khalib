@@ -3,7 +3,7 @@ import os
 import tempfile
 import warnings
 from bisect import bisect_left
-from typing import NamedTuple
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -11,7 +11,7 @@ from khiops import core as kh
 from khiops.core.internals.runner import KhiopsLocalRunner
 from khiops.sklearn import KhiopsClassifier
 from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin
-from sklearn.preprocessing import label_binarize, normalize
+from sklearn.preprocessing import LabelEncoder, label_binarize, normalize
 
 # Build a Khiops runner with one core
 # This is faster for the calibration use-cases
@@ -29,7 +29,7 @@ with warnings.catch_warnings():
 def run_with_single_core(func):
     """Decorator function to run Khiops with a single core
 
-    This is faster for many calibration calculations.
+    Running with only one core is faster for many calibration calculations.
     """
 
     def _run_with_single_core(self, *args, **kwargs):
@@ -52,38 +52,45 @@ def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
         Input scores.
     y : array-like of shape (n_samples,) or (n_samples, 1), optional
         Target values. If set, then the method parameters is ignored and set to "MODL".
-    method : {"MODL", "EqualFreq", "EqualWidth"}, default="MODL"
+    method : {"MODL", "EqualFrequency", "EqualWidth"}, default="MODL"
         Binning method:
 
         - "MODL": A non-parametric regularized binning method.
-        - "EqualFreq": All bins have the same number of elements. If many instances have
-          too many values the algorithm will put it in its own bin, which will be larger
-          than the other ones.
+        - "EqualFrequency": All bins have the same number of elements. If many instances
+          have too many values the algorithm will put it in its own bin, which will be
+          larger than the other ones.
         - "EqualWidth": All bins have the same width.
+
+        If the method is set to "EqualFrequency" or "EqualWidth" is set then 'y' is
+        ignored.
     max_bins: int, default=0
         The maximum number of bins to be created. The algorithms usually create this
-        number of bins but they may create less. The default value 0 means that there is
-        no limit to the number of intervals.
+        number of bins but they may create less. The default value 0 means:
+
+        - For "MODL": that there is no limit to the number of intervals.
+        - For "EqualFrequency" or "EqualWidth": that 10 is the maximum number of
+          intervals.
 
     Returns
     -------
-    `NamedTuple`
-        A named tuple with fields:
-
-        - bins: The bins as 2-tuples.
-        - freqs: The frequencies of each bin.
-        - target_freqs: The frequencies of the target.
+    `Binning`
+        The binning object containing the bin limits and frequencies.
     """
     # Check inputs
     if len(y_scores.shape) > 1 and y_scores.shape[1] > 1:
         raise ValueError(f"y_scores must be 1-D but it has shape {y_scores.shape}.")
     if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
         raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
-    valid_methods = ["MODL", "EqualFreq", "EqualWidth"]
+    valid_methods = ["MODL", "EqualFrequency", "EqualWidth"]
     if method not in valid_methods:
         raise ValueError(f"method must be in {valid_methods}. It is '{method}'")
     if max_bins < 0:
         raise ValueError(f"max_bins must be non-negative. It is {max_bins}")
+
+    # Set the y vector to be used by khiops
+    # This is necessary because for the "EqualFrequency" and "EqualWidth" methods if
+    # target is set then it uses MODL.
+    y_khiops = y if method == "MODL" else None
 
     # Create Khiops dictionary
     kdom = kh.DictionaryDomain()
@@ -94,7 +101,7 @@ def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
     var.name = "y_score"
     var.type = "Numerical"
     kdic.add_variable(var)
-    if y is not None:
+    if y_khiops is not None:
         var = kh.Variable()
         var.name = "y"
         var.type = "Categorical"
@@ -106,8 +113,8 @@ def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
         df_spec = {
             "y_score": y_scores if len(y_scores.shape) == 1 else y_scores.flatten()
         }
-        if y is not None:
-            df_spec["y"] = y if len(y.shape) == 1 else y.flatten()
+        if y_khiops is not None:
+            df_spec["y"] = y_khiops if len(y.shape) == 1 else y.flatten()
         output_df = pd.DataFrame(df_spec)
         output_table_path = f"{work_dir}/y_scores.txt"
         output_df.to_csv(output_table_path, sep="\t", index=False)
@@ -124,7 +131,7 @@ def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
                 kdom,
                 "scores",
                 output_table_path,
-                "y" if y is not None else "",
+                "y" if y_khiops is not None else "",
                 f"{work_dir}/report.khj",
                 sample_percentage=100,
                 field_separator="\t",
@@ -136,40 +143,96 @@ def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
             )
             results = kh.read_analysis_results_file(f"{work_dir}/report.khj")
 
-    # Recover the bins from the variable statistics objects
+    # Initialize the binning
+    binning = Binning()
+    if y is not None:
+        le = LabelEncoder()
+        le.fit(y)
+        binning.classes = le.classes_.tolist()
+
+    # Obtain the target value indexes if they were calculated with Khiops
+    if (target_values := results.preparation_report.target_values) is not None:
+        if binning.classes_type is bool:
+            casted_target_values = [val == "True" for val in target_values]
+        else:
+            casted_target_values = [binning.classes_type(val) for val in target_values]
+        target_indexes = le.transform(casted_target_values)
+
+    # Recover the breakpoints from the variable statistics objects
     # Normal case: There is a data grid
-    bins = []
-    freqs = []
     score_stats = results.preparation_report.variables_statistics[0]
-    if score_stats.data_grid is not None:
-        if score_stats.data_grid.is_supervised:
-            for part in score_stats.data_grid.dimensions[0].partition:
-                bins.append(Bin(left=part.lower_bound, right=part.upper_bound))
-                for target_freqs in score_stats.data_grid.part_target_frequencies:
-                    freqs.append(np.sum(target_freqs))
+    if (data_grid := score_stats.data_grid) is not None:
+        # Set the breakpoints
+        for part in data_grid.dimensions[0].partition:
+            binning.breakpoints.append(part.lower_bound)
+        binning.breakpoints.append(data_grid.dimensions[0].partition[-1].upper_bound)
+
+        # Set the frequencies and target frequencies
+        # Supervised khiops execution
+        if data_grid.is_supervised:
+            # Recover the frequencies and target frequencies
+            # Note: Target frequencies must be reordered to the order of binning.classes
+            for part_target_freqs in score_stats.data_grid.part_target_frequencies:
+                binning.freqs.append(sum(part_target_freqs))
+                binning.target_freqs.append(
+                    tuple(part_target_freqs[i] for i in target_indexes)
+                )
+        # Unsupervised khiops execution
         else:
-            for part in score_stats.data_grid.dimensions[0].partition:
-                bins.append(Bin(left=part.lower_bound, right=part.upper_bound))
-            freqs.extend(score_stats.data_grid.frequencies)
-    # Otherwise we just send an "epsilon" interval containing the only value
+            binning.freqs = score_stats.data_grid.frequencies.copy()
+            if y is not None:
+                y_indexes = le.transform(y)
+                y_scores_bin_indexes = [binning.find(y_score) for y_score in y_scores]
+                target_freqs = [[0] * len(le.classes_) for _ in range(binning.n_bins)]
+                for y_score_bin_index, y_index in zip(y_scores_bin_indexes, y_indexes):
+                    target_freqs[y_score_bin_index][y_index] += 1
+                binning.target_freqs = [tuple(freqs) for freqs in target_freqs]
+
+    # Otherwise there is just one interval
     else:
+        # Case of non-informative variable: binning consisting only of (min, max)
         if score_stats.min < score_stats.max:
-            bins.append(Bin(left=score_stats.min, right=score_stats.max))
+            binning.breakpoints = [score_stats.min, score_stats.max]
+        # Case of variable with one value: binning consisting only of (min, min + eps)
         else:
-            bins.append(Bin(left=score_stats.min, right=score_stats.max + 1.0e-9))
-        freqs.append(results.preparation_report.instance_number)
+            binning.breakpoints = [score_stats.min, score_stats.min + 1.0e-9]
 
-    return Binning(bins=bins, freqs=freqs)
+        # Add the total frequency and, if y was provided, the target frequencies
+        binning.freqs.append(results.preparation_report.instance_number)
+        if target_freqs := results.preparation_report.target_value_frequencies:
+            binning.target_freqs.append(tuple(target_freqs[i] for i in target_indexes))
+        elif y is not None:
+            binning.target_freqs.append(
+                tuple(np.unique(y, return_counts=True)[1].tolist())
+            )
+
+    return binning
 
 
-class Bin(NamedTuple):
-    left: float
-    right: float
+@dataclass
+class Binning:
+    breakpoints: list[float] = field(default_factory=list)
+    freqs: list[int] = field(default_factory=list)
+    target_freqs: list[tuple] = field(default_factory=list)
+    classes: list = field(default_factory=list)
 
+    def find(self, value: float) -> int:
+        return max(bisect_left(self.breakpoints[:-1], value) - 1, 0)
 
-class Binning(NamedTuple):
-    bins: list[Bin]
-    freqs: list[int]
+    @property
+    def n_bins(self):
+        return max(len(self.breakpoints) - 1, 0)
+
+    @property
+    def classes_type(self):
+        if self.classes:
+            return type(self.classes[0])
+        return None
+
+    def get_bin(self, i: int) -> tuple[float, float]:
+        if i >= self.n_bins:
+            raise IndexError(f"There are only {self.n_bins} bins. Index: {i}")
+        return tuple(self.breakpoints[i : i + 2])
 
 
 def robust_estimate_binary_ece(y, y_scores, y_pos, return_estimations=False):
@@ -335,7 +398,6 @@ class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         self.clf = clf
         self.normalize = normalize
 
-    @run_with_single_core
     def fit(self, X, y):  # noqa: N803
         probas = self.clf.predict_proba(X)
         if len(self.clf.classes_) == 2:
