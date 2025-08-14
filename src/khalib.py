@@ -196,7 +196,9 @@ def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
                 y_indexes = le.transform(y)
                 y_scores_bin_indexes = [binning.find(y_score) for y_score in y_scores]
                 target_freqs = [[0] * len(le.classes_) for _ in range(binning.n_bins)]
-                for y_score_bin_index, y_index in zip(y_scores_bin_indexes, y_indexes):
+                for y_score_bin_index, y_index in zip(
+                    y_scores_bin_indexes, y_indexes, strict=False
+                ):
                     target_freqs[y_score_bin_index][y_index] += 1
                 binning.target_freqs = [tuple(freqs) for freqs in target_freqs]
 
@@ -221,6 +223,58 @@ def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
     return binning
 
 
+def compute_binning_from_bins(bins: list[tuple[float, float]], y_scores, y):
+    """Builds a binning from a list of bins and data
+
+    This is a helper function mostly for massive experiments, as it avoids the overhead
+    of a Khiops process executon.
+
+    Parameters
+    ----------
+    bins : list[tuple[float, float]]
+        The score bins.
+    y_scores : array-like of shape (n_samples,) or (n_samples, 1)
+        Input scores.
+    y : array-like of shape (n_samples,) or (n_samples, 1)
+        Target values.
+    """
+    # Check inputs
+    if len(y_scores.shape) > 1 and y_scores.shape[1] > 1:
+        raise ValueError(f"y_scores must be 1-D but it has shape {y_scores.shape}.")
+    if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
+        raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
+    for i, a_bin in enumerate(bins):
+        if a_bin[0] > a_bin[1]:
+            raise ValueError(f"Bin at index {i} is not sorted: {a_bin}")
+        if i > 0 and bins[i - 1][1] != a_bin[0]:
+            raise ValueError(
+                f"Bin at index {i} is not adjacent to the previous one: "
+                f"{bins[i - 1]} {a_bin}"
+            )
+
+    # Initialize the binning
+    le = LabelEncoder().fit(y)
+    binning = Binning(
+        breakpoints=[a_bin[0] for a_bin in bins] + [a_bin[1]],
+        classes=le.classes_.tolist(),
+    )
+
+    # Initialize the frequencies
+    y_indexes = le.transform(y)
+    y_scores_bin_indexes = [binning.find(y_score) for y_score in y_scores]
+    freqs = [0] * binning.n_bins
+    target_freqs = [[0] * len(le.classes_) for _ in range(binning.n_bins)]
+    for y_score_bin_index, y_index in zip(
+        y_scores_bin_indexes, y_indexes, strict=False
+    ):
+        freqs[y_score_bin_index] += 1
+        target_freqs[y_score_bin_index][y_index] += 1
+    binning.freqs = freqs
+    binning.target_freqs = [tuple(freqs) for freqs in target_freqs]
+
+    return binning
+
+
 @dataclass
 class Binning:
     breakpoints: list[float] = field(default_factory=list)
@@ -236,26 +290,23 @@ class Binning:
         return max(len(self.breakpoints) - 1, 0)
 
     @property
+    def bins(self):
+        return [
+            (self.breakpoints[i], self.breakpoints[i + 1]) for i in range(self.n_bins)
+        ]
+
+    @property
     def classes_type(self):
         if self.classes:
             return type(self.classes[0])
         return None
-
-    def get_bin(self, i: int) -> tuple[float, float]:
-        if i >= self.n_bins:
-            raise IndexError(f"There are only {self.n_bins} bins. Index: {i}")
-        return tuple(self.breakpoints[i : i + 2])
 
 
 def robust_estimate_binary_ece(y, y_scores, y_pos):
     bins, _ = compute_khiops_bins(
         y_scores, y, method="EqualFrequency", max_parts=math.ceil(math.sqrt(len(y)))
     )
-    return binary_ece(
-        y_scores,
-        y,
-        method="label-bin",
-    )
+    return binary_ece(y_scores, y, method="label-bin")
 
 
 def robust_estimate_top_level_ece(y, probas, classes):
@@ -302,7 +353,7 @@ def find_bin(value, bins):
 def binary_ece_knn(y, y_scores, y_pos):
     k = int(math.sqrt(len(y)))
 
-    zipped_y = sorted(zip(y, y_scores), key=lambda k: k[1])
+    zipped_y = sorted(zip(y, y_scores, strict=False), key=lambda k: k[1])
 
     # Initialize windows sums
     win_sum_y = 0
@@ -321,7 +372,14 @@ def binary_ece_knn(y, y_scores, y_pos):
     return diff_sum / (len(y) * k)
 
 
-def binary_ece(y_scores, y, method="label-bin", binning_method="MODL", max_bins=0):
+def binary_ece(
+    y_scores,
+    y,
+    method: str = "label-bin",
+    binning_method: str = "MODL",
+    max_bins: int = 0,
+    binning: Binning | None = None,
+):
     """Estimates the ECE for a pair of score and label vectors
 
     Parameters
@@ -330,9 +388,9 @@ def binary_ece(y_scores, y, method="label-bin", binning_method="MODL", max_bins=
         Input scores.
     y : array-like of shape (n_samples,) or (n_samples, 1)
         Target values. Must have exactly 2 different values.
-    method: {"label-bin", "bin"}, default="label-bin"
+    method : {"label-bin", "bin"}, default="label-bin"
         ECE estimation method. See below for details.
-    binning_method: {"MODL", "EqualFrequency", "EqualWidth"}, default="MODL"
+    binning_method : {"MODL", "EqualFrequency", "EqualWidth"}, default="MODL"
         Binning method:
 
         - "MODL": A non-parametric regularized binning method.
@@ -343,17 +401,25 @@ def binary_ece(y_scores, y, method="label-bin", binning_method="MODL", max_bins=
 
         If the method is set to "EqualFrequency" or "EqualWidth" is set then 'y' is
         ignored.
-    max_bins: int, default=0
+    max_bins : int, default=0
         The maximum number of bins to be created. The algorithms usually create this
         number of bins but they may create less. The default value 0 means that there is
         no limit to the number of intervals.
+    binning : `Binning`, optional
+        A ready-made binning. If set then it is used for the ECE computation and the
+        parameters bininng_method and max_bins are ignored.
     """
-    binning = compute_khiops_bins(
-        y_scores, y=y, method=binning_method, max_bins=max_bins
-    )
+    # Compute the binning if necessary
+    if binning is None:
+        binning = compute_khiops_bins(
+            y_scores, y=y, method=binning_method, max_bins=max_bins
+        )
+
+    # Check that the binning has only two classes
     if (n_classes := len(binning.classes)) != 2:
         raise ValueError(f"Target 'y' must have only 2 classes. It has {n_classes}.")
 
+    # Estimate the ECE with the binning
     if method == "label-bin":
         sum_diffs = 0
         for y_score in y_scores:
