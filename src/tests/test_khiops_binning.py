@@ -128,3 +128,21 @@ class TestKhiopsBinning:
         # Compute the binning with the test settings and check it against the reference
         binning = khalib.compute_khiops_bins(y_scores, y=y, method=method)
         assert binning == ref_binning
+
+
+class TestECE:
+    @pytest.mark.parametrize("target_mode", ["bool", "float", "int", "intnl", "str"])
+    @pytest.mark.parametrize(
+        ("method", "expected_ece"), [("bin", 0.036162213), ("label-bin", 0.086438357)]
+    )
+    def test_binary_ece(
+        self, method, expected_ece, target_mode, y_scores_variants, y_variants
+    ):
+        # Prepare the input data for the ECE estimation
+        y = y_variants[target_mode]
+        y_scores = y_scores_variants["original"]
+        if target_mode not in ["bool", "int"]:
+            y_scores = 1 - y_scores
+
+        ece = khalib.binary_ece(y_scores, y, method=method)
+        assert ece == pytest.approx(expected_ece)
