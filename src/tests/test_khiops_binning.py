@@ -129,6 +129,19 @@ class TestKhiopsBinning:
         binning = khalib.compute_khiops_bins(y_scores, y=y, method=method)
         assert binning == ref_binning
 
+    def test_find_vfind_coherence(self, y_variants, y_scores_variants):
+        # Prepare the input data for the binning
+        y = y_variants["int"]
+        y_scores = y_scores_variants["original"]
+
+        # Create an equal width binning
+        binning = khalib.compute_khiops_bins(y_scores, y=y, method="EqualWidth")
+
+        test_scores = [i / 10 for i in range(-1, 12)]
+        np.testing.assert_array_equal(
+            binning.vfind(test_scores), [binning.find(score) for score in test_scores]
+        )
+
 
 class TestECE:
     @pytest.mark.parametrize("target_mode", ["bool", "float", "int", "intnl", "str"])

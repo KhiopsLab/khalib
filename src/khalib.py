@@ -285,6 +285,11 @@ class Binning:
     def find(self, value: float) -> int:
         return max(bisect_left(self.breakpoints[:-1], value) - 1, 0)
 
+    def vfind(self, values):
+        indexes = np.searchsorted(self.breakpoints[:-1], values, side="left") - 1
+        indexes[indexes < 0] = 0
+        return indexes
+
     @property
     def n_bins(self):
         return max(len(self.breakpoints) - 1, 0)
