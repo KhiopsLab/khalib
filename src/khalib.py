@@ -195,9 +195,9 @@ def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
             if y is not None:
                 y_indexes = le.transform(y)
                 y_scores_bin_indexes = [binning.find(y_score) for y_score in y_scores]
-                target_freqs = [[0] * len(le.classes_) for _ in range(binning.n_bins)]
-                for y_score_bin_index, y_index in zip(
-                    y_scores_bin_indexes, y_indexes, strict=False
+                target_freqs = [[0 for _ in le.classes_] for _ in binning.bins]
+                for y_score_bin_index, y_index in np.nditer(
+                    [y_scores_bin_indexes, y_indexes]
                 ):
                     target_freqs[y_score_bin_index][y_index] += 1
                 binning.target_freqs = [tuple(freqs) for freqs in target_freqs]
@@ -262,11 +262,9 @@ def compute_binning_from_bins(bins: list[tuple[float, float]], y_scores, y):
     # Initialize the frequencies
     y_indexes = le.transform(y)
     y_scores_bin_indexes = [binning.find(y_score) for y_score in y_scores]
-    freqs = [0] * binning.n_bins
-    target_freqs = [[0] * len(le.classes_) for _ in range(binning.n_bins)]
-    for y_score_bin_index, y_index in zip(
-        y_scores_bin_indexes, y_indexes, strict=False
-    ):
+    freqs = [0 for _ in binning.n_bins]
+    target_freqs = [[0 for _ in len(le.classes_)] for _ in range(binning.n_bins)]
+    for y_score_bin_index, y_index in np.nditer([y_scores_bin_indexes, y_indexes]):
         freqs[y_score_bin_index] += 1
         target_freqs[y_score_bin_index][y_index] += 1
     binning.freqs = freqs
@@ -427,18 +425,16 @@ def binary_ece(
     # Estimate the ECE with the binning
     if method == "label-bin":
         sum_diffs = 0
-        for y_score in y_scores:
-            i = binning.find(y_score)
+        for y_score, i in np.nditer([y_scores, binning.vfind(y_scores)]):
             sum_diffs += math.fabs(
                 y_score - binning.target_freqs[i][1] / binning.freqs[i]
             )
-
         return sum_diffs / len(y)
     else:
         assert method == "bin"
-        sum_score_by_bin = [0] * binning.n_bins
-        for y_score in y_scores:
-            sum_score_by_bin[binning.find(y_score)] += y_score
+        sum_score_by_bin = [0 for _ in binning.bins]
+        for y_score, i in np.nditer([y_scores, binning.vfind(y_scores)]):
+            sum_score_by_bin[i] += y_score
         return sum(
             [
                 math.fabs(sum_score_by_bin[i] - binning.target_freqs[i][1])
