@@ -156,71 +156,81 @@ def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
         results = kh.read_analysis_results_file(f"{work_dir}/report.khj")
 
     # Initialize the binning
-    binning = Binning()
     if y is not None:
         le = LabelEncoder()
         le.fit(y)
-        binning.classes = le.classes_.tolist()
+        classes = le.classes_.tolist()
+        # Note: When building `classes` variable is important with the `tolist` method,
+        # because it converts the numpy types to native Python ones.
 
     # Obtain the target value indexes if they were calculated with Khiops
     if (target_values := results.preparation_report.target_values) is not None:
-        if binning.classes_type is bool:
+        if type(classes[0]) is bool:
             casted_target_values = [val == "True" for val in target_values]
         else:
-            casted_target_values = [binning.classes_type(val) for val in target_values]
+            casted_target_values = [type(classes[0])(val) for val in target_values]
         target_indexes = le.transform(casted_target_values)
 
     # Recover the breakpoints from the variable statistics objects
     # Normal case: There is a data grid
     score_stats = results.preparation_report.variables_statistics[0]
     if (data_grid := score_stats.data_grid) is not None:
-        # Set the breakpoints
-        for part in data_grid.dimensions[0].partition:
-            binning.breakpoints.append(part.lower_bound)
-        binning.breakpoints.append(data_grid.dimensions[0].partition[-1].upper_bound)
+        # Create the breakpoints
+        breakpoints = [part.lower_bound for part in data_grid.dimensions[0].partition]
+        breakpoints.append(data_grid.dimensions[0].partition[-1].upper_bound)
 
-        # Set the frequencies and target frequencies
+        # Create the frequencies and target frequencies
         # Supervised khiops execution
         if data_grid.is_supervised:
             # Recover the frequencies and target frequencies
-            # Note: Target frequencies must be reordered to the order of binning.classes
-            for part_target_freqs in score_stats.data_grid.part_target_frequencies:
-                binning.freqs.append(sum(part_target_freqs))
-                binning.target_freqs.append(
-                    tuple(part_target_freqs[i] for i in target_indexes)
-                )
+            # Note: Target frequencies must be reordered to the order of `classes`
+            freqs = [
+                sum(tfreqs) for tfreqs in score_stats.data_grid.part_target_frequencies
+            ]
+            target_freqs = [
+                tuple(tfreqs[i] for i in target_indexes)
+                for tfreqs in score_stats.data_grid.part_target_frequencies
+            ]
         # Unsupervised khiops execution
         else:
-            binning.freqs = score_stats.data_grid.frequencies.copy()
+            freqs = score_stats.data_grid.frequencies.copy()
             if y is not None:
+                y_scores_bin_indexes = (
+                    np.searchsorted(breakpoints[:-1], y_scores, side="left") - 1
+                )
+                y_scores_bin_indexes[y_scores_bin_indexes < 0] = 0
                 y_indexes = le.transform(y)
-                y_scores_bin_indexes = [binning.find(y_score) for y_score in y_scores]
-                target_freqs = [[0 for _ in le.classes_] for _ in binning.bins]
+                target_freqs = [[0 for _ in le.classes_] for _ in breakpoints[:-1]]
                 for y_score_bin_index, y_index in np.nditer(
                     [y_scores_bin_indexes, y_indexes]
                 ):
                     target_freqs[y_score_bin_index][y_index] += 1
-                binning.target_freqs = [tuple(freqs) for freqs in target_freqs]
+                target_freqs = [tuple(freqs) for freqs in target_freqs]
 
     # Otherwise there is just one interval
     else:
         # Case of non-informative variable: binning consisting only of (min, max)
         if score_stats.min < score_stats.max:
-            binning.breakpoints = [score_stats.min, score_stats.max]
+            breakpoints = [score_stats.min, score_stats.max]
         # Case of variable with one value: binning consisting only of (min, min + eps)
         else:
-            binning.breakpoints = [score_stats.min, score_stats.min + 1.0e-9]
+            breakpoints = [score_stats.min, score_stats.min + 1.0e-9]
 
         # Add the total frequency and, if y was provided, the target frequencies
-        binning.freqs.append(results.preparation_report.instance_number)
-        if target_freqs := results.preparation_report.target_value_frequencies:
-            binning.target_freqs.append(tuple(target_freqs[i] for i in target_indexes))
+        freqs = [results.preparation_report.instance_number]
+        if (
+            target_freqs := results.preparation_report.target_value_frequencies
+        ) is not None:
+            target_freqs = [tuple(target_freqs[i] for i in target_indexes)]
         elif y is not None:
-            binning.target_freqs.append(
-                tuple(np.unique(y, return_counts=True)[1].tolist())
-            )
+            target_freqs = [tuple(np.unique(y, return_counts=True)[1].tolist())]
 
-    return binning
+    return Binning(
+        breakpoints=breakpoints,
+        freqs=freqs,
+        target_freqs=target_freqs if y is not None else [],
+        classes=le.classes_.tolist() if y is not None else [],
+    )
 
 
 def compute_binning_from_bins(bins: list[tuple[float, float]], y_scores, y):
@@ -252,38 +262,91 @@ def compute_binning_from_bins(bins: list[tuple[float, float]], y_scores, y):
                 f"{bins[i - 1]} {a_bin}"
             )
 
-    # Initialize the binning
+    # Initialize the breakpoints, score and target indexes
     le = LabelEncoder().fit(y)
-    binning = Binning(
-        breakpoints=[a_bin[0] for a_bin in bins] + [a_bin[1]],
-        classes=le.classes_.tolist(),
-    )
+    breakpoints = [a_bin[0] for a_bin in bins] + [a_bin[1]]
+    y_scores_bin_indexes = np.searchsorted(breakpoints[:-1], y_scores, side="left") - 1
+    y_scores_bin_indexes[y_scores_bin_indexes < 0] = 0
+    y_indexes = le.transform(y)
 
     # Initialize the frequencies
-    y_indexes = le.transform(y)
-    y_scores_bin_indexes = [binning.find(y_score) for y_score in y_scores]
-    freqs = [0 for _ in binning.n_bins]
-    target_freqs = [[0 for _ in len(le.classes_)] for _ in range(binning.n_bins)]
+    freqs = [0 for _ in len(bins)]
+    target_freqs = [[0 for _ in le.classes_] for _ in bins]
     for y_score_bin_index, y_index in np.nditer([y_scores_bin_indexes, y_indexes]):
         freqs[y_score_bin_index] += 1
         target_freqs[y_score_bin_index][y_index] += 1
-    binning.freqs = freqs
-    binning.target_freqs = [tuple(freqs) for freqs in target_freqs]
 
-    return binning
+    return Binning(
+        breakpoints=breakpoints,
+        freqs=freqs,
+        target_freqs=[tuple(freqs) for freqs in target_freqs],
+        classes=le.classes_.tolist(),
+    )
 
 
-@dataclass
+@dataclass()
 class Binning:
-    breakpoints: list[float] = field(default_factory=list)
-    freqs: list[int] = field(default_factory=list)
+    breakpoints: list[float]
+    freqs: list[int]
     target_freqs: list[tuple] = field(default_factory=list)
     classes: list = field(default_factory=list)
+    densities: list[float] = field(init=False)
+    target_probas: list[tuple] = field(init=False, default_factory=list)
+
+    def __post_init__(self):
+        # Check consistency of the constructor parameters
+        for i in range(n_bins := len(self.breakpoints) - 1):
+            if (left := self.breakpoints[i]) >= (right := self.breakpoints[i + 1]):
+                raise ValueError(
+                    "`breakpoints` must be increasing, "
+                    f"but at index {i} we have {left} >= {right}."
+                )
+        if (n_freqs := len(self.freqs)) != n_bins:
+            raise ValueError(
+                "`freqs` must match the size of `breakpoints` minus 1: "
+                f"{n_freqs} != {n_bins}"
+            )
+        if self.target_freqs:
+            if (n_target_freqs := len(self.target_freqs)) != n_freqs:
+                raise ValueError(
+                    "`target_freqs` length different from that of `freqs`: "
+                    f"({n_target_freqs} != {n_freqs}"
+                )
+            for i, tfreqs in enumerate(self.target_freqs):
+                if len(tfreqs) != len(self.classes):
+                    raise ValueError(
+                        f"`target_freqs` at bin index {i} has a length different from "
+                        f"the number of classes: {len(tfreqs)} != {len(self.classes)}."
+                    )
+                if sum(tfreqs) != self.freqs[i]:
+                    f"`target_freqs` at bin index {i} sums different from the bin "
+                    f"frequency: {sum(tfreqs)} != {self.freqs[i]}"
+
+        # Initialize the densities and target probabilities
+        self.densities = [
+            self.freqs[i]
+            / sum(self.freqs)
+            / (self.breakpoints[i + 1] - self.breakpoints[i])
+            for i in range(len(self.freqs))
+        ]
+        if self.target_freqs:
+            target_probas = []
+            for bin_freq, bin_target_freqs in zip(
+                self.freqs, self.target_freqs, strict=True
+            ):
+                target_probas.append(
+                    tuple(tfreq / bin_freq for tfreq in bin_target_freqs)
+                )
+
+            # Initialize the target probabilities
+            self.target_probas = target_probas
 
     def find(self, value: float) -> int:
         return max(bisect_left(self.breakpoints[:-1], value) - 1, 0)
 
     def vfind(self, values):
+        # Note: searchsorted with side="left" gives the bin index shifted by 1, except
+        # for the outliers in the left. We adjust them with a selection.
         indexes = np.searchsorted(self.breakpoints[:-1], values, side="left") - 1
         indexes[indexes < 0] = 0
         return indexes
@@ -294,9 +357,7 @@ class Binning:
 
     @property
     def bins(self):
-        return [
-            (self.breakpoints[i], self.breakpoints[i + 1]) for i in range(self.n_bins)
-        ]
+        return [tuple(self.breakpoints[i : i + 2]) for i in range(self.n_bins)]
 
     @property
     def classes_type(self):
