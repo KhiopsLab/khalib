@@ -37,7 +37,7 @@ def fixture_y_scores_variants(adult_scores_df):
     y_scores = adult_scores_df.y_score
     return {
         "original": y_scores,
-        "original-2D": np.transpose(np.vstack([1 - y_scores, y_scores])),
+        "original-2d": np.transpose(np.vstack([1 - y_scores, y_scores])),
         "constant": np.full(y_scores.shape[0], 0.5),
     }
 
@@ -80,21 +80,21 @@ def is_target_inverted(target_mode):
 
 class TestHistogram:
     all_cases = [
-        ("EqualFrequency", "bool", True),
-        ("EqualFrequency", "float", True),
-        ("EqualFrequency", "int", False),
-        ("EqualFrequency", "int", True),
-        ("EqualFrequency", "intnl", True),
-        ("EqualWidth", "bool", True),
-        ("EqualWidth", "float", True),
-        ("EqualWidth", "int", False),
-        ("EqualWidth", "int", True),
-        ("EqualWidth", "intnl", True),
-        ("MODL", "bool", True),
-        ("MODL", "float", True),
-        ("MODL", "int", False),
-        ("MODL", "int", True),
-        ("MODL", "intnl", True),
+        ("eq-freq", "bool", True),
+        ("eq-freq", "float", True),
+        ("eq-freq", "int", False),
+        ("eq-freq", "int", True),
+        ("eq-freq", "intnl", True),
+        ("eq-width", "bool", True),
+        ("eq-width", "float", True),
+        ("eq-width", "int", False),
+        ("eq-width", "int", True),
+        ("eq-width", "intnl", True),
+        ("modl", "bool", True),
+        ("modl", "float", True),
+        ("modl", "int", False),
+        ("modl", "int", True),
+        ("modl", "intnl", True),
     ]
 
     @pytest.mark.parametrize(("method", "target_mode", "use_y"), all_cases)
@@ -133,7 +133,7 @@ class TestHistogram:
         histogram = Histogram.from_data(y_scores, y=y, method=method)
         assert histogram == ref_histogram
 
-    @pytest.mark.parametrize("method", ["EqualFrequency", "EqualWidth", "MODL"])
+    @pytest.mark.parametrize("method", ["eq-freq", "eq-width", "modl"])
     def test_no_info_target(self, y_variants, y_scores_variants, ref_histogram, method):
         # Prepare the input data for the histogram
         y = y_variants["random"]
@@ -149,7 +149,7 @@ class TestHistogram:
         y_scores = y_scores_variants["original"]
 
         # Create an equal width histogram
-        histogram = Histogram.from_data(y_scores, y=y, method="EqualWidth")
+        histogram = Histogram.from_data(y_scores, y=y, method="eq-width")
 
         test_scores = [i / 10 for i in range(-1, 12)]
         np.testing.assert_array_equal(
@@ -160,7 +160,7 @@ class TestHistogram:
 
 class TestECE:
     @pytest.mark.parametrize("target_mode", ["bool", "float", "int", "intnl", "str"])
-    @pytest.mark.parametrize("variant", ["original", "original-2D"])
+    @pytest.mark.parametrize("variant", ["original", "original-2d"])
     @pytest.mark.parametrize(
         ("method", "expected_ece"), [("bin", 0.036162213), ("label-bin", 0.086438357)]
     )

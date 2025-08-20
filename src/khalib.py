@@ -56,7 +56,7 @@ class Histogram:
     target_probas: list[tuple] = field(init=False, default_factory=list)
 
     @classmethod
-    def from_data(cls, x, y=None, method="MODL", max_bins=0):
+    def from_data(cls, x, y=None, method="modl", max_bins=0):
         """Computes a histogram of an 1D vector
 
         Parameters
@@ -64,25 +64,23 @@ class Histogram:
         x : array-like of shape (n_samples,) or (n_samples, 1)
             Input scores.
         y : array-like of shape (n_samples,) or (n_samples, 1), optional
-            Target values. If set, then the method parameters is ignored and set to
-            "MODL".
-        method : {"MODL", "EqualFrequency", "EqualWidth"}, default="MODL"
+            Target values.
+        method : {"modl", "eq-freq", "eq-width"}, default="modl"
             Histogram method:
 
-            - "MODL": A non-parametric regularized histogram method.
-            - "EqualFrequency": All bins have the same number of elements. If many
-              instances have too many values the algorithm will put it in its own bin,
-              which will be larger than the other ones.
-            - "EqualWidth": All bins have the same width.
+            - "modl": A non-parametric regularized histogram method.
+            - "eq-freq": All bins have the same number of elements. If many instances
+              have too many values the algorithm will put it in its own bin, which will
+              be larger than the other ones.
+            - "eq-width": All bins have the same width.
 
-            If the method is set to "EqualFrequency" or "EqualWidth" is set then 'y' is
-            ignored.
+            If the method is set to "eq-freq" or "eq-width" is set then 'y' is ignored.
         max_bins: int, default=0
             The maximum number of bins to be created. The algorithms usually create this
             number of bins but they may create less. The default value 0 means:
 
-            - For "MODL": that there is no limit to the number of intervals.
-            - For "EqualFrequency" or "EqualWidth": that 10 is the maximum number of
+            - For "modl": that there is no limit to the number of intervals.
+            - For "eq-freq" or "eq-width": that 10 is the maximum number of
               intervals.
 
         Returns
@@ -95,16 +93,29 @@ class Histogram:
             raise ValueError(f"x must be 1-D but it has shape {x.shape}.")
         if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
             raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
-        valid_methods = ["MODL", "EqualFrequency", "EqualWidth"]
+        valid_methods = ["modl", "eq-freq", "eq-width"]
         if method not in valid_methods:
             raise ValueError(f"method must be in {valid_methods}. It is '{method}'")
         if max_bins < 0:
             raise ValueError(f"max_bins must be non-negative. It is {max_bins}")
 
         # Set the y vector to be used by khiops
-        # This is necessary because for the "EqualFrequency" and "EqualWidth" methods if
-        # target is set then it uses MODL.
-        y_khiops = y if method == "MODL" else None
+        # This is necessary because for the "eq-freq" and "eq-width" methods if
+        # target is set then it uses 'modl'.
+        y_khiops = y if method == "modl" else None
+
+        # Transform the binning methods to the Khiops names
+        if method == "modl":
+            khiops_method = "MODL"
+        elif method == "eq-freq":
+            khiops_method = "EqualFrequency"
+        elif method == "eq-width":
+            khiops_method = "EqualWidth"
+        else:
+            raise ValueError(
+                f"Unknown binning method '{method}'. "
+                "Choose between 'modl', 'eq-freq' and 'eq-width'"
+            )
 
         # Create Khiops dictionary
         kdom = kh.DictionaryDomain()
@@ -157,7 +168,7 @@ class Histogram:
                 field_separator="\t",
                 header_line=True,
                 max_trees=0,
-                discretization_method=method,
+                discretization_method=khiops_method,
                 max_parts=max_bins,
                 do_data_preparation_only=True,
             )
@@ -371,7 +382,7 @@ def ece(
     y_scores,
     y,
     method: str = "label-bin",
-    histogram_method: str = "MODL",
+    histogram_method: str = "modl",
     max_bins: int = 0,
     multi_class_method: str = "top-label",
     histogram: Histogram | None = None,
@@ -392,21 +403,22 @@ def ece(
         - "top-label": Estimates the ECE for the predicted class.
         - "classwise": Estimates the ECE for each class in a 1-vs-rest and the averages
           it.
-    histogram_method : {"MODL", "EqualFrequency", "EqualWidth"}, default="MODL"
+    histogram_method : {"modl", "eq-freq", "eq-width"}, default="modl"
         Histogram method:
 
-        - "MODL": A non-parametric regularized histogram method.
-        - "EqualFrequency": All bins have the same number of elements. If many instances
+        - "modl": A non-parametric regularized histogram method.
+        - "eq-freq": All bins have the same number of elements. If many instances
           have too many values the algorithm will put it in its own bin, which will be
           larger than the other ones.
-        - "EqualWidth": All bins have the same width.
+        - "eq-width": All bins have the same width.
 
-        If the method is set to "EqualFrequency" or "EqualWidth" is set then 'y' is
-        ignored.
+        If the method is set to "eq-freq" or "eq-width" is set then 'y' is ignored.
     max_bins : int, default=0
         The maximum number of bins to be created. The algorithms usually create this
-        number of bins but they may create less. The default value 0 means that there is
-        no limit to the number of intervals.
+        number of bins but they may create less. The default value 0 means:
+
+        - For "modl": that there is no limit to the number of intervals.
+        - For "eq-freq" or "eq-width": that 10 is the maximum number of intervals.
     histogram : `Histogram`, optional
         A ready-made histogram. If set then it is used for the ECE computation and the
         parameters histogram_method and max_bins are ignored.
@@ -477,7 +489,7 @@ def _binary_ece(
     y_scores,
     y,
     method: str = "label-bin",
-    histogram_method: str = "MODL",
+    histogram_method: str = "modl",
     max_bins: int = 0,
     histogram: Histogram | None = None,
 ):
