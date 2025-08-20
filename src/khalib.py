@@ -46,251 +46,253 @@ def single_core_khiops_runner():
         kh.set_runner(default_runner)
 
 
-def compute_khiops_bins(y_scores, y=None, method="MODL", max_bins=0):
-    """Computes a binning of an 1D vector with Khiops
-
-    Parameters
-    ----------
-    y_scores : array-like of shape (n_samples,) or (n_samples, 1)
-        Input scores.
-    y : array-like of shape (n_samples,) or (n_samples, 1), optional
-        Target values. If set, then the method parameters is ignored and set to "MODL".
-    method : {"MODL", "EqualFrequency", "EqualWidth"}, default="MODL"
-        Binning method:
-
-        - "MODL": A non-parametric regularized binning method.
-        - "EqualFrequency": All bins have the same number of elements. If many instances
-          have too many values the algorithm will put it in its own bin, which will be
-          larger than the other ones.
-        - "EqualWidth": All bins have the same width.
-
-        If the method is set to "EqualFrequency" or "EqualWidth" is set then 'y' is
-        ignored.
-    max_bins: int, default=0
-        The maximum number of bins to be created. The algorithms usually create this
-        number of bins but they may create less. The default value 0 means:
-
-        - For "MODL": that there is no limit to the number of intervals.
-        - For "EqualFrequency" or "EqualWidth": that 10 is the maximum number of
-          intervals.
-
-    Returns
-    -------
-    `Binning`
-        The binning object containing the bin limits and frequencies.
-    """
-    # Check inputs
-    if len(y_scores.shape) > 1 and y_scores.shape[1] > 1:
-        raise ValueError(f"y_scores must be 1-D but it has shape {y_scores.shape}.")
-    if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
-        raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
-    valid_methods = ["MODL", "EqualFrequency", "EqualWidth"]
-    if method not in valid_methods:
-        raise ValueError(f"method must be in {valid_methods}. It is '{method}'")
-    if max_bins < 0:
-        raise ValueError(f"max_bins must be non-negative. It is {max_bins}")
-
-    # Set the y vector to be used by khiops
-    # This is necessary because for the "EqualFrequency" and "EqualWidth" methods if
-    # target is set then it uses MODL.
-    y_khiops = y if method == "MODL" else None
-
-    # Create Khiops dictionary
-    kdom = kh.DictionaryDomain()
-    kdic = kh.Dictionary()
-    kdic.name = "scores"
-    kdom.add_dictionary(kdic)
-    var = kh.Variable()
-    var.name = "y_score"
-    var.type = "Numerical"
-    kdic.add_variable(var)
-    if y_khiops is not None:
-        var = kh.Variable()
-        var.name = "y"
-        var.type = "Categorical"
-        kdic.add_variable(var)
-
-    # Create an execution context stack with:
-    # - A temporary directory context
-    # - A catch_warnings context
-    # - A single_core_khiops_runner context
-    with ExitStack() as ctx_stack:
-        work_dir = ctx_stack.enter_context(
-            tempfile.TemporaryDirectory(prefix="khiops-bins_")
-        )
-        ctx_stack.enter_context(warnings.catch_warnings())
-        ctx_stack.enter_context(single_core_khiops_runner())
-
-        # Create data table file for khiops
-        df_spec = {
-            "y_score": y_scores if len(y_scores.shape) == 1 else y_scores.flatten()
-        }
-        if y_khiops is not None:
-            df_spec["y"] = y_khiops if len(y.shape) == 1 else y.flatten()
-        output_df = pd.DataFrame(df_spec)
-        output_table_path = f"{work_dir}/y_scores.txt"
-        output_df.to_csv(output_table_path, sep="\t", index=False)
-
-        # Ignore the non-informative warning of Khiops
-        warnings.filterwarnings(
-            action="ignore",
-            message="(?s:.*No informative input variable available.*)",
-        )
-
-        # Execute Khiops recover the report
-        kh.train_predictor(
-            kdom,
-            "scores",
-            output_table_path,
-            "y" if y_khiops is not None else "",
-            f"{work_dir}/report.khj",
-            sample_percentage=100,
-            field_separator="\t",
-            header_line=True,
-            max_trees=0,
-            discretization_method=method,
-            max_parts=max_bins,
-            do_data_preparation_only=True,
-        )
-        results = kh.read_analysis_results_file(f"{work_dir}/report.khj")
-
-    # Initialize the binning
-    if y is not None:
-        le = LabelEncoder()
-        le.fit(y)
-        classes = le.classes_.tolist()
-        # Note: When building `classes` variable is important with the `tolist` method,
-        # because it converts the numpy types to native Python ones.
-
-    # Obtain the target value indexes if they were calculated with Khiops
-    if (target_values := results.preparation_report.target_values) is not None:
-        if type(classes[0]) is bool:
-            casted_target_values = [val == "True" for val in target_values]
-        else:
-            casted_target_values = [type(classes[0])(val) for val in target_values]
-        target_indexes = le.transform(casted_target_values)
-
-    # Recover the breakpoints from the variable statistics objects
-    # Normal case: There is a data grid
-    score_stats = results.preparation_report.variables_statistics[0]
-    if (data_grid := score_stats.data_grid) is not None:
-        # Create the breakpoints
-        breakpoints = [part.lower_bound for part in data_grid.dimensions[0].partition]
-        breakpoints.append(data_grid.dimensions[0].partition[-1].upper_bound)
-
-        # Create the frequencies and target frequencies
-        # Supervised khiops execution
-        if data_grid.is_supervised:
-            # Recover the frequencies and target frequencies
-            # Note: Target frequencies must be reordered to the order of `classes`
-            freqs = [
-                sum(tfreqs) for tfreqs in score_stats.data_grid.part_target_frequencies
-            ]
-            target_freqs = [
-                tuple(tfreqs[i] for i in target_indexes)
-                for tfreqs in score_stats.data_grid.part_target_frequencies
-            ]
-        # Unsupervised khiops execution
-        else:
-            freqs = score_stats.data_grid.frequencies.copy()
-            if y is not None:
-                y_scores_bin_indexes = (
-                    np.searchsorted(breakpoints[:-1], y_scores, side="left") - 1
-                )
-                y_scores_bin_indexes[y_scores_bin_indexes < 0] = 0
-                y_indexes = le.transform(y)
-                target_freqs = [[0 for _ in le.classes_] for _ in breakpoints[:-1]]
-                for y_score_bin_index, y_index in np.nditer(
-                    [y_scores_bin_indexes, y_indexes]
-                ):
-                    target_freqs[y_score_bin_index][y_index] += 1
-                target_freqs = [tuple(freqs) for freqs in target_freqs]
-
-    # Otherwise there is just one interval
-    else:
-        # Case of non-informative variable: binning consisting only of (min, max)
-        if score_stats.min < score_stats.max:
-            breakpoints = [score_stats.min, score_stats.max]
-        # Case of variable with one value: binning consisting only of (min, min + eps)
-        else:
-            breakpoints = [score_stats.min, score_stats.min + 1.0e-9]
-
-        # Add the total frequency and, if y was provided, the target frequencies
-        freqs = [results.preparation_report.instance_number]
-        if (
-            target_freqs := results.preparation_report.target_value_frequencies
-        ) is not None:
-            target_freqs = [tuple(target_freqs[i] for i in target_indexes)]
-        elif y is not None:
-            target_freqs = [tuple(np.unique(y, return_counts=True)[1].tolist())]
-
-    return Binning(
-        breakpoints=breakpoints,
-        freqs=freqs,
-        target_freqs=target_freqs if y is not None else [],
-        classes=le.classes_.tolist() if y is not None else [],
-    )
-
-
-def compute_binning_from_bins(bins: list[tuple[float, float]], y_scores, y):
-    """Builds a binning from a list of bins and data
-
-    This is a helper function mostly for massive experiments, as it avoids the overhead
-    of a Khiops process executon.
-
-    Parameters
-    ----------
-    bins : list[tuple[float, float]]
-        The score bins.
-    y_scores : array-like of shape (n_samples,) or (n_samples, 1)
-        Input scores.
-    y : array-like of shape (n_samples,) or (n_samples, 1)
-        Target values.
-    """
-    # Check inputs
-    if len(y_scores.shape) > 1 and y_scores.shape[1] > 1:
-        raise ValueError(f"y_scores must be 1-D but it has shape {y_scores.shape}.")
-    if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
-        raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
-    for i, a_bin in enumerate(bins):
-        if a_bin[0] > a_bin[1]:
-            raise ValueError(f"Bin at index {i} is not sorted: {a_bin}")
-        if i > 0 and bins[i - 1][1] != a_bin[0]:
-            raise ValueError(
-                f"Bin at index {i} is not adjacent to the previous one: "
-                f"{bins[i - 1]} {a_bin}"
-            )
-
-    # Initialize the breakpoints, score and target indexes
-    le = LabelEncoder().fit(y)
-    breakpoints = [a_bin[0] for a_bin in bins] + [a_bin[1]]
-    y_scores_bin_indexes = np.searchsorted(breakpoints[:-1], y_scores, side="left") - 1
-    y_scores_bin_indexes[y_scores_bin_indexes < 0] = 0
-    y_indexes = le.transform(y)
-
-    # Initialize the frequencies
-    freqs = [0 for _ in len(bins)]
-    target_freqs = [[0 for _ in le.classes_] for _ in bins]
-    for y_score_bin_index, y_index in np.nditer([y_scores_bin_indexes, y_indexes]):
-        freqs[y_score_bin_index] += 1
-        target_freqs[y_score_bin_index][y_index] += 1
-
-    return Binning(
-        breakpoints=breakpoints,
-        freqs=freqs,
-        target_freqs=[tuple(freqs) for freqs in target_freqs],
-        classes=le.classes_.tolist(),
-    )
-
-
 @dataclass()
-class Binning:
+class Histogram:
     breakpoints: list[float]
     freqs: list[int]
     target_freqs: list[tuple] = field(default_factory=list)
     classes: list = field(default_factory=list)
     densities: list[float] = field(init=False)
     target_probas: list[tuple] = field(init=False, default_factory=list)
+
+    @classmethod
+    def from_data(cls, x, y=None, method="MODL", max_bins=0):
+        """Computes a histogram of an 1D vector
+
+        Parameters
+        ----------
+        x : array-like of shape (n_samples,) or (n_samples, 1)
+            Input scores.
+        y : array-like of shape (n_samples,) or (n_samples, 1), optional
+            Target values. If set, then the method parameters is ignored and set to
+            "MODL".
+        method : {"MODL", "EqualFrequency", "EqualWidth"}, default="MODL"
+            Histogram method:
+
+            - "MODL": A non-parametric regularized histogram method.
+            - "EqualFrequency": All bins have the same number of elements. If many
+              instances have too many values the algorithm will put it in its own bin,
+              which will be larger than the other ones.
+            - "EqualWidth": All bins have the same width.
+
+            If the method is set to "EqualFrequency" or "EqualWidth" is set then 'y' is
+            ignored.
+        max_bins: int, default=0
+            The maximum number of bins to be created. The algorithms usually create this
+            number of bins but they may create less. The default value 0 means:
+
+            - For "MODL": that there is no limit to the number of intervals.
+            - For "EqualFrequency" or "EqualWidth": that 10 is the maximum number of
+              intervals.
+
+        Returns
+        -------
+        `Histogram`
+            The histogram object containing the bin limits and frequencies.
+        """
+        # Check inputs
+        if len(x.shape) > 1 and x.shape[1] > 1:
+            raise ValueError(f"x must be 1-D but it has shape {x.shape}.")
+        if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
+            raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
+        valid_methods = ["MODL", "EqualFrequency", "EqualWidth"]
+        if method not in valid_methods:
+            raise ValueError(f"method must be in {valid_methods}. It is '{method}'")
+        if max_bins < 0:
+            raise ValueError(f"max_bins must be non-negative. It is {max_bins}")
+
+        # Set the y vector to be used by khiops
+        # This is necessary because for the "EqualFrequency" and "EqualWidth" methods if
+        # target is set then it uses MODL.
+        y_khiops = y if method == "MODL" else None
+
+        # Create Khiops dictionary
+        kdom = kh.DictionaryDomain()
+        kdic = kh.Dictionary()
+        kdic.name = "scores"
+        kdom.add_dictionary(kdic)
+        var = kh.Variable()
+        var.name = "x"
+        var.type = "Numerical"
+        kdic.add_variable(var)
+        if y_khiops is not None:
+            var = kh.Variable()
+            var.name = "y"
+            var.type = "Categorical"
+            kdic.add_variable(var)
+
+        # Create an execution context stack with:
+        # - A temporary directory context
+        # - A catch_warnings context
+        # - A single_core_khiops_runner context
+        with ExitStack() as ctx_stack:
+            work_dir = ctx_stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="khiops-hist_")
+            )
+            ctx_stack.enter_context(warnings.catch_warnings())
+            ctx_stack.enter_context(single_core_khiops_runner())
+
+            # Create data table file for khiops
+            df_spec = {"x": x if len(x.shape) == 1 else x.flatten()}
+            if y_khiops is not None:
+                df_spec["y"] = y_khiops if len(y.shape) == 1 else y.flatten()
+            output_df = pd.DataFrame(df_spec)
+            output_table_path = f"{work_dir}/hist-data.txt"
+            output_df.to_csv(output_table_path, sep="\t", index=False)
+
+            # Ignore the non-informative warning of Khiops
+            warnings.filterwarnings(
+                action="ignore",
+                message="(?s:.*No informative input variable available.*)",
+            )
+
+            # Execute Khiops recover the report
+            kh.train_predictor(
+                kdom,
+                "scores",
+                output_table_path,
+                "y" if y_khiops is not None else "",
+                f"{work_dir}/report.khj",
+                sample_percentage=100,
+                field_separator="\t",
+                header_line=True,
+                max_trees=0,
+                discretization_method=method,
+                max_parts=max_bins,
+                do_data_preparation_only=True,
+            )
+            results = kh.read_analysis_results_file(f"{work_dir}/report.khj")
+
+        # Initialize the histogram
+        if y is not None:
+            le = LabelEncoder()
+            le.fit(y)
+            classes = le.classes_.tolist()
+            # Note: When building `classes` variable is important with the `tolist`
+            # method, because it converts the numpy types to native Python ones.
+
+        # Obtain the target value indexes if they were calculated with Khiops
+        if (target_values := results.preparation_report.target_values) is not None:
+            if type(classes[0]) is bool:
+                casted_target_values = [val == "True" for val in target_values]
+            else:
+                casted_target_values = [type(classes[0])(val) for val in target_values]
+            target_indexes = le.transform(casted_target_values)
+
+        # Recover the breakpoints from the variable statistics objects
+        # Normal case: There is a data grid
+        score_stats = results.preparation_report.variables_statistics[0]
+        if (data_grid := score_stats.data_grid) is not None:
+            # Create the breakpoints
+            breakpoints = [
+                part.lower_bound for part in data_grid.dimensions[0].partition
+            ]
+            breakpoints.append(data_grid.dimensions[0].partition[-1].upper_bound)
+
+            # Create the frequencies and target frequencies
+            # Supervised khiops execution
+            if data_grid.is_supervised:
+                # Recover the frequencies and target frequencies
+                # Note: Target frequencies must be reordered to the order of `classes`
+                freqs = [
+                    sum(tfreqs)
+                    for tfreqs in score_stats.data_grid.part_target_frequencies
+                ]
+                target_freqs = [
+                    tuple(tfreqs[i] for i in target_indexes)
+                    for tfreqs in score_stats.data_grid.part_target_frequencies
+                ]
+            # Unsupervised khiops execution
+            else:
+                freqs = score_stats.data_grid.frequencies.copy()
+                if y is not None:
+                    x_bin_indexes = (
+                        np.searchsorted(breakpoints[:-1], x, side="left") - 1
+                    )
+                    x_bin_indexes[x_bin_indexes < 0] = 0
+                    y_indexes = le.transform(y)
+                    target_freqs = [[0 for _ in le.classes_] for _ in breakpoints[:-1]]
+                    for y_score_bin_index, y_index in np.nditer(
+                        [x_bin_indexes, y_indexes]
+                    ):
+                        target_freqs[y_score_bin_index][y_index] += 1
+                    target_freqs = [tuple(freqs) for freqs in target_freqs]
+
+        # Otherwise there is just one interval
+        else:
+            # Non-informative variable: histogram with only the bin (min, max)
+            if score_stats.min < score_stats.max:
+                breakpoints = [score_stats.min, score_stats.max]
+            # Single-valued variable: histogram with only the bin (min, min + eps)
+            else:
+                breakpoints = [score_stats.min, score_stats.min + 1.0e-9]
+
+            # Add the total frequency and, if y was provided, the target frequencies
+            freqs = [results.preparation_report.instance_number]
+            if (
+                target_freqs := results.preparation_report.target_value_frequencies
+            ) is not None:
+                target_freqs = [tuple(target_freqs[i] for i in target_indexes)]
+            elif y is not None:
+                target_freqs = [tuple(np.unique(y, return_counts=True)[1].tolist())]
+
+        return cls(
+            breakpoints=breakpoints,
+            freqs=freqs,
+            target_freqs=target_freqs if y is not None else [],
+            classes=le.classes_.tolist() if y is not None else [],
+        )
+
+    @classmethod
+    def from_data_and_bins(cls, bins: list[tuple[float, float]], x, y):
+        """Builds a histogram from a list of bins and data
+
+        This is a helper function mostly for massive experiments, as it avoids the
+        overhead of a Khiops process executon.
+
+        Parameters
+        ----------
+        x : array-like of shape (n_samples,) or (n_samples, 1)
+            Vector with the values to discretize for the histogram.
+        y : array-like of shape (n_samples,) or (n_samples, 1)
+            Target values associated to each element in 'x'.
+        bins : list[tuple[float, float]]
+            The bins for the data in 'x'.
+        """
+        # Check inputs
+        if len(x.shape) > 1 and x.shape[1] > 1:
+            raise ValueError(f"x must be 1-D but it has shape {x.shape}.")
+        if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
+            raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
+        for i, a_bin in enumerate(bins):
+            if a_bin[0] > a_bin[1]:
+                raise ValueError(f"Bin at index {i} is not sorted: {a_bin}")
+            if i > 0 and bins[i - 1][1] != a_bin[0]:
+                raise ValueError(
+                    f"Bin at index {i} is not adjacent to the previous one: "
+                    f"{bins[i - 1]} {a_bin}"
+                )
+
+        # Initialize the breakpoints, score and target indexes
+        le = LabelEncoder().fit(y)
+        breakpoints = [a_bin[0] for a_bin in bins] + [a_bin[1]]
+        x_bin_indexes = np.searchsorted(breakpoints[:-1], x, side="left") - 1
+        x_bin_indexes[x_bin_indexes < 0] = 0
+        y_indexes = le.transform(y)
+
+        # Initialize the frequencies
+        freqs = [0 for _ in len(bins)]
+        target_freqs = [[0 for _ in le.classes_] for _ in bins]
+        for y_score_bin_index, y_index in np.nditer([x_bin_indexes, y_indexes]):
+            freqs[y_score_bin_index] += 1
+            target_freqs[y_score_bin_index][y_index] += 1
+
+        return cls(
+            breakpoints=breakpoints,
+            freqs=freqs,
+            target_freqs=[tuple(freqs) for freqs in target_freqs],
+            classes=le.classes_.tolist(),
+        )
 
     def __post_init__(self):
         # Check consistency of the constructor parameters
@@ -369,9 +371,9 @@ def binary_ece(
     y_scores,
     y,
     method: str = "label-bin",
-    binning_method: str = "MODL",
+    histogram_method: str = "MODL",
     max_bins: int = 0,
-    binning: Binning | None = None,
+    histogram: Histogram | None = None,
 ):
     """Estimates the ECE for a pair of score and label vectors
 
@@ -383,10 +385,10 @@ def binary_ece(
         Target values. Must have exactly 2 different values.
     method : {"label-bin", "bin"}, default="label-bin"
         ECE estimation method. See below for details.
-    binning_method : {"MODL", "EqualFrequency", "EqualWidth"}, default="MODL"
-        Binning method:
+    histogram_method : {"MODL", "EqualFrequency", "EqualWidth"}, default="MODL"
+        Histogram method:
 
-        - "MODL": A non-parametric regularized binning method.
+        - "MODL": A non-parametric regularized histogram method.
         - "EqualFrequency": All bins have the same number of elements. If many instances
           have too many values the algorithm will put it in its own bin, which will be
           larger than the other ones.
@@ -398,37 +400,37 @@ def binary_ece(
         The maximum number of bins to be created. The algorithms usually create this
         number of bins but they may create less. The default value 0 means that there is
         no limit to the number of intervals.
-    binning : `Binning`, optional
-        A ready-made binning. If set then it is used for the ECE computation and the
+    histogram : `Histogram`, optional
+        A ready-made histogram. If set then it is used for the ECE computation and the
         parameters bininng_method and max_bins are ignored.
     """
-    # Compute the binning if necessary
-    if binning is None:
-        binning = compute_khiops_bins(
-            y_scores, y=y, method=binning_method, max_bins=max_bins
+    # Compute the histogram if necessary
+    if histogram is None:
+        histogram = Histogram.from_data(
+            y_scores, y=y, method=histogram_method, max_bins=max_bins
         )
 
-    # Check that the binning has only two classes
-    if (n_classes := len(binning.classes)) != 2:
+    # Check that the histogram has only two classes
+    if (n_classes := len(histogram.classes)) != 2:
         raise ValueError(f"Target 'y' must have only 2 classes. It has {n_classes}.")
 
-    # Estimate the ECE with the binning
+    # Estimate the ECE with the histogram
     if method == "label-bin":
         sum_diffs = 0
-        for y_score, i in np.nditer([y_scores, binning.vfind(y_scores)]):
+        for y_score, i in np.nditer([y_scores, histogram.vfind(y_scores)]):
             sum_diffs += math.fabs(
-                y_score - binning.target_freqs[i][1] / binning.freqs[i]
+                y_score - histogram.target_freqs[i][1] / histogram.freqs[i]
             )
         return sum_diffs / len(y)
     else:
         assert method == "bin"
-        sum_score_by_bin = [0 for _ in binning.bins]
-        for y_score, i in np.nditer([y_scores, binning.vfind(y_scores)]):
+        sum_score_by_bin = [0 for _ in histogram.bins]
+        for y_score, i in np.nditer([y_scores, histogram.vfind(y_scores)]):
             sum_score_by_bin[i] += y_score
         return sum(
             [
-                math.fabs(sum_score_by_bin[i] - binning.target_freqs[i][1])
-                for i in range(binning.n_bins)
+                math.fabs(sum_score_by_bin[i] - histogram.target_freqs[i][1])
+                for i in range(histogram.n_bins)
             ]
         ) / len(y)
 
@@ -438,9 +440,9 @@ def mc_ece(
     y,
     method: str = "label-bin",
     mc_method: str = "top-label",
-    binning_method: str = "MODL",
+    histogram_method: str = "MODL",
     max_bins: int = 0,
-    binning: Binning = None,
+    histogram: Histogram = None,
 ):
     le = LabelEncoder().fit(y)
     if mc_method == "top-label":
@@ -451,9 +453,9 @@ def mc_ece(
             y_pred_scores,
             y_preds,
             method=method,
-            binning_method=binning_method,
+            histogram_method=histogram_method,
             max_bins=max_bins,
-            binning=binning,
+            histogram=histogram,
         )
     else:
         assert mc_method == "classwise"
@@ -463,9 +465,9 @@ def mc_ece(
                 y_scores[:, k],
                 y_binarized[:, k],
                 method=method,
-                binning_method=binning_method,
+                histogram_method=histogram_method,
                 max_bins=max_bins,
-                binning=binning,
+                histogram=histogram,
             )
             for k in range(y_scores.shape[1])
         ]
@@ -483,12 +485,12 @@ class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
 
         # Binary classification
         if n_classes == 2:
-            self.binnings_ = [compute_khiops_bins(probas[:, 1].reshape(-1, 1), y)]
+            self.histograms_ = [Histogram.from_data(probas[:, 1].reshape(-1, 1), y)]
         # Multiclass classification: One-vs-Rest
         else:
             y_binarized = label_binarize(y, classes=self.estimator.classes_)
-            self.binnings_ = [
-                compute_khiops_bins(probas[:, k].reshape(-1, 1), y_binarized[:, k])
+            self.histograms_ = [
+                Histogram.from_data(probas[:, k].reshape(-1, 1), y_binarized[:, k])
                 for k in range(n_classes)
             ]
         return self
@@ -499,13 +501,15 @@ class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
 
         # Binary classification
         if n_classes == 2:
-            calibrated_probas = calibrate_binary_scores(self.binnings_[0], probas[:, 1])
+            calibrated_probas = calibrate_binary_scores(
+                self.histograms_[0], probas[:, 1]
+            )
         # Multiclass classification: One-vs-Rest
         else:
             binary_calibrated_probas = np.empty(probas.shape)
-            for k, binning in enumerate(self.binnings_):
+            for k, histogram in enumerate(self.histograms_):
                 binary_calibrated_probas[:, k] = calibrate_binary_scores(
-                    binning, probas[:, k], only_positive=True
+                    histogram, probas[:, k], only_positive=True
                 )
             calibrated_probas = binary_calibrated_probas / np.sum(
                 binary_calibrated_probas, axis=1, keepdims=True
@@ -514,17 +518,19 @@ class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         return calibrated_probas
 
 
-def calibrate_binary_scores(binning: Binning, y_scores, only_positive: bool = False):
-    y_scores_bin_indexes = binning.vfind(y_scores.reshape(-1, 1))
+def calibrate_binary_scores(
+    histogram: Histogram, y_scores, only_positive: bool = False
+):
+    y_scores_bin_indexes = histogram.vfind(y_scores.reshape(-1, 1))
     it = np.nditer(y_scores_bin_indexes, flags=["f_index"])
     if only_positive:
         calibrated_probas = np.empty(y_scores.shape[0])
         for bin_i in it:
-            calibrated_probas[it.index] = binning.target_probas[bin_i][1]
+            calibrated_probas[it.index] = histogram.target_probas[bin_i][1]
     else:
         calibrated_probas = np.empty((y_scores.shape[0], 2))
         for bin_i in it:
-            calibrated_probas[it.index][0] = binning.target_probas[bin_i][0]
-            calibrated_probas[it.index][1] = binning.target_probas[bin_i][1]
+            calibrated_probas[it.index][0] = histogram.target_probas[bin_i][0]
+            calibrated_probas[it.index][1] = histogram.target_probas[bin_i][1]
 
     return calibrated_probas

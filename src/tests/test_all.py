@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 import khalib
+from khalib import Histogram
 
 
 @pytest.fixture(name="data_root_dir")
@@ -45,18 +46,20 @@ def fixture_data_df(request):
     return request.node.nodeid.split("::")[-1].translate(trans_table)
 
 
-@pytest.fixture(name="ref_binning")
-def fixture_ref_binning(data_root_dir, short_test_id):
-    ref_json_path = f"{data_root_dir}/binning/ref/{short_test_id}.json"
+@pytest.fixture(name="ref_histogram")
+def fixture_ref_histogram(data_root_dir, short_test_id):
+    ref_json_path = f"{data_root_dir}/histogram/ref/{short_test_id}.json"
     if os.path.exists(ref_json_path):
-        with open(f"{data_root_dir}/binning/ref/{short_test_id}.json") as ref_json_file:
-            yield read_binning_from_json_data(json.load(ref_json_file))
+        with open(
+            f"{data_root_dir}/histogram/ref/{short_test_id}.json"
+        ) as ref_json_file:
+            yield read_histogram_from_json_data(json.load(ref_json_file))
     else:
         yield None
 
 
-def read_binning_from_json_data(json_data):
-    return khalib.Binning(
+def read_histogram_from_json_data(json_data):
+    return Histogram(
         breakpoints=json_data["breakpoints"],
         freqs=json_data["freqs"],
         target_freqs=[tuple(cur_freqs) for cur_freqs in json_data["target_freqs"]],
@@ -64,7 +67,7 @@ def read_binning_from_json_data(json_data):
     )
 
 
-class TestKhiopsBinning:
+class TestHistogram:
     all_cases = [
         ("EqualFrequency", "bool", True),
         ("EqualFrequency", "float", True),
@@ -85,61 +88,62 @@ class TestKhiopsBinning:
 
     @pytest.mark.parametrize(("method", "target_mode", "use_y"), all_cases)
     def test_happy_path(
-        self, y_variants, y_scores_variants, ref_binning, method, target_mode, use_y
+        self, y_variants, y_scores_variants, ref_histogram, method, target_mode, use_y
     ):
-        # Prepare the input data for the binning
+        # Prepare the input data for the histogram
         y = y_variants[target_mode] if use_y else None
         y_scores = y_scores_variants["original"]
 
-        # Compute the binning with the test settings and check it against the reference
-        binning = khalib.compute_khiops_bins(y_scores, y=y, method=method)
-        assert binning == ref_binning
+        # Compute the histogram with the test settings, check it against the reference
+        histogram = Histogram.from_data(y_scores, y=y, method=method)
+        assert histogram == ref_histogram
 
     @pytest.mark.parametrize(("method", "target_mode", "use_y"), all_cases)
     def _test_single_value_score(
-        self, y_variants, y_scores_variants, ref_binning, method, target_mode, use_y
+        self, y_variants, y_scores_variants, ref_histogram, method, target_mode, use_y
     ):
-        # Prepare the input data for the binning
+        # Prepare the input data for the histogram
         y = y_variants[target_mode] if use_y else None
         y_scores = y_scores_variants["constant"]
 
-        # Compute the binning with the test settings and check it against the reference
-        binning = khalib.compute_khiops_bins(y_scores, y=y, method=method)
-        assert binning == ref_binning
+        # Compute the histogram with the test settings, check it against the reference
+        histogram = Histogram.from_data(y_scores, y=y, method=method)
+        assert histogram == ref_histogram
 
     @pytest.mark.parametrize(("method", "target_mode", "use_y"), all_cases)
     def test_single_value_score(
-        self, y_variants, y_scores_variants, ref_binning, method, target_mode, use_y
+        self, y_variants, y_scores_variants, ref_histogram, method, target_mode, use_y
     ):
-        # Prepare the input data for the binning
+        # Prepare the input data for the histogram
         y = y_variants[target_mode] if use_y else None
         y_scores = y_scores_variants["constant"]
 
-        # Compute the binning with the test settings and check it against the reference
-        binning = khalib.compute_khiops_bins(y_scores, y=y, method=method)
-        assert binning == ref_binning
+        # Compute the histogram with the test settings, check it against the reference
+        histogram = Histogram.from_data(y_scores, y=y, method=method)
+        assert histogram == ref_histogram
 
     @pytest.mark.parametrize("method", ["EqualFrequency", "EqualWidth", "MODL"])
-    def test_no_info_target(self, y_variants, y_scores_variants, ref_binning, method):
-        # Prepare the input data for the binning
+    def test_no_info_target(self, y_variants, y_scores_variants, ref_histogram, method):
+        # Prepare the input data for the histogram
         y = y_variants["random"]
         y_scores = y_scores_variants["original"]
 
-        # Compute the binning with the test settings and check it against the reference
-        binning = khalib.compute_khiops_bins(y_scores, y=y, method=method)
-        assert binning == ref_binning
+        # Compute the histogram with the test settings, check it against the reference
+        histogram = Histogram.from_data(y_scores, y=y, method=method)
+        assert histogram == ref_histogram
 
     def test_find_vfind_coherence(self, y_variants, y_scores_variants):
-        # Prepare the input data for the binning
+        # Prepare the input data for the histogram
         y = y_variants["int"]
         y_scores = y_scores_variants["original"]
 
-        # Create an equal width binning
-        binning = khalib.compute_khiops_bins(y_scores, y=y, method="EqualWidth")
+        # Create an equal width histogram
+        histogram = Histogram.from_data(y_scores, y=y, method="EqualWidth")
 
         test_scores = [i / 10 for i in range(-1, 12)]
         np.testing.assert_array_equal(
-            binning.vfind(test_scores), [binning.find(score) for score in test_scores]
+            histogram.vfind(test_scores),
+            [histogram.find(score) for score in test_scores],
         )
 
 
