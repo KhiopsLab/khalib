@@ -433,6 +433,46 @@ def binary_ece(
         ) / len(y)
 
 
+def mc_ece(
+    y_scores,
+    y,
+    method: str = "label-bin",
+    mc_method: str = "top-label",
+    binning_method: str = "MODL",
+    max_bins: int = 0,
+    binning: Binning = None,
+):
+    le = LabelEncoder().fit(y)
+    if mc_method == "top-label":
+        prediction_indexes = np.argsort(y_scores, axis=1)[:, -1]
+        y_preds = (y == le.classes_[prediction_indexes]).astype(int)
+        y_pred_scores = y_scores[np.arange(len(y)), prediction_indexes]
+        return binary_ece(
+            y_pred_scores,
+            y_preds,
+            method=method,
+            binning_method=binning_method,
+            max_bins=max_bins,
+            binning=binning,
+        )
+    else:
+        assert mc_method == "classwise"
+        y_binarized = label_binarize(y, classes=le.classes_)
+        class_eces = [
+            binary_ece(
+                y_scores[:, k],
+                y_binarized[:, k],
+                method=method,
+                binning_method=binning_method,
+                max_bins=max_bins,
+                binning=binning,
+            )
+            for k in range(y_scores.shape[1])
+        ]
+        class_probas = np.unique(y, return_counts=True)[1] / len(y)
+        return np.dot(class_eces, class_probas)
+
+
 class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
     def __init__(self, estimator):
         self.estimator = estimator
