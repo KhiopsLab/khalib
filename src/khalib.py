@@ -367,12 +367,13 @@ class Histogram:
         return None
 
 
-def binary_ece(
+def ece(
     y_scores,
     y,
     method: str = "label-bin",
     histogram_method: str = "MODL",
     max_bins: int = 0,
+    multi_class_method: str = "top-label",
     histogram: Histogram | None = None,
 ):
     """Estimates the ECE for a pair of score and label vectors
@@ -381,10 +382,16 @@ def binary_ece(
     ----------
     y_scores : array-like of shape (n_samples,) or (n_samples, 1)
         Input scores.
-    y : array-like of shape (n_samples,) or (n_samples, 1)
-        Target values. Must have exactly 2 different values.
+    y : array-like of shape (n_samples,) or (n_samples, n_classes)
+        Target values.
     method : {"label-bin", "bin"}, default="label-bin"
         ECE estimation method. See below for details.
+    multi_class_method : {"top-label", "classwise"}, default="top-label"
+        Multi-class ECE estimation method:
+
+        - "top-label": Estimates the ECE for the predicted class.
+        - "classwise": Estimates the ECE for each class in a 1-vs-rest and the averages
+          it.
     histogram_method : {"MODL", "EqualFrequency", "EqualWidth"}, default="MODL"
         Histogram method:
 
@@ -402,7 +409,81 @@ def binary_ece(
         no limit to the number of intervals.
     histogram : `Histogram`, optional
         A ready-made histogram. If set then it is used for the ECE computation and the
-        parameters bininng_method and max_bins are ignored.
+        parameters histogram_method and max_bins are ignored.
+    """
+    if len(y_scores.shape) > 2:
+        raise ValueError(
+            "'y_scores' must be either a 1-D or 2-D array-like object, "
+            f"but its shape is {y_scores.shape}"
+        )
+    # 1-D or 2-D array with 1 column: Binary ECE
+    if len(y_scores.shape) == 1 or (
+        len(y_scores.shape) == 2 and y_scores.shape[1] == 1
+    ):
+        return _binary_ece(
+            y_scores,
+            y,
+            method=method,
+            histogram_method=histogram_method,
+            max_bins=max_bins,
+            histogram=histogram,
+        )
+    # 2-D array with 2 columns: Also Binary ECE but a little pre-treatment is needed
+    elif len(y_scores.shape) == 2 and y_scores.shape[1] == 2:
+        # le = LabelEncoder().fit(y)
+        # y_binarized = label_binarize(y, classes=le.classes_)
+        return _binary_ece(
+            y_scores[:, 1],
+            y,
+            method=method,
+            histogram_method=histogram_method,
+            max_bins=max_bins,
+            histogram=histogram,
+        )
+    # 2-D array with > 2 columns: Multi-class ECE
+    else:
+        le = LabelEncoder().fit(y)
+        if multi_class_method == "top-label":
+            prediction_indexes = np.argsort(y_scores, axis=1)[:, -1]
+            y_preds = (y == le.classes_[prediction_indexes]).astype(int)
+            y_pred_scores = y_scores[np.arange(len(y)), prediction_indexes]
+            return _binary_ece(
+                y_pred_scores,
+                y_preds,
+                method=method,
+                histogram_method=histogram_method,
+                max_bins=max_bins,
+                histogram=histogram,
+            )
+        else:
+            assert multi_class_method == "classwise"
+            y_binarized = label_binarize(y, classes=le.classes_)
+            class_eces = [
+                _binary_ece(
+                    y_scores[:, k],
+                    y_binarized[:, k],
+                    method=method,
+                    histogram_method=histogram_method,
+                    max_bins=max_bins,
+                    histogram=histogram,
+                )
+                for k in range(y_scores.shape[1])
+            ]
+            class_probas = np.unique(y, return_counts=True)[1] / len(y)
+            return float(np.dot(class_eces, class_probas))
+
+
+def _binary_ece(
+    y_scores,
+    y,
+    method: str = "label-bin",
+    histogram_method: str = "MODL",
+    max_bins: int = 0,
+    histogram: Histogram | None = None,
+):
+    """Estimates the ECE for a 2-class problem
+
+    See the function `ece` docstring for more details.
     """
     # Compute the histogram if necessary
     if histogram is None:
@@ -433,46 +514,6 @@ def binary_ece(
                 for i in range(histogram.n_bins)
             ]
         ) / len(y)
-
-
-def mc_ece(
-    y_scores,
-    y,
-    method: str = "label-bin",
-    mc_method: str = "top-label",
-    histogram_method: str = "MODL",
-    max_bins: int = 0,
-    histogram: Histogram = None,
-):
-    le = LabelEncoder().fit(y)
-    if mc_method == "top-label":
-        prediction_indexes = np.argsort(y_scores, axis=1)[:, -1]
-        y_preds = (y == le.classes_[prediction_indexes]).astype(int)
-        y_pred_scores = y_scores[np.arange(len(y)), prediction_indexes]
-        return binary_ece(
-            y_pred_scores,
-            y_preds,
-            method=method,
-            histogram_method=histogram_method,
-            max_bins=max_bins,
-            histogram=histogram,
-        )
-    else:
-        assert mc_method == "classwise"
-        y_binarized = label_binarize(y, classes=le.classes_)
-        class_eces = [
-            binary_ece(
-                y_scores[:, k],
-                y_binarized[:, k],
-                method=method,
-                histogram_method=histogram_method,
-                max_bins=max_bins,
-                histogram=histogram,
-            )
-            for k in range(y_scores.shape[1])
-        ]
-        class_probas = np.unique(y, return_counts=True)[1] / len(y)
-        return np.dot(class_eces, class_probas)
 
 
 class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):

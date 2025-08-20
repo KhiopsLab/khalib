@@ -34,10 +34,17 @@ def fixture_y_variants(adult_scores_df):
 
 @pytest.fixture(name="y_scores_variants")
 def fixture_y_scores_variants(adult_scores_df):
+    y_scores = adult_scores_df.y_score
     return {
-        "original": adult_scores_df.y_score,
-        "constant": np.full(adult_scores_df.shape[0], 0.5),
+        "original": y_scores,
+        "original-2D": np.transpose(np.vstack([1 - y_scores, y_scores])),
+        "constant": np.full(y_scores.shape[0], 0.5),
     }
+
+
+@pytest.fixture(name="vehicles_scores_df")
+def fixture_vehicles_scores_df(data_root_dir):
+    return pd.read_csv(f"{data_root_dir}/tables/vehicles_scores.tsv", sep="\t")
 
 
 @pytest.fixture(name="short_test_id")
@@ -65,6 +72,10 @@ def read_histogram_from_json_data(json_data):
         target_freqs=[tuple(cur_freqs) for cur_freqs in json_data["target_freqs"]],
         classes=json_data["classes"],
     )
+
+
+def is_target_inverted(target_mode):
+    return target_mode in ["float", "intnl", "str"]
 
 
 class TestHistogram:
@@ -149,17 +160,36 @@ class TestHistogram:
 
 class TestECE:
     @pytest.mark.parametrize("target_mode", ["bool", "float", "int", "intnl", "str"])
+    @pytest.mark.parametrize("variant", ["original", "original-2D"])
     @pytest.mark.parametrize(
         ("method", "expected_ece"), [("bin", 0.036162213), ("label-bin", 0.086438357)]
     )
     def test_binary_ece(
-        self, method, expected_ece, target_mode, y_scores_variants, y_variants
+        self, method, expected_ece, target_mode, variant, y_scores_variants, y_variants
     ):
         # Prepare the input data for the ECE estimation
         y = y_variants[target_mode]
-        y_scores = y_scores_variants["original"]
-        if target_mode not in ["bool", "int"]:
-            y_scores = 1 - y_scores
+        y_scores = y_scores_variants[variant]
+        if is_target_inverted(target_mode):
+            if len(y_scores.shape) == 1:
+                y_scores = 1 - y_scores
+            else:
+                y_scores[:, [0, 1]] = y_scores[:, [1, 0]]
 
-        ece = khalib.binary_ece(y_scores, y, method=method)
+        # Estimate the ECE
+        ece = khalib.ece(y_scores, y, method=method)
+        assert ece == pytest.approx(expected_ece)
+
+    @pytest.mark.parametrize(
+        ("multi_class_method", "expected_ece"),
+        [("top-label", 0.0723944), ("classwise", 0.04642129)],
+    )
+    def test_multi_class_ece(
+        self, multi_class_method, expected_ece, vehicles_scores_df
+    ):
+        ece = khalib.ece(
+            vehicles_scores_df.drop("y", axis=1).__array__(),
+            vehicles_scores_df.y,
+            multi_class_method=multi_class_method,
+        )
         assert ece == pytest.approx(expected_ece)
