@@ -10,9 +10,8 @@ import numpy as np
 import pandas as pd
 from khiops import core as kh
 from khiops.core.internals.runner import KhiopsLocalRunner
-from khiops.sklearn import KhiopsClassifier
 from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin
-from sklearn.preprocessing import LabelEncoder, label_binarize, normalize
+from sklearn.preprocessing import LabelEncoder, label_binarize
 
 khiops_single_core_runner: KhiopsLocalRunner | None = None
 
@@ -435,65 +434,57 @@ def binary_ece(
 
 
 class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
-    # noqa: N803
-    def __init__(self, clf, normalize=False):
-        self.clf = clf
-        self.normalize = normalize
+    def __init__(self, estimator):
+        self.estimator = estimator
 
     def fit(self, X, y):  # noqa: N803
-        probas = self.clf.predict_proba(X)
-        if len(self.clf.classes_) == 2:
-            self.calibrator_ = KhiopsClassifier(n_trees=0)
-            self.calibrator_.fit(probas[:, 1].reshape(-1, 1), y)
-        # One-vs-Rest
+        probas = self.estimator.predict_proba(X)
+        n_classes = probas.shape[1]
+
+        # Binary classification
+        if n_classes == 2:
+            self.binnings_ = [compute_khiops_bins(probas[:, 1].reshape(-1, 1), y)]
+        # Multiclass classification: One-vs-Rest
         else:
-            binarized_labels = label_binarize(y, classes=self.clf.classes_)
-            self.estimators_ = []
-            self.calibrator_ = KhiopsClassifier(n_trees=0)
-            for j in range(len(self.clf.classes_)):
-                self.estimators_.append(self.calibrator_)
-                self.estimators_[j].fit(
-                    probas[:, j].reshape(-1, 1), binarized_labels[:, j]
-                )
+            y_binarized = label_binarize(y, classes=self.estimator.classes_)
+            self.binnings_ = [
+                compute_khiops_bins(probas[:, k].reshape(-1, 1), y_binarized[:, k])
+                for k in range(n_classes)
+            ]
         return self
 
     def predict_proba(self, X):  # noqa: N803
-        y_scores = self.clf.predict_proba(X)
-        if len(self.clf.classes_) == 2:
-            with warnings.catch_warnings():
-                warnings.filterwarnings(action="ignore", message=".*(Underflow).*")
-                calibrated_probas = self.calibrator_.predict_proba(
-                    y_scores[:, 1].reshape(-1, 1)
-                )
-        # One-vs-Rest
+        probas = self.estimator.predict_proba(X)
+        n_classes = probas.shape[1]
+
+        # Binary classification
+        if n_classes == 2:
+            calibrated_probas = calibrate_binary_scores(self.binnings_[0], probas[:, 1])
+        # Multiclass classification: One-vs-Rest
         else:
-            all_probas = []
-            for j, estimator in enumerate(self.estimators_):
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(action="ignore", message=".*(Underflow).*")
-                    all_probas.append(
-                        estimator.predict_proba(y_scores[:, j].reshape(-1, 1))[
-                            :, 1
-                        ].reshape(-1, 1)
-                    )
-            unnormalized_probas = np.concatenate(all_probas, axis=1)
-            if self.normalize:
-                calibrated_probas = normalize(unnormalized_probas, axis=1, norm="l1")
-            else:
-                calibrated_probas = []
-                for probas in unnormalized_probas:
-                    new_probas = []
-                    for k in range(len(self.clf.classes_)):
-                        new_probas.append(
-                            1
-                            / (len(self.clf.classes_))
-                            * (
-                                (len(self.clf.classes_) - 1) * probas[k]
-                                + np.sum(np.delete(1 - probas, k))
-                                - (len(self.clf.classes_) - 2)
-                            )
-                        )
-                    calibrated_probas.append(new_probas)
-                calibrated_probas = np.array(calibrated_probas)
+            binary_calibrated_probas = np.empty(probas.shape)
+            for k, binning in enumerate(self.binnings_):
+                binary_calibrated_probas[:, k] = calibrate_binary_scores(
+                    binning, probas[:, k], only_positive=True
+                )
+            calibrated_probas = binary_calibrated_probas / np.sum(
+                binary_calibrated_probas, axis=1, keepdims=True
+            )
 
         return calibrated_probas
+
+
+def calibrate_binary_scores(binning: Binning, y_scores, only_positive: bool = False):
+    y_scores_bin_indexes = binning.vfind(y_scores.reshape(-1, 1))
+    it = np.nditer(y_scores_bin_indexes, flags=["f_index"])
+    if only_positive:
+        calibrated_probas = np.empty(y_scores.shape[0])
+        for bin_i in it:
+            calibrated_probas[it.index] = binning.target_probas[bin_i][1]
+    else:
+        calibrated_probas = np.empty((y_scores.shape[0], 2))
+        for bin_i in it:
+            calibrated_probas[it.index][0] = binning.target_probas[bin_i][0]
+            calibrated_probas[it.index][1] = binning.target_probas[bin_i][1]
+
+    return calibrated_probas
