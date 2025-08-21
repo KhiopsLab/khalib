@@ -57,7 +57,7 @@ class Histogram:
 
     @classmethod
     def from_data(cls, x, y=None, method="modl", max_bins=0):
-        """Computes a histogram of an 1D vector
+        """Computes a histogram of an 1D vector via Khiops
 
         Parameters
         ----------
@@ -228,7 +228,6 @@ class Histogram:
                     ):
                         target_freqs[y_score_bin_index][y_index] += 1
                     target_freqs = [tuple(freqs) for freqs in target_freqs]
-
         # Otherwise there is just one interval
         else:
             # Non-informative variable: histogram with only the bin (min, max)
@@ -255,55 +254,50 @@ class Histogram:
         )
 
     @classmethod
-    def from_data_and_bins(cls, bins: list[tuple[float, float]], x, y):
-        """Builds a histogram from a list of bins and data
-
-        This is a helper function mostly for massive experiments, as it avoids the
-        overhead of a Khiops process executon.
+    def from_data_and_breakpoints(cls, x, breakpoints: list[float], y=None):
+        """Builds a histogram from a list of breakpoints and data
 
         Parameters
         ----------
         x : array-like of shape (n_samples,) or (n_samples, 1)
             Vector with the values to discretize for the histogram.
-        y : array-like of shape (n_samples,) or (n_samples, 1)
+        breakpoints : list[float]
+            A sorted list of floats defining the bin edges.
+        y : array-like of shape (n_samples,) or (n_samples, 1), optional
             Target values associated to each element in 'x'.
-        bins : list[tuple[float, float]]
-            The bins for the data in 'x'.
         """
         # Check inputs
         if len(x.shape) > 1 and x.shape[1] > 1:
             raise ValueError(f"x must be 1-D but it has shape {x.shape}.")
         if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
             raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
-        for i, a_bin in enumerate(bins):
-            if a_bin[0] > a_bin[1]:
-                raise ValueError(f"Bin at index {i} is not sorted: {a_bin}")
-            if i > 0 and bins[i - 1][1] != a_bin[0]:
-                raise ValueError(
-                    f"Bin at index {i} is not adjacent to the previous one: "
-                    f"{bins[i - 1]} {a_bin}"
-                )
+        for i in range(len(breakpoints) - 1):
+            if (left := breakpoints[i]) > breakpoints[i + 1]:
+                raise ValueError(f"Breakpoint at index {i} is not sorted: {left}")
 
-        # Initialize the breakpoints, score and target indexes
-        le = LabelEncoder().fit(y)
-        breakpoints = [a_bin[0] for a_bin in bins] + [a_bin[1]]
+        # Initialize the breakpoints and bin frequencies
         x_bin_indexes = np.searchsorted(breakpoints[:-1], x, side="left") - 1
         x_bin_indexes[x_bin_indexes < 0] = 0
-        y_indexes = le.transform(y)
+        freqs = np.unique(x_bin_indexes, return_counts=True)[1].tolist()
 
-        # Initialize the frequencies
-        freqs = [0 for _ in len(bins)]
-        target_freqs = [[0 for _ in le.classes_] for _ in bins]
-        for y_score_bin_index, y_index in np.nditer([x_bin_indexes, y_indexes]):
-            freqs[y_score_bin_index] += 1
-            target_freqs[y_score_bin_index][y_index] += 1
+        if y is None:
+            return cls(breakpoints=breakpoints, freqs=freqs)
+        else:
+            # Obtain the class indexes of y
+            le = LabelEncoder().fit(y)
+            y_indexes = le.transform(y)
 
-        return cls(
-            breakpoints=breakpoints,
-            freqs=freqs,
-            target_freqs=[tuple(freqs) for freqs in target_freqs],
-            classes=le.classes_.tolist(),
-        )
+            # Initialize the target frequencies per bin
+            target_freqs = [[0 for _ in le.classes_] for _ in breakpoints[:-1]]
+            for x_bin_index, y_index in np.nditer([x_bin_indexes, y_indexes]):
+                target_freqs[x_bin_index][y_index] += 1
+
+            return cls(
+                breakpoints=breakpoints,
+                freqs=freqs,
+                target_freqs=[tuple(freqs) for freqs in target_freqs],
+                classes=le.classes_.tolist(),
+            )
 
     def __post_init__(self):
         # Check consistency of the constructor parameters

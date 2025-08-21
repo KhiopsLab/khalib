@@ -157,6 +157,24 @@ class TestHistogram:
             [histogram.find(score) for score in test_scores],
         )
 
+    @pytest.mark.parametrize("y_scores_fixture", ["original", "constant"])
+    @pytest.mark.parametrize("method", ["eq-freq", "eq-width", "modl"])
+    def test_manual_vs_modl_coherence(
+        self, y_fixtures, y_scores_fixture, y_scores_fixtures, method
+    ):
+        # Prepare the input data for the histogram
+        y = y_fixtures["int"]
+        y_scores = y_scores_fixtures[y_scores_fixture]
+
+        # Obtain the histogram first with Khiops
+        histogram_ref = Histogram.from_data(y_scores, y=y, method=method)
+
+        # Rebuild it with the `from_data_and_breakpoints` method and check
+        histogram = Histogram.from_data_and_breakpoints(
+            y_scores, histogram_ref.breakpoints, y=y
+        )
+        assert histogram == histogram_ref
+
 
 class TestECE:
     @pytest.mark.parametrize("y_fixture", ["bool", "float", "int", "intnl", "str"])
