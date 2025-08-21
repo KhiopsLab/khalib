@@ -19,8 +19,8 @@ def fixture_adult_scores_df(data_root_dir):
     return pd.read_csv(f"{data_root_dir}/tables/adult_scores_sample.tsv", sep="\t")
 
 
-@pytest.fixture(name="y_variants")
-def fixture_y_variants(adult_scores_df):
+@pytest.fixture(name="y_fixtures")
+def fixture_y_fixtures(adult_scores_df):
     rng = np.random.default_rng(seed=1234567)
     return {
         "int": adult_scores_df.y,
@@ -32,8 +32,8 @@ def fixture_y_variants(adult_scores_df):
     }
 
 
-@pytest.fixture(name="y_scores_variants")
-def fixture_y_scores_variants(adult_scores_df):
+@pytest.fixture(name="y_scores_fixtures")
+def fixture_y_scores_fixtures(adult_scores_df):
     y_scores = adult_scores_df.y_score
     return {
         "original": y_scores,
@@ -74,8 +74,8 @@ def read_histogram_from_json_data(json_data):
     )
 
 
-def is_target_inverted(target_mode):
-    return target_mode in ["float", "intnl", "str"]
+def is_target_inverted(y_fixture):
+    return y_fixture in ["float", "intnl", "str"]
 
 
 class TestHistogram:
@@ -97,56 +97,56 @@ class TestHistogram:
         ("modl", "intnl", True),
     ]
 
-    @pytest.mark.parametrize(("method", "target_mode", "use_y"), all_cases)
+    @pytest.mark.parametrize(("method", "y_fixture", "use_y"), all_cases)
     def test_happy_path(
-        self, y_variants, y_scores_variants, ref_histogram, method, target_mode, use_y
+        self, y_fixtures, y_scores_fixtures, ref_histogram, method, y_fixture, use_y
     ):
         # Prepare the input data for the histogram
-        y = y_variants[target_mode] if use_y else None
-        y_scores = y_scores_variants["original"]
+        y = y_fixtures[y_fixture] if use_y else None
+        y_scores = y_scores_fixtures["original"]
 
         # Compute the histogram with the test settings, check it against the reference
         histogram = Histogram.from_data(y_scores, y=y, method=method)
         assert histogram == ref_histogram
 
-    @pytest.mark.parametrize(("method", "target_mode", "use_y"), all_cases)
+    @pytest.mark.parametrize(("method", "y_fixture", "use_y"), all_cases)
     def _test_single_value_score(
-        self, y_variants, y_scores_variants, ref_histogram, method, target_mode, use_y
+        self, y_fixtures, y_scores_fixtures, ref_histogram, method, y_fixture, use_y
     ):
         # Prepare the input data for the histogram
-        y = y_variants[target_mode] if use_y else None
-        y_scores = y_scores_variants["constant"]
+        y = y_fixtures[y_fixture] if use_y else None
+        y_scores = y_scores_fixtures["constant"]
 
         # Compute the histogram with the test settings, check it against the reference
         histogram = Histogram.from_data(y_scores, y=y, method=method)
         assert histogram == ref_histogram
 
-    @pytest.mark.parametrize(("method", "target_mode", "use_y"), all_cases)
+    @pytest.mark.parametrize(("method", "y_fixture", "use_y"), all_cases)
     def test_single_value_score(
-        self, y_variants, y_scores_variants, ref_histogram, method, target_mode, use_y
+        self, y_fixtures, y_scores_fixtures, ref_histogram, method, y_fixture, use_y
     ):
         # Prepare the input data for the histogram
-        y = y_variants[target_mode] if use_y else None
-        y_scores = y_scores_variants["constant"]
+        y = y_fixtures[y_fixture] if use_y else None
+        y_scores = y_scores_fixtures["constant"]
 
         # Compute the histogram with the test settings, check it against the reference
         histogram = Histogram.from_data(y_scores, y=y, method=method)
         assert histogram == ref_histogram
 
     @pytest.mark.parametrize("method", ["eq-freq", "eq-width", "modl"])
-    def test_no_info_target(self, y_variants, y_scores_variants, ref_histogram, method):
+    def test_no_info_target(self, y_fixtures, y_scores_fixtures, ref_histogram, method):
         # Prepare the input data for the histogram
-        y = y_variants["random"]
-        y_scores = y_scores_variants["original"]
+        y = y_fixtures["random"]
+        y_scores = y_scores_fixtures["original"]
 
         # Compute the histogram with the test settings, check it against the reference
         histogram = Histogram.from_data(y_scores, y=y, method=method)
         assert histogram == ref_histogram
 
-    def test_find_vfind_coherence(self, y_variants, y_scores_variants):
+    def test_find_vfind_coherence(self, y_fixtures, y_scores_fixtures):
         # Prepare the input data for the histogram
-        y = y_variants["int"]
-        y_scores = y_scores_variants["original"]
+        y = y_fixtures["int"]
+        y_scores = y_scores_fixtures["original"]
 
         # Create an equal width histogram
         histogram = Histogram.from_data(y_scores, y=y, method="eq-width")
@@ -159,18 +159,24 @@ class TestHistogram:
 
 
 class TestECE:
-    @pytest.mark.parametrize("target_mode", ["bool", "float", "int", "intnl", "str"])
-    @pytest.mark.parametrize("variant", ["original", "original-2d"])
+    @pytest.mark.parametrize("y_fixture", ["bool", "float", "int", "intnl", "str"])
+    @pytest.mark.parametrize("y_scores_fixture", ["original", "original-2d"])
     @pytest.mark.parametrize(
         ("method", "expected_ece"), [("bin", 0.036162213), ("label-bin", 0.086438357)]
     )
     def test_binary_ece(
-        self, method, expected_ece, target_mode, variant, y_scores_variants, y_variants
+        self,
+        method,
+        expected_ece,
+        y_fixture,
+        y_fixtures,
+        y_scores_fixture,
+        y_scores_fixtures,
     ):
         # Prepare the input data for the ECE estimation
-        y = y_variants[target_mode]
-        y_scores = y_scores_variants[variant]
-        if is_target_inverted(target_mode):
+        y = y_fixtures[y_fixture]
+        y_scores = y_scores_fixtures[y_scores_fixture]
+        if is_target_inverted(y_fixture):
             if len(y_scores.shape) == 1:
                 y_scores = 1 - y_scores
             else:
