@@ -1,8 +1,8 @@
+import bisect
 import math
 import os
 import tempfile
 import warnings
-from bisect import bisect_left
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 
@@ -348,13 +348,19 @@ class Histogram:
             self.target_probas = target_probas
 
     def find(self, value: float) -> int:
-        return max(bisect_left(self.breakpoints[:-1], value) - 1, 0)
+        """Returns the histogram bin index for a value"""
+        if value <= self.breakpoints[0]:
+            return 0
+        elif value >= self.breakpoints[-1]:
+            return len(self.breakpoints) - 2
+        else:
+            return bisect.bisect_right(self.breakpoints, value) - 1
 
     def vfind(self, values):
-        # Note: searchsorted with side="left" gives the bin index shifted by 1, except
-        # for the outliers in the left. We adjust them with a selection.
-        indexes = np.searchsorted(self.breakpoints[:-1], values, side="left") - 1
-        indexes[indexes < 0] = 0
+        """Returns the histogram bin indexes for a value sequence"""
+        indexes = np.searchsorted(self.breakpoints[:-1], values, side="right") - 1
+        indexes[np.array(values) < self.breakpoints[0]] = 0
+        indexes[np.array(values) > self.breakpoints[-2]] = self.n_bins - 1
         return indexes
 
     @property
