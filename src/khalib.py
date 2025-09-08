@@ -413,7 +413,7 @@ class Histogram:
         return None
 
 
-def ece(
+def calibration_error(
     y_scores,
     y,
     method: str = "label-bin",
@@ -426,10 +426,11 @@ def ece(
 
     Parameters
     ----------
-    y_scores : array-like of shape (n_samples,) or (n_samples, 1)
-        Input scores.
+    y_scores : array-like of shape (n_samples,) or (n_samples, 1) or (n_samples, 2)
+        Scores/probabilities. If it is a 2-D array the column indexed as 1 will be used
+        for the estimation.
     y : array-like of shape (n_samples,) or (n_samples, n_classes)
-        Target values.
+        Target values (class labels).
     method : {"label-bin", "bin"}, default="label-bin"
         ECE estimation method. See below for details.
     multi_class_method : {"top-label", "classwise"}, default="top-label"
@@ -530,7 +531,7 @@ def _binary_ece(
 ):
     """Estimates the ECE for a 2-class problem
 
-    See the function `ece` docstring for more details.
+    See the function `calibration_error` docstring for more details.
     """
     # Compute the histogram if necessary
     if histogram is None:
