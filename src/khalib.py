@@ -10,8 +10,13 @@ import numpy as np
 import pandas as pd
 from khiops import core as kh
 from khiops.core.internals.runner import KhiopsLocalRunner
+from khiops.sklearn import KhiopsClassifier
 from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin
+from sklearn.exceptions import NotFittedError
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, label_binarize
+from sklearn.utils._response import _get_response_values
+from sklearn.utils.validation import check_is_fitted
 
 khiops_single_core_runner: KhiopsLocalRunner | None = None
 
@@ -528,53 +533,132 @@ def _binary_ece(
         ) / len(y)
 
 
-class KhiopsCalibrator(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
-    def __init__(self, estimator):
+class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
+    """Classifier calibration via Khiops
+
+    This estimator uses the Khiops regularized histogram construction method (MODL) to
+    calibrate the probabilities/scores coming from a classifier.
+
+    For binary classifiers the calibrated scores are calculated
+
+    Parameters
+    ----------
+    estimator : estimator instance, default=None
+        The classifier whose output need to be calibrated to provide more accurate
+        `predict_proba` outputs. If not provided, it trains a `KhiopsClassifier`. If
+        provided, but the estimator is no fitted then, on `fit`, it will be fitted with
+        `train_size` elements.
+    train_size : float or int, default=0.75
+        Same parameter as `test_train_split`. Only used when `estimator` is not provided
+        or non-fitted.
+    random_state : int, default=None
+        Same parameter as `test_train_split`. Only used when `estimator` is not provided
+        or non-fitted.
+    """
+
+    def __init__(self, estimator=None, train_size=0.75, random_state=None):
+        """See class docstring"""
         self.estimator = estimator
+        self.train_size = train_size
+        self.random_state = random_state
 
     def fit(self, X, y):  # noqa: N803
-        probas = self.estimator.predict_proba(X)
-        n_classes = probas.shape[1]
+        """Fits the calibrated model"""
+        # Check/initialize fitted estimator
+        if self.estimator is None:
+            self.fitted_estimator_ = KhiopsClassifier()
+        else:
+            self.fitted_estimator_ = self.estimator
+
+        # Fit the base predictor if not fitted
+        try:
+            check_is_fitted(self.fitted_estimator_)
+            x_calib, y_calib = X, y
+        except NotFittedError:
+            x_train, x_calib, y_train, y_calib = train_test_split(
+                X, y, train_size=self.train_size, random_state=self.random_state
+            )
+            self.fitted_estimator_.fit(x_train, y_train)
+
+        # Estimate the uncalibrated scores
+        scores, _ = _get_response_values(
+            self.fitted_estimator_,
+            x_calib,
+            response_method=["predict_proba", "decision_function"],
+        )
 
         # Binary classification
-        if n_classes == 2:
-            self.histograms_ = [Histogram.from_data(probas[:, 1].reshape(-1, 1), y)]
+        if (n_classes := len(self.fitted_estimator_.classes_)) == 2:
+            self.histograms_ = [Histogram.from_data(scores, y_calib)]
         # Multiclass classification: One-vs-Rest
         else:
-            y_binarized = label_binarize(y, classes=self.estimator.classes_)
+            y_binarized = label_binarize(
+                y_calib, classes=self.fitted_estimator_.classes_
+            )
             self.histograms_ = [
-                Histogram.from_data(probas[:, k].reshape(-1, 1), y_binarized[:, k])
+                Histogram.from_data(scores[:, k].reshape(-1, 1), y_binarized[:, k])
                 for k in range(n_classes)
             ]
+
+            calibrated_probas = np.empty(scores.shape)
+            for k, histogram in enumerate(self.histograms_):
+                calibrated_probas[:, k] = map_scores_to_positive_class_proba(
+                    scores[:, k], histogram, only_positive=True
+                )
         return self
 
     def predict_proba(self, X):  # noqa: N803
-        probas = self.estimator.predict_proba(X)
-        n_classes = probas.shape[1]
+        """Estimates the calibrated classification probabilities"""
+        # Estimate the uncalibrated scores
+        scores, _ = _get_response_values(
+            self.fitted_estimator_,
+            X,
+            response_method=["predict_proba", "decision_function"],
+        )
 
         # Binary classification
-        if n_classes == 2:
-            calibrated_probas = calibrate_binary_scores(
-                self.histograms_[0], probas[:, 1]
+        if len(self.histograms_) == 1:
+            calibrated_probas = map_scores_to_positive_class_proba(
+                scores, self.histograms_[0]
             )
         # Multiclass classification: One-vs-Rest
         else:
-            binary_calibrated_probas = np.empty(probas.shape)
+            calibrated_probas = np.empty(scores.shape)
             for k, histogram in enumerate(self.histograms_):
-                binary_calibrated_probas[:, k] = calibrate_binary_scores(
-                    histogram, probas[:, k], only_positive=True
+                calibrated_probas[:, k] = map_scores_to_positive_class_proba(
+                    scores[:, k], histogram, only_positive=True
                 )
-            calibrated_probas = binary_calibrated_probas / np.sum(
-                binary_calibrated_probas, axis=1, keepdims=True
+
+            calibrated_probas = calibrated_probas / np.sum(
+                calibrated_probas, axis=1, keepdims=True
             )
 
         return calibrated_probas
 
 
-def calibrate_binary_scores(
-    histogram: Histogram, y_scores, only_positive: bool = False
+def map_scores_to_positive_class_proba(
+    y_scores, histogram: Histogram, only_positive: bool = False
 ):
-    y_scores_bin_indexes = histogram.vfind(y_scores.reshape(-1, 1))
+    """Maps scores to the target probability of the histogram's positive class
+
+    Parameters
+    ----------
+    y_scores : array-like of shape (n_samples,) or (n_samples, 1)
+        Input scores.
+    histogram : `Histogram`
+        A histogram with target statistics (ie `target_freqs` must be non-empty).
+    only_positive : bool, default=False
+        If ``True`` it returns only 1-D array with the probabilities of the positive
+        class. Otherwise it returns a 2-D array with the probabilities for both classes.
+    """
+    # Check the inputs
+    if not histogram.classes:
+        raise ValueError("'histogram' must have target statistics.")
+    if (n_classes := len(histogram.classes)) != 2:
+        raise ValueError(f"'histogram' must have only 2 classes (it has {n_classes})")
+
+    # Map the scores to their corresponding bin target probability
+    y_scores_bin_indexes = histogram.vfind(y_scores)
     it = np.nditer(y_scores_bin_indexes, flags=["f_index"])
     if only_positive:
         calibrated_probas = np.empty(y_scores.shape[0])
