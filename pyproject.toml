@@ -17,6 +17,11 @@ dependencies = [
 [tools.setuptools]
 packages = ["khcalib"]
 
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
 [tool.ruff.lint]
 select = [
     "E",    # pycodestyle errors
