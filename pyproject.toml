@@ -13,6 +13,9 @@ dependencies = [
     "numpy>=2.0.0",
     "scikit-learn>=1.5.0",
 ]
+license = "BSD-3-Clause"
+license-files = ["LICENSE.md"]
+
 
 [tools.setuptools]
 packages = ["khcalib"]
