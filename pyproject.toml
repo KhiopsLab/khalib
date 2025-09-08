@@ -10,7 +10,7 @@ authors = [{ name = "Felipe Olmos", email = "luisfelipe.olmosmarchant@orange.com
 requires-python = ">=3.11"
 dependencies = [
     "khiops>=11.0.0.0b0",
-    "numpy>=1.26.0",
+    "numpy>=2.0.0",
     "scikit-learn>=1.5.0",
 ]
 
@@ -60,7 +60,7 @@ khiops = { url = "https://github.com/KhiopsML/khiops-python/releases/download/11
 
 [dependency-groups]
 dev = [
-    "ipython>=9.4.0",
+    "ipython>=8.27.0",
     "pre-commit>=4.3.0",
     "pytest>=8.4.1",
 ]
