@@ -1,3 +1,5 @@
+"""Classifier calibration with Khiops"""
+
 import bisect
 import math
 import os
@@ -24,7 +26,7 @@ khiops_single_core_runner: KhiopsLocalRunner | None = None
 def build_single_core_khiops_runner():
     """Build a Khiops runner with one core
 
-    Running with a single core is faster for most of the calibration use-cases
+    Running with a single core is faster for most of the calibration use-cases.
     """
     default_max_cores = os.environ.get("KHIOPS_PROC_NUMBER")
     os.environ["KHIOPS_PROC_NUMBER"] = "1"
@@ -53,15 +55,63 @@ def single_core_khiops_runner():
 
 @dataclass()
 class Histogram:
+    """A histogram with optional target variable statistics
+
+    .. note::
+        To obtain instances from real data, prefer the factory method `from_data` rather
+        than the base constructor.
+
+    Attributes
+    ----------
+    breakpoints : list[float]
+        The breakpoints defining the histogram in increasing order.
+    freqs : list of float
+        The frequencies of each bin.
+    densities : list[float]
+        The densities of each bin.
+    classes : list
+        The class labels.
+    target_freqs : list[tuple], optional
+        The target frequencies in each bin. Each tuple is has the same size as
+        :paramref:`classes`.
+    target_probas : list[tuple], optional
+        The target conditional probabilites in each bin. Each tuple is has the same size
+        as :paramref:`classes`.
+    """
+
     breakpoints: list[float]
     freqs: list[int]
+    densities: list[float] = field(init=False)
     target_freqs: list[tuple] = field(default_factory=list)
     classes: list = field(default_factory=list)
-    densities: list[float] = field(init=False)
     target_probas: list[tuple] = field(init=False, default_factory=list)
 
+    @property
+    def n_bins(self) -> int:
+        """Number of histogram bins."""
+        return max(len(self.breakpoints) - 1, 0)
+
+    @property
+    def bins(self) -> list[tuple]:
+        """List of histogram bins."""
+        return [tuple(self.breakpoints[i : i + 2]) for i in range(self.n_bins)]
+
+    @property
+    def classes_type(self) -> type | None:
+        """Type of the target classes (only for histograms built with y)."""
+        if self.classes:
+            return type(self.classes[0])
+        return None
+
     @classmethod
-    def from_data(cls, x, y=None, method="modl", max_bins=0, use_finest=False):
+    def from_data(
+        cls,
+        x,
+        y=None,
+        method: str = "modl",
+        max_bins: int = 0,
+        use_finest: bool = False,
+    ) -> "Histogram":
         """Computes a histogram of an 1D vector via Khiops
 
         Parameters
@@ -87,8 +137,9 @@ class Histogram:
             - For "modl": that there is no limit to the number of intervals.
             - For "eq-freq" or "eq-width": that 10 is the maximum number of
               intervals.
-        use_finest: _Unsupervised 'modl' histogram only_:
-            If `True` it chooses the finest instead of the most interpretable.
+        use_finest: bool, default=False
+            *Unsupervised 'modl' histogram only*: If `True` it builds the finest
+            histogram instead of the most interpretable.
 
         Returns
         -------
@@ -281,7 +332,9 @@ class Histogram:
         )
 
     @classmethod
-    def from_data_and_breakpoints(cls, x, breakpoints: list[float], y=None):
+    def from_data_and_breakpoints(
+        cls, x, breakpoints: list[float], y=None
+    ) -> "Histogram":
         """Builds a histogram from a list of breakpoints and data
 
         Parameters
@@ -380,7 +433,18 @@ class Histogram:
             self.target_probas = target_probas
 
     def find(self, value: float) -> int:
-        """Returns the histogram bin index for a value"""
+        """Returns the histogram bin index for a value
+
+        Parameters
+        ----------
+        value : float
+            The value to look up in the histogram bins.
+
+        Returns
+        -------
+        int
+            The index of the bin containing the value.
+        """
         if value <= self.breakpoints[0]:
             return 0
         elif value >= self.breakpoints[-1]:
@@ -389,28 +453,22 @@ class Histogram:
             return bisect.bisect_right(self.breakpoints, value) - 1
 
     def vfind(self, values):
-        """Returns the histogram bin indexes for a value sequence"""
+        """Returns the histogram bin indexes for a value sequence
+
+        Parameters
+        ----------
+        value : :external:term:`array-like`
+            The values to look up in the histogram bins.
+
+        Returns
+        -------
+        :external:term:`array-like`
+            The indexes of the bins containing the values.
+        """
         indexes = np.searchsorted(self.breakpoints[:-1], values, side="right") - 1
         indexes[np.array(values) < self.breakpoints[0]] = 0
         indexes[np.array(values) > self.breakpoints[-2]] = self.n_bins - 1
         return indexes
-
-    @property
-    def n_bins(self):
-        """Number of histogram bins"""
-        return max(len(self.breakpoints) - 1, 0)
-
-    @property
-    def bins(self):
-        """List of histogram bins"""
-        return [tuple(self.breakpoints[i : i + 2]) for i in range(self.n_bins)]
-
-    @property
-    def classes_type(self):
-        """Type of the target classes (only for histograms built with y)"""
-        if self.classes:
-            return type(self.classes[0])
-        return None
 
 
 def calibration_error(
@@ -422,7 +480,10 @@ def calibration_error(
     multi_class_method: str = "top-label",
     histogram: Histogram | None = None,
 ):
-    """Estimates the ECE for a pair of score and label vectors
+    r"""Estimates the ECE via binning
+
+    The default binning method "modl" finds a regularized histogram for which the
+    distribution of the target as pure as possible.
 
     Parameters
     ----------
@@ -436,13 +497,15 @@ def calibration_error(
     multi_class_method : {"top-label", "classwise"}, default="top-label"
         Multi-class ECE estimation method:
 
-        - "top-label": Estimates the ECE for the predicted class.
-        - "classwise": Estimates the ECE for each class in a 1-vs-rest and the averages
-          it.
+        - "top-label": Estimates the ECE for the confidence scores (ie. the predicted
+          class score).
+        - "classwise": Estimates the ECE for each class in a one-vs-rest fashion and the
+          averages it.
     histogram_method : {"modl", "eq-freq", "eq-width"}, default="modl"
         Histogram method:
 
-        - "modl": A non-parametric regularized histogram method.
+        - "modl": A non-parametric regularized histogram method. It finds the best
+          histogram such that the distribution of the target is constant in each bin.
         - "eq-freq": All bins have the same number of elements. If many instances
           have too many values the algorithm will put it in its own bin, which will be
           larger than the other ones.
@@ -458,6 +521,60 @@ def calibration_error(
     histogram : `Histogram`, optional
         A ready-made histogram. If set then it is used for the ECE computation and the
         parameters histogram_method and max_bins are ignored.
+
+
+    Notes
+    -----
+    We present the formulas for the two binary ECE estimators used in this function, as
+    described in [RCSM22]_. Both approximate the theoretical calibration error:
+
+    .. math::
+        \mathbb{E}\left[ \left| \mathbb{P}\left[ Y = 1 | S \right] - S  \right| \right]
+
+    where the pair :math:`(S, Y)` is a random vector taking values in :math:`[0, 1]
+    \times \lbrace{0, 1\rbrace}`. The random variable :math:`S` represent the
+    (normalized) scores coming from a classifier, and :math:`Y` the target.
+
+    Let
+    :math:`\lbrace {B_i} \rbrace _{i=I}^I` a binning of :math:`[0,1]` and :math:`\lbrace
+    (s_n, y_n) \rbrace_{n=1}^N` a sample following the distribution of :math:`(S, Y)`.
+
+
+    The **label-bin** ECE estimation is given by:
+
+    .. math::
+        \text{ECE}_{\text{lb}} = \frac{1}{N} \sum_{n=1}^N \sum_{i = 1}^I
+           \mathbb{1}_{s_n \in B_i} \left| s_n - \bar{y_i} \right|
+
+    where :math:`\bar{y_i}` is the sample conditional expectation of :math:`Y` in the
+    :math:`i`-th bin:
+
+    .. math::
+        \frac{\sum_{n=1}^N \mathbb{1}_{s_n \in B_i} \cdot y_n}{|B_i|}.
+
+    On the other hand, the **bin** ECE estimation is given by:
+
+    .. math::
+        \text{ECE}_{\text{bin}} = \sum_{i = 1}^I
+           \frac{\left| B_i \right| }{N} \left| \bar{s_i} - \bar{y_i} \right|
+
+    where :math:`\bar{y_i}` is as above, and :math:`\bar{s_i}` is the sample
+    conditional expectation of :math:`S` in the :math:`i`-th bin:
+
+    .. math::
+        \frac{\sum_{n=1}^N \mathbb{1}_{s_n \in B_i} \cdot s_n}{|B_i|}.
+
+
+    The **bin** estimator is a lower bound for the real ECE for any binning used. And,
+    for a given binning, it is a lower bound of the **label-bin** estimator.
+
+    The **bin** estimator is the most common literature, usually called the *plugin*
+    estimator, or even shown as the defitinion ECE. Despite this fact, we choose the
+    **label-bin** estimator as default method because it is exact when the conditional
+    distribution :math:`\mathbb{P}\left[ Y = 1 | S = s \right]` is piecewise constant on
+    :math:`s`. These piecewise constant models are exactly the hypothesis space of any
+    histogram estimation of the ECE.
+
     """
     if len(y_scores.shape) > 2:
         raise ValueError(
@@ -570,21 +687,47 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
     This estimator uses the Khiops regularized histogram construction method (MODL) to
     calibrate the probabilities/scores coming from a classifier.
 
-    For binary classifiers the calibrated scores are calculated
+    For binary classifiers, it fits a Khiops histogram for the scores for the positive
+    class. Then, for a given score, it estimates its calibrated probability as the
+    positive class probability of the bin in which the score falls.
+
+    For multi-class classifiers, it fits khiops histogram for each class in a
+    one-vs-rest fashion. Then, given a score vector, it estimates its calibrated
+    probabilities by applying in each one-vs-rest the binary method described above and
+    then normalizing to one.
+
+    This class emulates closely the `~sklearn.calibration.CalibratedClassifierCV`
+    interface but without cross-validation, as the Khiops models are regularized and do
+    not need it.
+
+    .. _KhiopsClassifier: https://khiops.org/11.0.0-b.0/api-docs/python-api/api/sklearn/generated/khiops.sklearn.estimators.html#khiops.sklearn.estimators.KhiopsClassifier
 
     Parameters
     ----------
     estimator : estimator instance, default=None
         The classifier whose output need to be calibrated to provide more accurate
-        `predict_proba` outputs. If not provided, it trains a `KhiopsClassifier`. If
-        provided, but the estimator is no fitted then, on `fit`, it will be fitted with
-        `train_size` elements.
+        `predict_proba` outputs. If not provided, it trains a `KhiopsClassifier`_. If
+        provided, but the estimator is not fitted then, on `fit`, it will
+        be fitted with :paramref:`train_size` elements.
     train_size : float or int, default=0.75
-        Same parameter as `test_train_split`. Only used when `estimator` is not provided
-        or non-fitted.
+        Same parameter as `~sklearn.model_selection.train_test_split`. Only used when
+        :paramref:`estimator` is not provided or not fitted.
     random_state : int, default=None
-        Same parameter as `test_train_split`. Only used when `estimator` is not provided
-        or non-fitted.
+        Same parameter as `~sklearn.model_selection.train_test_split`. Only used when
+        :paramref:`estimator` is not provided or not fitted.
+
+
+    Attributes
+    ----------
+    fitted_estimator_ :
+        The underlying fitted classifier. It is the same instance as
+        :paramref:`estimator` if it was provided, otherwise it is an instance of
+        `KhiopsClassifier`_.
+    histograms_ : list of size 1 or n_classes
+        In the binary case: a list of size 1 with the `Histogram` instance for the
+        positive class. In the multi class case: A list of size n_classes containing the
+        one-vs-rest `Histogram` for each class.
+
     """
 
     def __init__(self, estimator=None, train_size=0.75, random_state=None):
@@ -594,7 +737,20 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         self.random_state = random_state
 
     def fit(self, X, y):  # noqa: N803
-        """Fits the calibrated model"""
+        """Fits the calibrated model
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data.
+        y : array-like of shape (n_samples,)
+            Target values.
+
+        Returns
+        -------
+        self
+            The calling estimator instance.
+        """
         # Check/initialize fitted estimator
         if self.estimator is None:
             self.fitted_estimator_ = KhiopsClassifier()
@@ -633,13 +789,24 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
 
             calibrated_probas = np.empty(scores.shape)
             for k, histogram in enumerate(self.histograms_):
-                calibrated_probas[:, k] = map_scores_to_positive_class_proba(
+                calibrated_probas[:, k] = calibrate_binary(
                     scores[:, k], histogram, only_positive=True
                 )
         return self
 
     def predict_proba(self, X):  # noqa: N803
-        """Estimates the calibrated classification probabilities"""
+        """Estimates the calibrated classification probabilities
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data.
+
+        Returns
+        -------
+        P : array-like of shape (n_samples, n_classes)
+            The estimated calibrated probabilities for each class.
+        """
         # Estimate the uncalibrated scores
         scores, _ = _get_response_values(
             self.fitted_estimator_,
@@ -649,14 +816,12 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
 
         # Binary classification
         if len(self.histograms_) == 1:
-            calibrated_probas = map_scores_to_positive_class_proba(
-                scores, self.histograms_[0]
-            )
+            calibrated_probas = calibrate_binary(scores, self.histograms_[0])
         # Multiclass classification: One-vs-Rest
         else:
             calibrated_probas = np.empty(scores.shape)
             for k, histogram in enumerate(self.histograms_):
-                calibrated_probas[:, k] = map_scores_to_positive_class_proba(
+                calibrated_probas[:, k] = calibrate_binary(
                     scores[:, k], histogram, only_positive=True
                 )
 
@@ -667,17 +832,19 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         return calibrated_probas
 
 
-def map_scores_to_positive_class_proba(
-    y_scores, histogram: Histogram, only_positive: bool = False
-):
-    """Maps scores to the target probability of the histogram's positive class
+def calibrate_binary(y_scores, histogram: Histogram, only_positive: bool = False):
+    """Calibrates a binary score with an histogram
+
+    This function may be used to calibrate binary classification scores without the use
+    of the `KhalibClassifier` estimator.
 
     Parameters
     ----------
     y_scores : array-like of shape (n_samples,) or (n_samples, 1)
-        Input scores.
+        Scores for the positive class.
     histogram : `Histogram`
-        A histogram with target statistics (ie `target_freqs` must be non-empty).
+        A histogram with target statistics (ie. :paramref:`Histogram.target_freqs` must
+        be non-empty).
     only_positive : bool, default=False
         If ``True`` it returns only 1-D array with the probabilities of the positive
         class. Otherwise it returns a 2-D array with the probabilities for both classes.

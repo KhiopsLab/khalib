@@ -63,7 +63,13 @@ khiops = { url = "https://github.com/KhiopsML/khiops-python/releases/download/11
 
 [dependency-groups]
 dev = [
+    "furo>=2025.7.19",
     "ipython>=8.27.0",
+    "myst-parser>=4.0.1",
+    "numpydoc>=1.9.0",
     "pre-commit>=4.3.0",
     "pytest>=8.4.1",
+    "sphinx>=8.2.3",
+    "sphinx-copybutton>=0.5.2",
+    "sphinx-paramlinks>=0.6.0",
 ]
