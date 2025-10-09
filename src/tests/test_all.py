@@ -318,25 +318,6 @@ class TestECE:
 
 def _clf_data_builder(n_train, n_calib, n_test, n_classes, n_features, n_informative):
     # Note, we build this way to ensure reproducibility for the not_fitted/None case
-    # x_not_test, y_not_test = make_classification(
-    # n_samples=n_train + n_calib,
-    # n_classes=n_classes,
-    # n_features=n_features,
-    # n_informative=n_informative,
-    # random_state=314,
-    # return_X_y=True,
-    # )
-    # x_train, x_calib, y_train, y_calib = train_test_split(
-    # x_not_test, y_not_test, train_size=n_train, random_state=3141
-    # )
-    # x_test, y_test =  make_classification(
-    # n_samples=n_test,
-    # n_classes=n_classes,
-    # n_features=n_features,
-    # n_informative=n_informative,
-    # random_state=31415,
-    # return_X_y=True,
-    # )
     x, y = make_classification(
         n_samples=n_train + n_calib + n_test,
         n_classes=n_classes,
