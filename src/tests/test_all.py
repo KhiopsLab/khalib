@@ -90,11 +90,11 @@ class TestHistogram:
         ("eq-width", "int", False),
         ("eq-width", "int", True),
         ("eq-width", "intnl", True),
-        ("modl", "bool", True),
-        ("modl", "float", True),
-        ("modl", "int", False),
-        ("modl", "int", True),
-        ("modl", "intnl", True),
+        ("khiops", "bool", True),
+        ("khiops", "float", True),
+        ("khiops", "int", False),
+        ("khiops", "int", True),
+        ("khiops", "intnl", True),
     ]
 
     @pytest.mark.parametrize(("method", "y_fixture", "use_y"), all_cases)
@@ -123,7 +123,7 @@ class TestHistogram:
         histogram = Histogram.from_data(y_scores, y=y, method=method)
         assert histogram == ref_histogram
 
-    @pytest.mark.parametrize("method", ["eq-freq", "eq-width", "modl"])
+    @pytest.mark.parametrize("method", ["eq-freq", "eq-width", "khiops"])
     def test_no_info_target(self, y_fixtures, y_scores_fixtures, ref_histogram, method):
         # Prepare the input data for the histogram
         y = y_fixtures["random"]
@@ -155,8 +155,8 @@ class TestHistogram:
         )
 
     @pytest.mark.parametrize("y_scores_fixture", ["original", "constant"])
-    @pytest.mark.parametrize("method", ["eq-freq", "eq-width", "modl"])
-    def test_manual_vs_modl_coherence(
+    @pytest.mark.parametrize("method", ["eq-freq", "eq-width", "khiops"])
+    def test_manual_vs_khiops_coherence(
         self, y_fixtures, y_scores_fixture, y_scores_fixtures, method
     ):
         # Prepare the input data for the histogram

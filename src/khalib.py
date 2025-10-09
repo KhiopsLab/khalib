@@ -108,7 +108,7 @@ class Histogram:
         cls,
         x,
         y=None,
-        method: str = "modl",
+        method: str = "khiops",
         max_bins: int = 0,
         use_finest: bool = False,
     ) -> "Histogram":
@@ -120,10 +120,10 @@ class Histogram:
             Input scores.
         y : array-like of shape (n_samples,) or (n_samples, 1), optional
             Target values.
-        method : {"modl", "eq-freq", "eq-width"}, default="modl"
+        method : {"khiops", "eq-freq", "eq-width"}, default="khiops"
             Histogram method:
 
-            - "modl": A non-parametric regularized histogram method.
+            - "khiops": A non-parametric regularized histogram method.
             - "eq-freq": All bins have the same number of elements. If many instances
               have too many values the algorithm will put it in its own bin, which will
               be larger than the other ones.
@@ -134,11 +134,11 @@ class Histogram:
             The maximum number of bins to be created. The algorithms usually create this
             number of bins but they may create less. The default value 0 means:
 
-            - For "modl": that there is no limit to the number of intervals.
+            - For "khiops": that there is no limit to the number of intervals.
             - For "eq-freq" or "eq-width": that 10 is the maximum number of
               intervals.
         use_finest: bool, default=False
-            *Unsupervised 'modl' histogram only*: If `True` it builds the finest
+            *Unsupervised 'khiops' histogram only*: If `True` it builds the finest
             histogram instead of the most interpretable.
 
         Returns
@@ -151,7 +151,7 @@ class Histogram:
             raise ValueError(f"x must be 1-D but it has shape {x.shape}.")
         if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
             raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
-        valid_methods = ["modl", "eq-freq", "eq-width"]
+        valid_methods = ["khiops", "eq-freq", "eq-width"]
         if method not in valid_methods:
             raise ValueError(f"method must be in {valid_methods}. It is '{method}'")
         if max_bins < 0:
@@ -159,11 +159,11 @@ class Histogram:
 
         # Set the y vector to be used by khiops
         # This is necessary because for the "eq-freq" and "eq-width" methods if
-        # target is set then it uses 'modl'.
-        y_khiops = y if method == "modl" else None
+        # target is set then it uses 'khiops'.
+        y_khiops = y if method == "khiops" else None
 
         # Transform the binning methods to the Khiops names
-        if method == "modl":
+        if method == "khiops":
             khiops_method = "MODL"
         elif method == "eq-freq":
             khiops_method = "EqualFrequency"
@@ -172,7 +172,7 @@ class Histogram:
         else:
             raise ValueError(
                 f"Unknown binning method '{method}'. "
-                "Choose between 'modl', 'eq-freq' and 'eq-width'"
+                "Choose between 'khiops', 'eq-freq' and 'eq-width'"
             )
 
         # Create Khiops dictionary
@@ -275,7 +275,7 @@ class Histogram:
 
                 # Recover the frequencies
                 freqs = dg.frequencies.copy()
-            # Case 'modl': Recover the histogram from the modl_histogram field
+            # Case 'khiops': Recover the histogram from the modl_histogram field
             else:
                 if use_finest:
                     histogram_index = -1
@@ -475,14 +475,14 @@ def calibration_error(
     y_scores,
     y,
     method: str = "label-bin",
-    histogram_method: str = "modl",
+    histogram_method: str = "khiops",
     max_bins: int = 0,
     multi_class_method: str = "top-label",
     histogram: Histogram | None = None,
 ):
     r"""Estimates the ECE via binning
 
-    The default binning method "modl" finds a regularized histogram for which the
+    The default binning method "khiops" finds a regularized histogram for which the
     distribution of the target as pure as possible.
 
     Parameters
@@ -501,10 +501,10 @@ def calibration_error(
           class score).
         - "classwise": Estimates the ECE for each class in a one-vs-rest fashion and the
           averages it.
-    histogram_method : {"modl", "eq-freq", "eq-width"}, default="modl"
+    histogram_method : {"khiops", "eq-freq", "eq-width"}, default="khiops"
         Histogram method:
 
-        - "modl": A non-parametric regularized histogram method. It finds the best
+        - "khiops": A non-parametric regularized histogram method. It finds the best
           histogram such that the distribution of the target is constant in each bin.
         - "eq-freq": All bins have the same number of elements. If many instances
           have too many values the algorithm will put it in its own bin, which will be
@@ -516,7 +516,7 @@ def calibration_error(
         The maximum number of bins to be created. The algorithms usually create this
         number of bins but they may create less. The default value 0 means:
 
-        - For "modl": that there is no limit to the number of intervals.
+        - For "khiops": that there is no limit to the number of intervals.
         - For "eq-freq" or "eq-width": that 10 is the maximum number of intervals.
     histogram : `Histogram`, optional
         A ready-made histogram. If set then it is used for the ECE computation and the
@@ -642,7 +642,7 @@ def _binary_ece(
     y_scores,
     y,
     method: str = "label-bin",
-    histogram_method: str = "modl",
+    histogram_method: str = "khiops",
     max_bins: int = 0,
     histogram: Histogram | None = None,
 ):
