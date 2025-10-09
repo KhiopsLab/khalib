@@ -267,45 +267,50 @@ class Histogram:
                     for tfreqs in dg.part_target_frequencies
                 ]
             # Unsupervised khiops execution
-            # Case 'eq-freq' or 'eq-width'
-            elif score_stats.modl_histograms is None:
-                # Create the breakpoints
-                breakpoints = [part.lower_bound for part in dg.dimensions[0].partition]
-                breakpoints.append(dg.dimensions[0].partition[-1].upper_bound)
-
-                # Recover the frequencies
-                freqs = dg.frequencies.copy()
-            # Case 'khiops': Recover the histogram from the modl_histogram field
             else:
-                if use_finest:
-                    histogram_index = -1
+                # Case 'eq-freq' or 'eq-width'
+                if score_stats.modl_histograms is None:
+                    # Create the breakpoints
+                    breakpoints = [
+                        part.lower_bound for part in dg.dimensions[0].partition
+                    ]
+                    breakpoints.append(dg.dimensions[0].partition[-1].upper_bound)
+
+                    # Recover the frequencies
+                    freqs = dg.frequencies.copy()
+                # Case 'khiops': Recover the histogram from the modl_histogram field
                 else:
-                    histogram_index = (
-                        score_stats.modl_histograms.information_rates.index(100)
-                    )
-                breakpoints = score_stats.modl_histograms.histograms[
-                    histogram_index
-                ].bounds
-                freqs = score_stats.modl_histograms.histograms[
-                    histogram_index
-                ].frequencies
+                    if use_finest:
+                        histogram_index = -1
+                    else:
+                        histogram_index = (
+                            score_stats.modl_histograms.information_rates.index(100)
+                        )
+                    breakpoints = score_stats.modl_histograms.histograms[
+                        histogram_index
+                    ].bounds
+                    freqs = score_stats.modl_histograms.histograms[
+                        histogram_index
+                    ].frequencies
 
-            # Compute the supervised fields if y was provided
-            if y is not None:
-                # Compute the class and  bin indexes
-                y_indexes = le.transform(y)
-                x_bin_indexes = (
-                    np.searchsorted(breakpoints[:-1], x, side="left") - 1
-                ).reshape(1, -1)
-                x_bin_indexes[x_bin_indexes < 0] = 0
-                # Note: reshape is needed for the 1-column matrix case if not the
-                # iterator below does not work
+                # Compute the supervised fields if y was provided
+                if y is not None:
+                    # Compute the class and  bin indexes
+                    y_indexes = le.transform(y)
+                    x_bin_indexes = (
+                        np.searchsorted(breakpoints[:-1], x, side="left") - 1
+                    ).reshape(1, -1)
+                    x_bin_indexes[x_bin_indexes < 0] = 0
+                    # Note: reshape is needed for the 1-column matrix case if not the
+                    # iterator below does not work
 
-                # Compute the target frequencies
-                target_freqs = [[0 for _ in le.classes_] for _ in breakpoints[:-1]]
-                for y_score_bin_index, y_index in np.nditer([x_bin_indexes, y_indexes]):
-                    target_freqs[y_score_bin_index][y_index] += 1
-                target_freqs = [tuple(freqs) for freqs in target_freqs]
+                    # Compute the target frequencies
+                    target_freqs = [[0 for _ in le.classes_] for _ in breakpoints[:-1]]
+                    for y_score_bin_index, y_index in np.nditer(
+                        [x_bin_indexes, y_indexes]
+                    ):
+                        target_freqs[y_score_bin_index][y_index] += 1
+                    target_freqs = [tuple(freqs) for freqs in target_freqs]
         # Otherwise there is just one interval
         else:
             # Non-informative variable: histogram with only the bin (min, max)
