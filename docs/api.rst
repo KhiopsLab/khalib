@@ -10,6 +10,10 @@ API Reference
    :member-order: bysource
 
 
+.. autofunction:: calibration_error
+
+.. autofunction:: build_reliability_diagram
+
 .. autoclass:: Histogram
    :members:
    :member-order: bysource
@@ -17,7 +21,6 @@ API Reference
 
 .. autofunction:: calibrate_binary
 
-.. autofunction:: calibration_error
 
 
 

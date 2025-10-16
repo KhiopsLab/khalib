@@ -3,7 +3,7 @@ author = "Felipe Olmos"
 release = "0.1"
 
 extensions = [
-    "myst_parser",
+    "myst_nb",  # activates myst_parser as well
     "numpydoc",
     "sphinx.ext.autodoc",
     "sphinx_copybutton",
@@ -22,6 +22,10 @@ autosummary_generate = True
 autosummary_ignore_module_all = False
 
 default_role = "obj"
+
+# Enable this to debug notebooks
+# nb_execution_allow_errors=True
+nb_execution_show_tb: True
 
 
 ## Numpydoc extension config

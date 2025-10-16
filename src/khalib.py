@@ -233,6 +233,9 @@ class Histogram:
                 do_data_preparation_only=True,
             )
             results = kh.read_analysis_results_file(f"{work_dir}/report.khj")
+            # import shutil
+
+            # shutil.copy(f"{work_dir}/report.khj", "tmp.khj")
 
         # Initialize the histogram
         if y is not None:
