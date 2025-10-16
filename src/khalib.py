@@ -814,6 +814,9 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         P : array-like of shape (n_samples, n_classes)
             The estimated calibrated probabilities for each class.
         """
+        # Check that is fitted
+        check_is_fitted(self)
+
         # Estimate the uncalibrated scores
         scores, _ = _get_response_values(
             self.fitted_estimator_,
