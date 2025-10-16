@@ -13,6 +13,8 @@ import pandas as pd
 from khiops import core as kh
 from khiops.core.internals.runner import KhiopsLocalRunner
 from khiops.sklearn import KhiopsClassifier
+from matplotlib import pyplot as plt
+from matplotlib.ticker import LogLocator
 from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin
 from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import train_test_split
@@ -874,3 +876,212 @@ def calibrate_binary(y_scores, histogram: Histogram, only_positive: bool = False
             calibrated_probas[it.index][1] = histogram.target_probas[bin_i][1]
 
     return calibrated_probas
+
+
+def build_reliability_diagram(
+    y_scores,
+    y,
+    dirac_threshold=1.0e-06,
+    log_plot_threshold=3.0,
+    min_density_bar_width=2.5e-03,
+):
+    """Builds a reliability diagram with the target score distribution below
+
+    To build the diagram this function uses Khiops supervised histograms. To build the
+    score distribution, it uses Khiops unsupervised histograms. Using the latter, it
+    implements a heuristic to dectect when the scores is distributed as a sum of diracs
+    and changes visualization accordingly.
+
+
+    Parameters
+    ----------
+    y_scores : array-like of shape (n_samples,) or (n_samples, 1) or (n_samples, 2)
+        Scores/probabilities. If it is a 2-D array the column indexed as 1 will be used
+        for the estimation.
+    y : array-like of shape (n_samples,) or (n_samples, n_classes)
+        Target values (class labels).
+    dirac_threshold : float, default=1.0e-06
+        If a bin in the scores' unsupervised histogram is lower than this
+        'dirac_threshold' then it is considered a dirac mass.
+    log_plot_threshold : float, default=3.0
+        *Density plot only:* If the log-difference between the maximal and minimal
+        positive density values is larger than 'log_plot_threshold' then the density
+        plot uses a log scale in the y-axis.
+    min_density_bar_width : float, default=5.0e-03
+        *Density plot only:* If a bin of the scores' unsupervised histogram has a width
+        lower than 'min_density_bar_width' then it is plotted as having a width of
+        'min_density_bar_width'.
+
+    Returns
+    -------
+    tuple
+        A 2-tuple containing:
+
+        - A `matplotlib.figure.Figure`.
+        - A `dict` containing two `matplotlib.axes.Axes` with keys, "reliability
+          diagram" and "score_distribution".
+    """
+    # Check the input parameters
+    if len(y_scores.shape) > 2:
+        raise ValueError(
+            "'y_scores' must be either a 1-D or 2-D array-like object, "
+            f"but its shape is {y_scores.shape}"
+        )
+    if len(y.shape) > 1:
+        raise ValueError(
+            f"'y_scores' must be a 1-D array-like object, but its shape is {y.shape}"
+        )
+    if dirac_threshold <= 0.0:
+        raise ValueError("'dirac_threshold' must be positive")
+    if log_plot_threshold <= 0.0:
+        raise ValueError("'log_plot_threshold' must be positive")
+    if min_density_bar_width <= 0.0:
+        raise ValueError("'min_density_bar_width' must be positive")
+
+    # Create the base plot
+    fig, axs = plt.subplot_mosaic(
+        [["reliability_diagram"], ["score_distribution"]],
+        figsize=(6, 6),
+        height_ratios=(4, 1),
+        sharex=True,
+    )
+    fig.subplots_adjust(hspace=0)
+    fig.suptitle("Reliability Diagram")
+
+    # Build a unsupervised histogram to to detect the dirac masses case
+    uhist_y_scores = Histogram.from_data(y_scores, use_finest=True)
+    dirac_indexes = []
+    if uhist_y_scores.freqs[1] == 0 and (
+        uhist_y_scores.bins[0][1] - uhist_y_scores.bins[0][0] < dirac_threshold
+    ):
+        dirac_indexes.append(True)
+    else:
+        dirac_indexes.append(False)
+    for i in range(1, uhist_y_scores.n_bins - 1):
+        cur_left, cur_right = uhist_y_scores.bins[i]
+        if (
+            uhist_y_scores.freqs[i - 1] == 0
+            and uhist_y_scores.freqs[i + 1] == 0
+            and (cur_right - cur_left < dirac_threshold)
+        ):
+            dirac_indexes.append(True)
+        else:
+            dirac_indexes.append(False)
+    if uhist_y_scores.freqs[-2] == 0 and (
+        uhist_y_scores.bins[-1][1] - uhist_y_scores.bins[-1][0] < dirac_threshold
+    ):
+        dirac_indexes.append(True)
+    else:
+        dirac_indexes.append(False)
+
+    # Compute the supervised score histogram
+    hist_y_scores = Histogram.from_data(y_scores, y)
+
+    # Case where are only dirac masses
+    n_nonzero_bins = sum(freq > 0 for freq in uhist_y_scores.freqs)
+    if sum(dirac_indexes) == n_nonzero_bins:
+        # Compute the dirac masses plot data
+        dirac_masses = [
+            freq / sum(uhist_y_scores.freqs)
+            for freq, is_dirac in zip(uhist_y_scores.freqs, dirac_indexes, strict=False)
+            if is_dirac
+        ]
+        dirac_locations = [
+            (left + right) / 2
+            for (left, right), is_dirac in zip(
+                uhist_y_scores.bins, dirac_indexes, strict=False
+            )
+            if is_dirac
+        ]
+        indexes = hist_y_scores.vfind(dirac_locations)
+        target_probas = [hist_y_scores.target_probas[i][1] for i in indexes]
+        axs["reliability_diagram"].scatter(
+            dirac_locations, target_probas, color="tab:red", alpha=0.8
+        )
+        axs["reliability_diagram"].plot(
+            (0, 1), (0, 1), color="tab:grey", linestyle="dotted"
+        )
+        for loc, mass in zip(dirac_locations, dirac_masses, strict=False):
+            axs["score_distribution"].annotate(
+                "",
+                xy=(loc, mass),
+                xytext=(loc, 0.0),
+                label="dirac masses",
+                arrowprops={
+                    "arrowstyle": "-|>",
+                    "shrinkA": 0,
+                    "shrinkB": 0,
+                    "color": "tab:blue",
+                },
+            )
+        axs["score_distribution"].grid(color="gainsboro")
+        axs["score_distribution"].set_xlabel("Score Positive Class")
+        axs["score_distribution"].set_ylabel("Probability")
+    # Case where there are only proper densities or a mix of both
+    else:
+        # Plot the reliability diagram
+        x = []
+        for intv in hist_y_scores.bins:
+            x.extend(intv)
+        x[0] = 0
+        x[-1] = 1
+        y = []
+        for probas in hist_y_scores.target_probas:
+            y.extend((probas[1], probas[1]))
+        axs["reliability_diagram"].plot(x, y)
+        axs["reliability_diagram"].plot(x, x, linestyle="dotted", color="gray")
+        axs["reliability_diagram"].fill_between(x, x, y, color="tab:red", alpha=0.2)
+        axs["reliability_diagram"].set_ylabel("Positive Class Probability")
+        axs["reliability_diagram"].grid(color="gainsboro")
+
+        # Recompute the density, this time we took the most interpretable histogram
+        uhist_y_scores = Histogram.from_data(y_scores)
+
+        # Plot the density
+        density_bar_starts = [
+            left
+            for (left, _), freq in zip(
+                uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
+            )
+            if freq > 0
+        ]
+        density_bar_widths = [
+            right - left
+            if right - left >= min_density_bar_width
+            else min_density_bar_width
+            for (left, right), freq in zip(
+                uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
+            )
+            if freq > 0
+        ]
+        density_bar_heights = [
+            density
+            for density, freq in zip(
+                uhist_y_scores.densities,
+                uhist_y_scores.freqs,
+                strict=True,
+            )
+            if freq > 0
+        ]
+        density_bar_log_range = None
+        if density_bar_heights:
+            density_bar_log_range = math.log10(max(density_bar_heights)) - math.log10(
+                min(density_bar_heights)
+            )
+        axs["score_distribution"].bar(
+            x=density_bar_starts,
+            height=density_bar_heights,
+            width=density_bar_widths,
+            align="edge",
+            label="Density",
+        )
+        axs["score_distribution"].grid(color="gainsboro")
+        axs["score_distribution"].set_xlabel("Score Positive Class")
+        axs["score_distribution"].set_ylabel("Density")
+        if density_bar_log_range > log_plot_threshold:
+            axs["score_distribution"].set_yscale("log")
+            axs["score_distribution"].yaxis.set_major_locator(
+                LogLocator(base=10, subs=[1], numticks=5)
+            )
+
+    return fig, axs
