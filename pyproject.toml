@@ -27,6 +27,7 @@ markers = [
 ]
 
 [tool.ruff.lint]
+exclude = ["docs/quickstart.py"]
 select = [
     "E",    # pycodestyle errors
     "F",    # pyflakes

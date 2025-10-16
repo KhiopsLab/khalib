@@ -12,9 +12,6 @@
 #     name: python3
 # ---
 
-# Disable "Module level import not at top of file"
-# ruff: noqa: E402
-
 # %% [markdown]
 #  # Quickstart
 #
