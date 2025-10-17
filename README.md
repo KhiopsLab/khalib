@@ -24,11 +24,17 @@ See the [documentation][khalib-docs] for more information.
 
 - Make sure you have installed [Khiops 11 Beta][khiops11-setup]
 - Execute
+
 ```bash
-pip install https://github.com/KhiopsLab/khalib/archive/refs/heads/main.zip
+pip install https://github.com/KhiopsLab/khalib/archive/refs/tags/0.1.zip
 ```
+
 <!-- end-install -->
 
+
+## Documentation
+
+See https://khiopslab.github.io/khalib/
 
 
 [khiops-org]: https://khiops.org

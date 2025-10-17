@@ -17,21 +17,15 @@ exclude_patterns = []
 html_theme = "furo"
 html_static_path = ["_static"]
 html_title = f"<h6><center>{project} {release}</center></h6>"
+default_role = "obj"
 
+# Extensions configs
+
+## autosummary
 autosummary_generate = True
 autosummary_ignore_module_all = False
 
-default_role = "obj"
-
-# Enable this to debug notebooks
-# nb_execution_allow_errors=True
-nb_execution_show_tb: True
-
-
-## Numpydoc extension config
-numpydoc_show_class_members = False
-
-## Autodoc extension config
+## autodoc
 autodoc_default_options = {
     "members": True,
     "inherited-members": False,
@@ -40,7 +34,17 @@ autodoc_default_options = {
     "special-members": False,
 }
 
-## Intersphinx extension config
+
+## myst_nb
+nb_execution_allow_errors = False  # Enable this to debug notebooks
+nb_execution_show_tb: True
+
+
+## numpydoc
+numpydoc_show_class_members = False
+
+
+## intersphinx
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
     "pandas": ("https://pandas.pydata.org/pandas-docs/dev", None),
