@@ -1,0 +1,43 @@
+name: Docs
+on:
+  workflow_dispatch:
+
+# Cancel any ongoing run of this workflow on the same PR or ref
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Required permissions to deploy in GH pages
+permissions:
+  id-token: write
+  pages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+      - name: Setup Python
+        run: uv python install
+      - name: Setup Just
+        uses: extractions/setup-just@v3
+      - name: Build docs
+        run: |
+          mkdir docs/_static
+          just docs
+      - name: Upload the package as an artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ./docs/_build/html
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

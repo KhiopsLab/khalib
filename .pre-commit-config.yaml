@@ -1,7 +1,19 @@
 repos:
-- repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: v0.12.4
-  hooks:
-    - id: ruff-check
-      args: [ --fix ]
-    - id: ruff-format
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.12.4
+    hooks:
+      - id: ruff-check
+        args: [ --fix ]
+      - id: ruff-format
+  - repo: https://github.com/mwouts/jupytext
+    rev: v1.17.3
+    hooks:
+    - id: jupytext
+      args: [--update, --from,  py:percent, --to, notebook]
+      files: docs/quickstart.py
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.8
+    hooks:
+      - id: actionlint
+        name: actionlint
+
