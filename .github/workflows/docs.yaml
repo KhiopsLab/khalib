@@ -1,6 +1,7 @@
 name: Docs
 on:
   workflow_dispatch:
+  pull_request:
 
 # Cancel any ongoing run of this workflow on the same PR or ref
 concurrency:
@@ -21,8 +22,15 @@ jobs:
         uses: astral-sh/setup-uv@v6
       - name: Setup Python
         run: uv python install
-      - name: Setup Just
+      - name: Setup just
         uses: extractions/setup-just@v3
+      - name: Setup Khiops
+        run: |
+          sudo apt-get update -y && sudo apt-get install wget lsb-release -y
+          CODENAME=$(lsb_release -cs)
+          TEMP_DEB="$(mktemp)"
+          wget -O "$TEMP_DEB" "https://github.com/KhiopsML/khiops/releases/download/11.0.0-b.0/khiops-core-openmpi_11.0.0-b.0-1-${CODENAME}.amd64.deb"
+          sudo dpkg -i "$TEMP_DEB" || sudo apt-get -f -y install
       - name: Build docs
         run: |
           mkdir docs/_static
@@ -36,8 +44,8 @@ jobs:
     needs: [build]
     runs-on: ubuntu-latest
     steps:
-      - name: Setup Pages
+      - name: Setup Github Pages
         uses: actions/configure-pages@v5
-      - name: Deploy to GitHub Pages
+      - name: Deploy docs to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4

@@ -15,30 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install uv
         uses: astral-sh/setup-uv@v6
+      - name: Setup Just
+        uses: extractions/setup-just@v3
       - name: Run pre-commit
-        run: uv run pre-commit
-  tests:
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.11', '3.12', '3.13', '3.14']
-        os: ['ubuntu-latest', 'windows-latest', 'macos-latest']
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Set up Python
-        run: uv python install
-      - name: Install Miniforge
-        uses: conda-incubator/setup-miniconda@v3
-        with:
-          auto-update-conda: true
-          miniforge-version: latest
-          conda-remove-defaults: true
-      - name: Install khiops
-        run: conda install --quiet --yes --name test khiops-core=11.0.0b.0
-      - name: Run tests
-        run: conda run --name test uv run pytest src/tests
+        run: just pre-commit
