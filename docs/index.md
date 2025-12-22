@@ -19,7 +19,7 @@ estimated. These histograms have the following properties:
 
 
 [khiops-org]: https://khiops.org
-[khiops11-setup]: https://khiops.org/11.0.0-b.0/setup/
+[khiops-setup]: https://khiops.org/setup/
 [sk-calclf]: https://scikit-learn.org/stable/modules/generated/sklearn.calibration.CalibratedClassifierCV.html
 [khalib-docs]: https://khiopsml.github.io/khalib
 

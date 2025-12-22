@@ -20,10 +20,8 @@ See the [documentation][khalib-docs] for more information.
 <!-- start-install -->
 ## Installation
 
-*Note: We'll improve this installation procedure soon!*
-
-- Make sure you have installed [Khiops 11 Beta][khiops11-setup]
-- Execute
+- [Install Khiops][khiops-setup]
+- Install the `khalib` python library:
 
 ```bash
 pip install https://github.com/KhiopsLab/khalib/archive/refs/tags/0.1.zip

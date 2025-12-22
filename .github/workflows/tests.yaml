@@ -33,6 +33,6 @@ jobs:
           miniforge-version: latest
           conda-remove-defaults: true
       - name: Install khiops
-        run: conda install --quiet --yes --name test khiops-core=11.0.0b.0
+        run: conda install --quiet --yes --name test khiops-core=11.0.0
       - name: Run tests
         run: conda run --name test uv run pytest src/tests
