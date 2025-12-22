@@ -6,12 +6,15 @@ suite.
 
 ## Features
 - `KhalibClassifier`: A scikit-learn estimator to calibrate classifiers with a similar interface
-  fashion as [CalibratedClassifierCV][sk-calclf].
+  as [CalibratedClassifierCV][sk-calclf].
 - `calibration_error` : A function to estimate the Estimated Calibration Error (ECE).
-- `build_reliability_diagram` : A function that builds a reliability diagram.
+- `build_reliability_diagram` : A function to build a reliability diagram.
 
 These features are based on Khiops's non-parametric supervised histograms, so there is no need to
 specify the number and width of the bins, as they are automatically estimated from data.
+
+[khiops-org]: https://khiops.org
+[sk-calclf]: https://scikit-learn.org/stable/modules/generated/sklearn.calibration.CalibratedClassifierCV.html
 
 <!-- end-summary -->
 
@@ -23,9 +26,10 @@ See the [documentation][khalib-docs] for more information.
 - [Install Khiops][khiops-setup]
 - Install the `khalib` python library:
 
-```bash
-pip install https://github.com/KhiopsLab/khalib/archive/refs/tags/0.1.zip
+```sh
+pip install khalib
 ```
+[khiops-setup]: https://khiops.org/setup/
 
 <!-- end-install -->
 
@@ -35,8 +39,4 @@ pip install https://github.com/KhiopsLab/khalib/archive/refs/tags/0.1.zip
 See https://khiopslab.github.io/khalib/
 
 
-[khiops-org]: https://khiops.org
-[khiops11-setup]: https://khiops.org/11.0.0-b.0/setup/
-[sk-calclf]: https://scikit-learn.org/stable/modules/generated/sklearn.calibration.CalibratedClassifierCV.html
 [khalib-docs]: https://khiopslab.github.io/khalib
-
