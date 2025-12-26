@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "khalib"
-version = "0.1"
+version = "0.2rc2"
 description = "Classifier Calibration with Khiops"
 authors = [{ name = "Felipe Olmos", email = "luisfelipe.olmosmarchant@orange.com" }]
 requires-python = ">=3.11"
@@ -14,8 +14,31 @@ dependencies = [
     "scikit-learn>=1.5.0",
     "matplotlib>=3.9.0",
 ]
+readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE.md"]
+classifiers=[
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python",
+  "Topic :: Software Development",
+  "Topic :: Scientific/Engineering",
+  "Development Status :: 5 - Production/Stable",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX",
+  "Operating System :: Unix",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+[project.urls]
+homepage = "https://khiopslab.github.io/khalib"
+source = "https://github.com/KhiopsLab/khalib"
+tracker = "https://github.com/KhiopsLab/khalib/issues"
+changelog = "https://github.com/KhiopsLab/khalib/blob/main/CHANGELOG.md"
 
 
 [tool.setuptools.packages.find]
