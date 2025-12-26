@@ -1,6 +1,6 @@
 alias pc := pre-commit
 pre-commit:
-  uv run pre-commit run --all-files
+  uvx pre-commit run --all-files
 
 alias d := docs
 docs:
