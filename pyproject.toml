@@ -18,8 +18,8 @@ license = "BSD-3-Clause"
 license-files = ["LICENSE.md"]
 
 
-[tools.setuptools]
-packages = ["khcalib"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 markers = [
