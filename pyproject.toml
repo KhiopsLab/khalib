@@ -43,6 +43,7 @@ changelog = "https://github.com/KhiopsLab/khalib/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["khalib"]
 
 [tool.pytest.ini_options]
 markers = [

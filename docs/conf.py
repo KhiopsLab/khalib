@@ -38,7 +38,7 @@ autosummary_ignore_module_all = False
 ## autodoc
 autodoc_default_options = {
     "members": True,
-    "inherited-members": False,
+    "inherited-members": True,
     "private-members": False,
     "show-inheritance": True,
     "special-members": False,
