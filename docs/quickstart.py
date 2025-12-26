@@ -112,3 +112,7 @@ calib_hist_ece_test = khalib.calibration_error(calib_hist_y_test_scores, y=y_tes
 print("CALIB HIST ECE:", calib_hist_ece_test)
 print("Reduction     :", (ece_test - calib_ece_test) / ece_test)
 _ = khalib.build_reliability_diagram(calib_hist_y_test_scores, y_test)
+
+# %%
+
+# %%

@@ -1,0 +1,71 @@
+name: Package
+on:
+  workflow_dispatch:
+    inputs:
+      pypi-target:
+          type: choice
+          default: no-op
+          options: [no-op, testpypi, pypi]
+          description: PyPI Target
+  pull_request:
+
+# Cancel any ongoing run of this workflow on the same PR or ref
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.14'
+          enable-cache: true
+      - name: Build Package
+        run: |
+          uv build --sdist
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: pip-package
+          path: dist/
+  publish-pypi:
+    if: inputs.pypi-target == 'pypi' && github.ref_type == 'tag' && github.repository_owner == 'KhiopsLab'
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/khalib
+    permissions:
+      id-token: write
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: pip-package
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+  publish-testpypi:
+    if: inputs.pypi-target == 'testpypi' && github.ref_type == 'tag' && github.repository_owner == 'KhiopsLab'
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/khalib
+    permissions:
+      id-token: write
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: pip-package
+          path: dist/
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/

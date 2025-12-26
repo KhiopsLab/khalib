@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
     - 'src/**'
+    - .github/workflows/tests.yaml
 
 # Cancel any ongoing run of this workflow on the same PR or ref
 concurrency:
@@ -24,15 +25,17 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Set up Python
-        run: uv python install
+          enable-cache: true
+      - name: Setup just
+        uses: extractions/setup-just@v3
       - name: Install Miniforge
         uses: conda-incubator/setup-miniconda@v3
         with:
           auto-update-conda: true
           miniforge-version: latest
           conda-remove-defaults: true
-      - name: Install khiops
-        run: conda install --quiet --yes --name test khiops-core=11.0.0b.0
+      - name: Install Khiops
+        run: conda install --quiet --yes --name test khiops-core>=11.0.0
       - name: Run tests
-        run: conda run --name test uv run pytest src/tests
+        # We run with `conda` so we find the khiops executables installed in the conda env
+        run: conda run --name test just test
