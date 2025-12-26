@@ -1,7 +1,17 @@
+# This script must be executed in its directory
+import importlib
+import sys
+
+# Obtain the project's version
+sys.path.append("../")
+khalib_version = importlib.metadata.version("khalib")
+
+# Basic Information
 project = "khalib"
 author = "Felipe Olmos"
-release = "0.1"
+release = khalib_version
 
+# Sphinx extensions
 extensions = [
     "myst_nb",  # activates myst_parser as well
     "numpydoc",
@@ -11,13 +21,13 @@ extensions = [
     "sphinx.ext.intersphinx",
 ]
 
+# Basic Sphinx config
+default_role = "obj"
 templates_path = ["_templates"]
 exclude_patterns = []
-
 html_theme = "furo"
 html_static_path = ["_static"]
 html_title = f"<h6><center>{project} {release}</center></h6>"
-default_role = "obj"
 
 # Extensions configs
 
