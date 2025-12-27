@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3] - 2025-12-26
+
+### Fixed
+- `ModuleNotFound` packaging error.
+
 ## [0.2] - 2025-12-26
 
 ### Changed
@@ -12,6 +17,7 @@
 - `calibration_error` function
 - `build_reliability_diagram` function
 
-[Unreleased]: https://github.com/yourusername/yourproject/compare/0.2...HEAD
+[Unreleased]: https://github.com/yourusername/yourproject/compare/0.3...HEAD
+[0.3]: https://github.com/yourusername/yourproject/compare/0.2...0.3
 [0.2]: https://github.com/yourusername/yourproject/compare/0.1...0.2
 [0.1]: https://github.com/yourusername/yourproject/releases/tag/0.1

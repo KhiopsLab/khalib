@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "khalib"
-version = "0.2"
+version = "0.3"
 description = "Classifier Calibration with Khiops"
 authors = [{ name = "Felipe Olmos", email = "luisfelipe.olmosmarchant@orange.com" }]
 requires-python = ">=3.11"
@@ -43,6 +43,7 @@ changelog = "https://github.com/KhiopsLab/khalib/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["khalib"]
 
 [tool.pytest.ini_options]
 markers = [
