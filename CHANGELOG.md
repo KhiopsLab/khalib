@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4] - 2026-01-05
+
+### Fixed
+
+- `build_reliability_diagram`: Error when scores are distributed uniformly.
+
 ## [0.3] - 2025-12-26
 
 ### Fixed
@@ -17,7 +23,8 @@
 - `calibration_error` function
 - `build_reliability_diagram` function
 
-[Unreleased]: https://github.com/yourusername/yourproject/compare/0.3...HEAD
-[0.3]: https://github.com/yourusername/yourproject/compare/0.2...0.3
-[0.2]: https://github.com/yourusername/yourproject/compare/0.1...0.2
-[0.1]: https://github.com/yourusername/yourproject/releases/tag/0.1
+[Unreleased]: https://github.com/khiopslab/khalib/compare/0.4...HEAD
+[0.4]: https://github.com/khiopslab/khalib/compare/0.3...0.4
+[0.3]: https://github.com/khiopslab/khalib/compare/0.2...0.3
+[0.2]: https://github.com/khiopslab/khalib/compare/0.1...0.2
+[0.1]: https://github.com/khiopslab/khalib/releases/tag/0.1
