@@ -11,7 +11,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.svm import SVC
 from sklearn.utils.validation import check_is_fitted
 
-from khalib import Histogram, KhalibClassifier, calibration_error
+from khalib import Histogram, KhalibClassifier, calibrate_binary, calibration_error
+from khalib.main import compute_dirac_indexes
 
 
 @pytest.fixture(name="data_root_dir")
@@ -443,3 +444,29 @@ class TestKhalibClassifier:
                 y_scores_calib_test, y_test, multi_class_method="top-label"
             )
             assert ece == pytest.approx(expected_ece, rel=1e-2)
+
+
+class TestDiracHeuristic:
+    def test_uniform(self):
+        # The uniform distribution should have only one bin and no diracs
+        rng = np.random.default_rng(seed=1234567)
+        y_scores = rng.uniform(size=2000)
+        uhist = Histogram.from_data(y_scores, use_finest=True)
+        assert compute_dirac_indexes(uhist, 1e-06) == [False, False]
+
+    def test_dirac(self):
+        y_scores = np.array([0.2] * 250 + [0.5] * 250 + [0.9] * 500)
+        y = np.array(
+            [0] * 200 + [1] * 50 + [0] * 125 + [1] * 125 + [0] * 50 + [1] * 450
+        )
+        hist = Histogram.from_data(y_scores, y=y)
+        y_scores_calib = calibrate_binary(y_scores, hist, only_positive=True)
+        uhist = Histogram.from_data(y_scores_calib, use_finest=True)
+        assert compute_dirac_indexes(uhist, 1e-06) == [True, False, True, False, True]
+
+    def test_beta(self):
+        # A sufficiently large continuous distribution sample should have no diracs
+        rng = np.random.default_rng(seed=1234567)
+        y_scores = rng.beta(a=0.5, b=0.5, size=2000)
+        uhist = Histogram.from_data(y_scores, use_finest=True)
+        assert not all(compute_dirac_indexes(uhist, 1e-06))

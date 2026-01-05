@@ -284,10 +284,13 @@ class Histogram:
                 else:
                     if use_finest:
                         histogram_index = -1
-                    else:
+                    elif 100 in score_stats.modl_histograms.information_rates:
                         histogram_index = (
                             score_stats.modl_histograms.information_rates.index(100)
                         )
+                    else:
+                        assert len(score_stats.modl_histograms.information_rates) == 1
+                        histogram_index = 0
                     breakpoints = score_stats.modl_histograms.histograms[
                         histogram_index
                     ].bounds
@@ -951,31 +954,11 @@ def build_reliability_diagram(
     fig.subplots_adjust(hspace=0)
     fig.suptitle("Reliability Diagram")
 
-    # Build a unsupervised histogram to to detect the dirac masses case
+    # Build a unsupervised histogram
     uhist_y_scores = Histogram.from_data(y_scores, use_finest=True)
-    dirac_indexes = []
-    if uhist_y_scores.freqs[1] == 0 and (
-        uhist_y_scores.bins[0][1] - uhist_y_scores.bins[0][0] < dirac_threshold
-    ):
-        dirac_indexes.append(True)
-    else:
-        dirac_indexes.append(False)
-    for i in range(1, uhist_y_scores.n_bins - 1):
-        cur_left, cur_right = uhist_y_scores.bins[i]
-        if (
-            uhist_y_scores.freqs[i - 1] == 0
-            and uhist_y_scores.freqs[i + 1] == 0
-            and (cur_right - cur_left < dirac_threshold)
-        ):
-            dirac_indexes.append(True)
-        else:
-            dirac_indexes.append(False)
-    if uhist_y_scores.freqs[-2] == 0 and (
-        uhist_y_scores.bins[-1][1] - uhist_y_scores.bins[-1][0] < dirac_threshold
-    ):
-        dirac_indexes.append(True)
-    else:
-        dirac_indexes.append(False)
+
+    # Compute the dirac mass indexes
+    dirac_indexes = compute_dirac_indexes(uhist_y_scores, dirac_threshold)
 
     # Compute the supervised score histogram
     hist_y_scores = Histogram.from_data(y_scores, y)
@@ -1088,3 +1071,43 @@ def build_reliability_diagram(
             )
 
     return fig, axs
+
+
+def compute_dirac_indexes(uhist, dirac_threshold):
+    """Computes the dirac mass indexes of a histogram
+
+    We declare a dirac mass bin if:
+
+    - it is surrounded by empty bins.
+    - its length is less than ``dirac_threshold``
+
+    """
+    dirac_indexes = []
+    if (
+        len(uhist.freqs) > 1
+        and uhist.freqs[1] == 0
+        and (uhist.bins[0][1] - uhist.bins[0][0] < dirac_threshold)
+    ):
+        dirac_indexes.append(True)
+    else:
+        dirac_indexes.append(False)
+    for i in range(1, uhist.n_bins - 1):
+        cur_left, cur_right = uhist.bins[i]
+        if (
+            uhist.freqs[i - 1] == 0
+            and uhist.freqs[i + 1] == 0
+            and (cur_right - cur_left < dirac_threshold)
+        ):
+            dirac_indexes.append(True)
+        else:
+            dirac_indexes.append(False)
+    if (
+        len(uhist.freqs) > 2
+        and uhist.freqs[-2] == 0
+        and (uhist.bins[-1][1] - uhist.bins[-1][0] < dirac_threshold)
+    ):
+        dirac_indexes.append(True)
+    else:
+        dirac_indexes.append(False)
+
+    return dirac_indexes
