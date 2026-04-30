@@ -417,8 +417,10 @@ class Histogram:
                         f"the number of classes: {len(tfreqs)} != {len(self.classes)}."
                     )
                 if sum(tfreqs) != self.freqs[i]:
-                    f"`target_freqs` at bin index {i} sums different from the bin "
-                    f"frequency: {sum(tfreqs)} != {self.freqs[i]}"
+                    raise ValueError(
+                        f"`target_freqs` at bin index {i} sums different from the bin "
+                        f"frequency: {sum(tfreqs)} != {self.freqs[i]}"
+                    )
 
         # Initialize the densities and target probabilities
         self.densities = [
