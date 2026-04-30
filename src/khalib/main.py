@@ -304,10 +304,8 @@ class Histogram:
                     y_indexes = le.transform(y)
                     x_bin_indexes = (
                         np.searchsorted(breakpoints[:-1], x, side="left") - 1
-                    ).reshape(1, -1)
+                    ).reshape(-1)
                     x_bin_indexes[x_bin_indexes < 0] = 0
-                    # Note: reshape is needed for the 1-column matrix case if not the
-                    # iterator below does not work
 
                     # Compute the target frequencies
                     target_freqs = [[0 for _ in le.classes_] for _ in breakpoints[:-1]]
@@ -315,7 +313,7 @@ class Histogram:
                         [x_bin_indexes, y_indexes]
                     ):
                         target_freqs[y_score_bin_index][y_index] += 1
-                    target_freqs = [tuple(freqs) for freqs in target_freqs]
+                    target_freqs = [tuple(tf) for tf in target_freqs]
         # Otherwise there is just one interval
         else:
             # Non-informative variable: histogram with only the bin (min, max)
@@ -799,11 +797,6 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
                 for k in range(n_classes)
             ]
 
-            calibrated_probas = np.empty(scores.shape)
-            for k, histogram in enumerate(self.histograms_):
-                calibrated_probas[:, k] = calibrate_binary(
-                    scores[:, k], histogram, only_positive=True
-                )
         return self
 
     def predict_proba(self, X):  # noqa: N803
@@ -915,7 +908,7 @@ def build_reliability_diagram(
         *Density plot only:* If the log-difference between the maximal and minimal
         positive density values is larger than 'log_plot_threshold' then the density
         plot uses a log scale in the y-axis.
-    min_density_bar_width : float, default=5.0e-03
+    min_density_bar_width : float, default=2.5e-03
         *Density plot only:* If a bin of the scores' unsupervised histogram has a width
         lower than 'min_density_bar_width' then it is plotted as having a width of
         'min_density_bar_width'.
@@ -937,7 +930,7 @@ def build_reliability_diagram(
         )
     if len(y.shape) > 1:
         raise ValueError(
-            f"'y_scores' must be a 1-D array-like object, but its shape is {y.shape}"
+            f"'y' must be a 1-D array-like object, but its shape is {y.shape}"
         )
     if dirac_threshold <= 0.0:
         raise ValueError("'dirac_threshold' must be positive")
