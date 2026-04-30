@@ -1080,10 +1080,19 @@ def compute_dirac_indexes(uhist, dirac_threshold):
 
     We declare a dirac mass bin if:
 
-    - it is surrounded by empty bins.
+    - it is surrounded by empty bins or if it is the only one
     - its length is less than ``dirac_threshold``
 
     """
+
+    # Early return for just one bin
+    if len(uhist.freqs) == 1:
+        if uhist.bins[0][1] - uhist.bins[0][0] < dirac_threshold:
+            return [True]
+        else:
+            return [False]
+
+    # More than one bin
     dirac_indexes = []
     if (
         len(uhist.freqs) > 1
@@ -1104,7 +1113,7 @@ def compute_dirac_indexes(uhist, dirac_threshold):
         else:
             dirac_indexes.append(False)
     if (
-        len(uhist.freqs) > 2
+        len(uhist.freqs) > 1
         and uhist.freqs[-2] == 0
         and (uhist.bins[-1][1] - uhist.bins[-1][0] < dirac_threshold)
     ):

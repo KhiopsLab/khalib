@@ -452,7 +452,7 @@ class TestDiracHeuristic:
         rng = np.random.default_rng(seed=1234567)
         y_scores = rng.uniform(size=2000)
         uhist = Histogram.from_data(y_scores, use_finest=True)
-        assert compute_dirac_indexes(uhist, 1e-06) == [False, False]
+        assert compute_dirac_indexes(uhist, 1e-06) == [False]
 
     def test_dirac(self):
         y_scores = np.array([0.2] * 250 + [0.5] * 250 + [0.9] * 500)
