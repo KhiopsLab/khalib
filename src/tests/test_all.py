@@ -155,6 +155,19 @@ class TestHistogram:
             [histogram.find(score) for score in histogram.breakpoints],
         )
 
+    def test_find_vfind_boundary_coherence(self):
+        """Test find/vfind agree on all boundary edge cases"""
+        histogram = Histogram(
+            breakpoints=[0.0, 0.3, 0.7, 1.0],
+            freqs=[10, 20, 15],
+        )
+        # Test: below min, at each breakpoint, between bins, above max
+        edge_values = [-0.5, 0.0, 0.15, 0.3, 0.5, 0.7, 0.85, 1.0, 1.5]
+        np.testing.assert_array_equal(
+            histogram.vfind(edge_values),
+            [histogram.find(v) for v in edge_values],
+        )
+
     @pytest.mark.parametrize("y_scores_fixture", ["original", "constant"])
     @pytest.mark.parametrize("method", ["eq-freq", "eq-width", "khiops"])
     def test_manual_vs_khiops_coherence(
