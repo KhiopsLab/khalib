@@ -1051,7 +1051,7 @@ def build_reliability_diagram(
             )
             if freq > 0
         ]
-        density_bar_log_range = None
+        density_bar_log_range = 0
         if density_bar_heights:
             density_bar_log_range = math.log10(max(density_bar_heights)) - math.log10(
                 min(density_bar_heights)
