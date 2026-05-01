@@ -19,9 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Setup uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v8.1.0
         with:
           python-version: '3.14'
           enable-cache: true
@@ -44,7 +44,7 @@ jobs:
       id-token: write
     steps:
       - name: Download package artifact
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: pip-package
           path: dist/
@@ -61,7 +61,7 @@ jobs:
       id-token: write
     steps:
       - name: Download package artifact
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: pip-package
           path: dist/
