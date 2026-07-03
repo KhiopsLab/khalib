@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6] - 2026-07-03
+
+### Changed
+- Simplify installation by using the latest Khiops version: No other installation is necessary.
+
 ## [0.5] - 2026-04-30
 
 ### Fixed
@@ -29,7 +34,8 @@
 - `calibration_error` function
 - `build_reliability_diagram` function
 
-[Unreleased]: https://github.com/khiopslab/khalib/compare/0.5...HEAD
+[Unreleased]: https://github.com/khiopslab/khalib/compare/0.6...HEAD
+[0.6]: https://github.com/khiopslab/khalib/compare/0.5...0.6
 [0.5]: https://github.com/khiopslab/khalib/compare/0.4...0.5
 [0.4]: https://github.com/khiopslab/khalib/compare/0.3...0.4
 [0.3]: https://github.com/khiopslab/khalib/compare/0.2...0.3
