@@ -25,11 +25,6 @@ jobs:
           enable-cache: true
       - name: Setup just
         uses: extractions/setup-just@v4
-      - name: Setup Khiops
-        run: |
-          sudo apt-get update -y && sudo apt-get install wget lsb-release -y
-          wget -O "./khiops.deb" "https://github.com/KhiopsML/khiops/releases/download/11.0.0/khiops-core-openmpi_11.0.0-1-$(lsb_release -cs).amd64.deb"
-          sudo dpkg -i "./khiops.deb" || sudo apt-get -f -y install
       - name: Build docs
         run: |
           mkdir docs/_static

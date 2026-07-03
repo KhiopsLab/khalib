@@ -23,13 +23,9 @@ See the [documentation][khalib-docs] for more information.
 <!-- start-install -->
 ## Installation
 
-- [Install Khiops][khiops-setup]
-- Install the `khalib` python library:
-
 ```sh
 pip install khalib
 ```
-[khiops-setup]: https://khiops.org/setup/
 
 <!-- end-install -->
 
