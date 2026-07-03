@@ -22,20 +22,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@v8.2.0
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - name: Setup just
         uses: extractions/setup-just@v4
-      - name: Install Miniforge
-        uses: conda-incubator/setup-miniconda@v4
-        with:
-          auto-update-conda: true
-          miniforge-version: latest
-          conda-remove-defaults: true
-      - name: Install Khiops
-        run: conda install --quiet --yes --name test khiops-core>=11.0.0
-      - name: Run tests
-        # We run with `conda` so we find the khiops executables installed in the conda env
-        run: conda run --name test just test
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Add the path of Intel MPI DLL: For some reason uv doesn't take it into account
+          # in the github runner
+          $env:PATH = "$($PWD.Path)\.venv\Library\bin;$env:PATH"
+          just test -x
+      - name: Run tests (*nix)
+        if: runner.os != 'Windows'
+        run: just test -x
+
