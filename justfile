@@ -1,6 +1,6 @@
-alias pc := pre-commit
-pre-commit:
-  uvx pre-commit run --all-files
+alias pk := prek
+prek:
+  uvx prek run --all-files
 
 alias d := docs
 docs:
@@ -10,5 +10,4 @@ alias t := test
 [positional-arguments]
 @test *args:
   uv run pytest src/tests "$@"
-
 
