@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from khiops.sklearn import KhiopsClassifier
+from matplotlib import pyplot as plt
 from scipy.sparse import coo_matrix, csr_matrix, dok_matrix, lil_matrix
 from sklearn.datasets import make_classification
 from sklearn.exceptions import NotFittedError
@@ -18,7 +19,13 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from sklearn.utils.validation import check_is_fitted
 
-from khalib import Histogram, KhalibClassifier, calibrate_binary, calibration_error
+from khalib import (
+    Histogram,
+    KhalibClassifier,
+    build_reliability_diagram,
+    calibrate_binary,
+    calibration_error,
+)
 from khalib import main as khalib_main
 from khalib.main import compute_dirac_indexes
 
@@ -148,6 +155,14 @@ def test_calibration_error_accepts_numpy_boolean_reuse_stats():
     assert calibration_error(
         [0.1, 0.9], [0, 1], histogram=histogram, reuse_stats=np.bool_(True)
     ) == pytest.approx(0.4)
+
+
+def test_dirac_rejects_complex_threshold():
+    histogram = Histogram([0.0, 1.0], [2])
+    with pytest.raises(
+        ValueError, match="'dirac_threshold' must contain only real values"
+    ):
+        compute_dirac_indexes(histogram, np.complex128(1e-6))
 
 
 @pytest.fixture(name="data_root_dir")
@@ -2184,7 +2199,180 @@ class TestCalibrateBinary:
             calibrate_binary(scores, histogram)
 
 
+class TestReliabilityDiagram:
+    def test_closes_figure_when_histogram_construction_fails(self, monkeypatch):
+        previous_figures = set(plt.get_fignums())
+
+        def fail_histogram(*args, **kwargs):
+            raise RuntimeError("Histogram construction failed")
+
+        monkeypatch.setattr(Histogram, "from_data", fail_histogram)
+        with pytest.raises(RuntimeError, match="Histogram construction failed"):
+            build_reliability_diagram([0.1, 0.9], [0, 1])
+
+        assert set(plt.get_fignums()) == previous_figures
+
+    @pytest.mark.parametrize(
+        "threshold", ["dirac_threshold", "log_plot_threshold", "min_density_bar_width"]
+    )
+    @pytest.mark.parametrize(
+        "value", [np.inf, -np.inf, np.nan, 10**400, True, np.bool_(True)]
+    )
+    def test_rejects_invalid_plotting_thresholds(self, monkeypatch, threshold, value):
+        def unexpected_plot(*args, **kwargs):
+            pytest.fail("Threshold validation must precede plotting")
+
+        monkeypatch.setattr(plt, "subplot_mosaic", unexpected_plot)
+        with pytest.raises(
+            ValueError, match=f"'{threshold}' must be finite and positive"
+        ):
+            build_reliability_diagram([0.1, 0.9], [0, 1], **{threshold: value})
+
+    @pytest.mark.parametrize(
+        "threshold", ["dirac_threshold", "log_plot_threshold", "min_density_bar_width"]
+    )
+    def test_rejects_nonpositive_plotting_thresholds(self, threshold):
+        with pytest.raises(
+            ValueError, match=f"'{threshold}' must be finite and positive"
+        ):
+            build_reliability_diagram([0.1, 0.9], [0, 1], **{threshold: 0.0})
+
+    @pytest.mark.parametrize(
+        "threshold", ["dirac_threshold", "log_plot_threshold", "min_density_bar_width"]
+    )
+    @pytest.mark.parametrize("value", ["0.1", None, [0.1, 0.2]])
+    def test_rejects_non_numeric_plotting_thresholds(self, threshold, value):
+        with pytest.raises(TypeError, match=f"'{threshold}' must be a real number"):
+            build_reliability_diagram([0.1, 0.9], [0, 1], **{threshold: value})
+
+    @pytest.mark.parametrize(
+        "scores", [[np.nan, 0.9], [[np.nan], [0.9]], [[np.nan, 0.1], [0.1, 0.9]]]
+    )
+    @pytest.mark.parametrize("dtype", [float, object])
+    def test_rejects_nan_scores_before_plotting(self, monkeypatch, scores, dtype):
+        # Reject NaN even in the unused column before allocating a figure
+        def unexpected_plot(*args, **kwargs):
+            pytest.fail("NaN validation must precede plotting")
+
+        monkeypatch.setattr(plt, "subplot_mosaic", unexpected_plot)
+        with pytest.raises(ValueError, match="'y_scores' must not contain NaN"):
+            build_reliability_diagram(np.array(scores, dtype=dtype), [0, 1])
+
+    @pytest.mark.parametrize("scores", [[-np.inf, 0.9], [[0.9, -np.inf], [0.1, 0.9]]])
+    def test_rejects_infinite_scores_before_plotting(self, monkeypatch, scores):
+        def unexpected_plot(*args, **kwargs):
+            pytest.fail("Infinite-score validation must precede plotting")
+
+        monkeypatch.setattr(plt, "subplot_mosaic", unexpected_plot)
+        with pytest.raises(ValueError, match="'y_scores' must not contain infinite"):
+            build_reliability_diagram(scores, [0, 1])
+
+    @pytest.mark.parametrize(
+        "scores",
+        [
+            [-0.1, 0.9],
+            [0.1, 1.1],
+            [[1.1, 0.5], [0.1, 0.9]],
+            [[0.9, 0.1], [0.1, -0.1]],
+        ],
+    )
+    def test_rejects_scores_outside_unit_interval_before_plotting(
+        self, monkeypatch, scores
+    ):
+        def unexpected_plot(*args, **kwargs):
+            pytest.fail("Score-range validation must precede plotting")
+
+        monkeypatch.setattr(plt, "subplot_mosaic", unexpected_plot)
+        with pytest.raises(
+            ValueError, match="'y_scores' must be in the range \\[0, 1\\]"
+        ):
+            build_reliability_diagram(scores, [0, 1])
+
+    @pytest.mark.parametrize("labels", [[0, 0, 0], ["cat"] * 3, [0, 1, 2]])
+    @pytest.mark.parametrize("as_column", [False, True])
+    def test_rejects_nonbinary_targets_before_plotting(
+        self, monkeypatch, labels, as_column
+    ):
+        # Invalid targets must not create figures or launch histogram construction
+        def unexpected_work(*args, **kwargs):
+            pytest.fail("Target validation must precede plotting and histograms")
+
+        monkeypatch.setattr(plt, "subplot_mosaic", unexpected_work)
+        monkeypatch.setattr(Histogram, "from_data", unexpected_work)
+        y = np.array(labels)
+        if as_column:
+            y = y[:, np.newaxis]
+        with pytest.raises(ValueError, match="exactly two distinct target labels"):
+            build_reliability_diagram([0.1, 0.5, 0.9], y)
+
+    @pytest.mark.parametrize(
+        ("scores", "y"),
+        [([0.1], [0, 1]), ([0.1, 0.9], [0]), ([[0.9, 0.1]], [0, 1])],
+    )
+    def test_rejects_mismatched_sample_counts(self, scores, y):
+        with pytest.raises(ValueError, match="inconsistent numbers of samples"):
+            build_reliability_diagram(scores, y)
+
+    @pytest.mark.parametrize("score_fixture", ["original", "constant"])
+    @pytest.mark.parametrize("n_columns", [1, 2])
+    @pytest.mark.parametrize("dtype", [float, object])
+    def test_score_shapes_produce_same_diagram(
+        self, score_fixture, n_columns, dtype, y_scores_fixtures, y_fixtures
+    ):
+        # Compare supported matrix inputs with positive-class scores
+        scores = np.asarray(y_scores_fixtures[score_fixture])
+        matrix = (
+            scores[:, np.newaxis]
+            if n_columns == 1
+            else np.column_stack([1 - scores, scores])
+        )
+        figures = []
+        try:
+            for values, labels in (
+                (scores, y_fixtures["int"].tolist()),
+                (matrix.astype(dtype), np.asarray(y_fixtures["int"])[:, np.newaxis]),
+            ):
+                figure, _ = build_reliability_diagram(values, labels)
+                figures.append(figure)
+                figure.canvas.draw()
+            np.testing.assert_array_equal(
+                np.asarray(figures[0].canvas.buffer_rgba()),
+                np.asarray(figures[1].canvas.buffer_rgba()),
+            )
+        finally:
+            for figure in figures:
+                plt.close(figure)
+
+    @pytest.mark.parametrize(
+        "scores", [np.array(0.5), np.empty((2, 0)), np.ones((2, 3)), np.ones((2, 1, 1))]
+    )
+    def test_invalid_score_shapes(self, scores):
+        with pytest.raises(ValueError, match="one or two columns"):
+            build_reliability_diagram(scores, np.array([0, 1]))
+
+
 class TestDiracHeuristic:
+    @pytest.mark.parametrize(
+        ("freqs", "expected"),
+        [
+            ([0, 0, 1, 0, 0], [False, False, True, False, False]),
+            ([1, 0, 0, 0, 1], [True, False, False, False, True]),
+            ([1, 1, 0, 1, 1], [False, False, False, False, False]),
+        ],
+    )
+    def test_only_populated_isolated_bins_are_diracs(self, freqs, expected):
+        histogram = Histogram(
+            breakpoints=[0.0, 1e-8, 2e-8, 3e-8, 4e-8, 5e-8], freqs=freqs
+        )
+        assert compute_dirac_indexes(histogram, 1e-6) == expected
+
+    @pytest.mark.parametrize(
+        ("width", "expected"), [(1e-8, True), (1e-6, False), (1e-4, False)]
+    )
+    def test_single_bin_width_threshold(self, width, expected):
+        histogram = Histogram(breakpoints=[0.0, width], freqs=[1])
+        assert compute_dirac_indexes(histogram, 1e-6) == [expected]
+
     def test_uniform(self):
         # The uniform distribution should have only one bin and no diracs
         rng = np.random.default_rng(seed=1234567)

@@ -1493,10 +1493,10 @@ def build_reliability_diagram(
     Parameters
     ----------
     y_scores : array-like of shape (n_samples,) or (n_samples, 1) or (n_samples, 2)
-        Scores/probabilities. If it is a 2-D array the column indexed as 1 will be used
-        for the estimation.
-    y : array-like of shape (n_samples,) or (n_samples, n_classes)
-        Target values (class labels).
+        Positive-class scores/probabilities. For a two-column array, column 1
+        is used; a single-column array is flattened.
+    y : array-like of shape (n_samples,) or (n_samples, 1)
+        Target values containing exactly two distinct class labels.
     dirac_threshold : float, default=1.0e-06
         If a bin in the scores' unsupervised histogram is lower than this
         'dirac_threshold' then it is considered a dirac mass.
@@ -1517,23 +1517,66 @@ def build_reliability_diagram(
         - A `matplotlib.figure.Figure`.
         - A `dict` containing two `matplotlib.axes.Axes` with keys, "reliability
           diagram" and "score_distribution".
+
+    Raises
+    ------
+    ValueError
+        Raised in the following cases:
+
+        - Scores and labels have different numbers of samples.
+        - Target labels do not contain exactly two distinct classes.
+        - Scores contain nonnumeric values.
+        - Scores contain NaN or missing values.
+        - Scores contain boolean values.
+        - Scores contain infinite values.
+        - Scores contain values outside the finite floating-point range.
+        - Scores are outside the range [0, 1].
+        - Labels contain NaN or missing values.
+        - Plotting thresholds are nonfinite or nonpositive.
+        - Scores, labels, or plotting thresholds contain complex values.
+    TypeError
+        A plotting threshold is not a real number.
     """
     # Check the input parameters
-    if len(y_scores.shape) > 2:
+    for name, value in (
+        ("dirac_threshold", dirac_threshold),
+        ("log_plot_threshold", log_plot_threshold),
+        ("min_density_bar_width", min_density_bar_width),
+    ):
+        _check_real_values(value, name)
+        try:
+            is_valid = (
+                not isinstance(value, (bool, np.bool_))
+                and math.isfinite(value)
+                and value > 0.0
+            )
+        except TypeError as error:
+            raise TypeError(f"'{name}' must be a real number.") from error
+        except OverflowError:
+            is_valid = False
+        if not is_valid:
+            raise ValueError(f"'{name}' must be finite and positive.")
+    y_scores = _as_score_array(y_scores, "y_scores")
+    if y_scores.ndim not in (1, 2) or (
+        y_scores.ndim == 2 and y_scores.shape[1] not in (1, 2)
+    ):
         raise ValueError(
-            "'y_scores' must be either a 1-D or 2-D array-like object, "
+            "'y_scores' must be 1-D or 2-D with one or two columns, "
             f"but its shape is {y_scores.shape}"
         )
-    if len(y.shape) > 1:
+    y = _as_1d_array(y, "y")
+    _check_no_missing_values(y, "y")
+    check_consistent_length(y_scores, y)
+    _check_no_infinite_values(y_scores, "y_scores")
+    if np.any(y_scores < 0) or np.any(y_scores > 1):
+        raise ValueError("'y_scores' must be in the range [0, 1].")
+    if len(np.unique(y)) != 2:
         raise ValueError(
-            f"'y' must be a 1-D array-like object, but its shape is {y.shape}"
+            "Reliability diagrams require exactly two distinct target labels in 'y'."
         )
-    if dirac_threshold <= 0.0:
-        raise ValueError("'dirac_threshold' must be positive")
-    if log_plot_threshold <= 0.0:
-        raise ValueError("'log_plot_threshold' must be positive")
-    if min_density_bar_width <= 0.0:
-        raise ValueError("'min_density_bar_width' must be positive")
+    # Normalize positive-class scores for all histogram computations
+    if y_scores.ndim == 2:
+        y_scores = y_scores[:, -1]
 
     # Create the base plot
     fig, axs = plt.subplot_mosaic(
@@ -1546,13 +1589,21 @@ def build_reliability_diagram(
     fig.suptitle("Reliability Diagram")
 
     # Build a unsupervised histogram
-    uhist_y_scores = Histogram.from_data(y_scores, use_finest=True)
+    try:
+        uhist_y_scores = Histogram.from_data(y_scores, use_finest=True)
+    except Exception:
+        plt.close(fig)
+        raise
 
     # Compute the dirac mass indexes
     dirac_indexes = compute_dirac_indexes(uhist_y_scores, dirac_threshold)
 
     # Compute the supervised score histogram
-    hist_y_scores = Histogram.from_data(y_scores, y)
+    try:
+        hist_y_scores = Histogram.from_data(y_scores, y)
+    except Exception:
+        plt.close(fig)
+        raise
 
     # Case where are only dirac masses
     n_nonzero_bins = sum(freq > 0 for freq in uhist_y_scores.freqs)
@@ -1612,7 +1663,11 @@ def build_reliability_diagram(
         axs["reliability_diagram"].grid(color="gainsboro")
 
         # Recompute the density, this time we took the most interpretable histogram
-        uhist_y_scores = Histogram.from_data(y_scores)
+        try:
+            uhist_y_scores = Histogram.from_data(y_scores)
+        except Exception:
+            plt.close(fig)
+            raise
 
         # Plot the density
         density_bar_starts = [
@@ -1669,14 +1724,20 @@ def compute_dirac_indexes(uhist, dirac_threshold):
 
     We declare a dirac mass bin if:
 
+    - it contains observations
     - it is surrounded by empty bins or if it is the only one
     - its length is less than ``dirac_threshold``
 
+    Raises
+    ------
+    ValueError
+        If dirac_threshold is complex.
     """
+    _check_real_values(dirac_threshold, "dirac_threshold")
 
     # Early return for just one bin
     if len(uhist.freqs) == 1:
-        if uhist.bins[0][1] - uhist.bins[0][0] < dirac_threshold:
+        if uhist.freqs[0] > 0 and uhist.bins[0][1] - uhist.bins[0][0] < dirac_threshold:
             return [True]
         else:
             return [False]
@@ -1685,6 +1746,7 @@ def compute_dirac_indexes(uhist, dirac_threshold):
     dirac_indexes = []
     if (
         len(uhist.freqs) > 1
+        and uhist.freqs[0] > 0
         and uhist.freqs[1] == 0
         and (uhist.bins[0][1] - uhist.bins[0][0] < dirac_threshold)
     ):
@@ -1694,7 +1756,8 @@ def compute_dirac_indexes(uhist, dirac_threshold):
     for i in range(1, uhist.n_bins - 1):
         cur_left, cur_right = uhist.bins[i]
         if (
-            uhist.freqs[i - 1] == 0
+            uhist.freqs[i] > 0
+            and uhist.freqs[i - 1] == 0
             and uhist.freqs[i + 1] == 0
             and (cur_right - cur_left < dirac_threshold)
         ):
@@ -1703,6 +1766,7 @@ def compute_dirac_indexes(uhist, dirac_threshold):
             dirac_indexes.append(False)
     if (
         len(uhist.freqs) > 1
+        and uhist.freqs[-1] > 0
         and uhist.freqs[-2] == 0
         and (uhist.bins[-1][1] - uhist.bins[-1][0] < dirac_threshold)
     ):
