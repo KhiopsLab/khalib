@@ -164,6 +164,29 @@ def test_score_apis_reject_complex_labels(function, labels):
 
 
 @pytest.mark.parametrize(
+    "function",
+    [
+        pytest.param(partial(Histogram.from_data, [0.1, 0.9]), id="histogram-khiops"),
+        pytest.param(
+            partial(Histogram.from_data, [0.1, 0.9], method="eq-width"),
+            id="histogram-eq-width",
+        ),
+        pytest.param(
+            partial(Histogram.from_data_and_breakpoints, [0.1, 0.9], [0.0, 1.0]),
+            id="histogram-manual",
+        ),
+        pytest.param(
+            partial(calibration_error, [0.1, 0.9], histogram_method="eq-width"),
+            id="ece-eq-width",
+        ),
+        pytest.param(
+            partial(calibration_error, [0.1, 0.9], histogram_method="eq-freq"),
+            id="ece-eq-freq",
+        ),
+        pytest.param(partial(build_reliability_diagram, [0.1, 0.9]), id="diagram"),
+    ],
+)
+@pytest.mark.parametrize(
     "labels",
     [
         [0, np.nan],
@@ -171,20 +194,9 @@ def test_score_apis_reject_complex_labels(function, labels):
         np.array(["class", pd.NA], dtype=object),
     ],
 )
-def test_histogram_and_score_apis_reject_missing_labels(labels):
+def test_histogram_and_score_apis_reject_missing_labels(function, labels):
     with pytest.raises(ValueError, match="'y' must not contain NaN or missing values"):
-        Histogram.from_data([0.1, 0.9], labels)
-    with pytest.raises(ValueError, match="'y' must not contain NaN or missing values"):
-        Histogram.from_data([0.1, 0.9], labels, method="eq-width")
-    with pytest.raises(ValueError, match="'y' must not contain NaN or missing values"):
-        Histogram.from_data_and_breakpoints([0.1, 0.9], [0.0, 1.0], labels)
-    for method in ("eq-width", "eq-freq"):
-        with pytest.raises(
-            ValueError, match="'y' must not contain NaN or missing values"
-        ):
-            calibration_error([0.1, 0.9], labels, histogram_method=method)
-    with pytest.raises(ValueError, match="'y' must not contain NaN or missing values"):
-        build_reliability_diagram([0.1, 0.9], labels)
+        function(labels)
 
 
 @pytest.mark.parametrize("missing", [np.nan, pd.NA])
@@ -702,20 +714,23 @@ class TestHistogram:
             )
 
     @pytest.mark.parametrize("scores", [[10**400, 10**400 + 1], [10**400, 0.5]])
-    def test_rejects_scores_outside_finite_float_range(self, scores):
+    @pytest.mark.parametrize(
+        "api", ["histogram", "manual", "vfind", "ece", "calibrate", "diagram"]
+    )
+    def test_rejects_scores_outside_finite_float_range(self, scores, api):
         histogram = Histogram([0.0, 1.0], [2], target_freqs=[(1, 1)], classes=[0, 1])
+        function = {
+            "histogram": partial(Histogram.from_data, method="eq-width"),
+            "manual": partial(
+                Histogram.from_data_and_breakpoints, breakpoints=[0.0, 1.0]
+            ),
+            "vfind": histogram.vfind,
+            "ece": partial(calibration_error, y=[0, 1], histogram=histogram),
+            "calibrate": partial(calibrate_binary, histogram=histogram),
+            "diagram": partial(build_reliability_diagram, y=[0, 1]),
+        }[api]
         with pytest.raises(ValueError, match="within the finite floating-point range"):
-            Histogram.from_data(scores, method="eq-width")
-        with pytest.raises(ValueError, match="within the finite floating-point range"):
-            Histogram.from_data_and_breakpoints(scores, [0.0, 1.0])
-        with pytest.raises(ValueError, match="within the finite floating-point range"):
-            histogram.vfind(scores)
-        with pytest.raises(ValueError, match="within the finite floating-point range"):
-            calibration_error(scores, [0, 1], histogram=histogram)
-        with pytest.raises(ValueError, match="within the finite floating-point range"):
-            calibrate_binary(scores, histogram)
-        with pytest.raises(ValueError, match="within the finite floating-point range"):
-            build_reliability_diagram(scores, [0, 1])
+            function(scores)
 
     def test_density_for_arbitrary_precision_integer_width(self):
         endpoint = 2**1024
