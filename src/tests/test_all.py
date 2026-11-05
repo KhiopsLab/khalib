@@ -2361,6 +2361,13 @@ class TestCalibrateBinary:
 
 
 class TestReliabilityDiagram:
+    @pytest.fixture(name="forbid_plotting")
+    def fixture_forbid_plotting(self, monkeypatch):
+        def unexpected_plot(*args, **kwargs):
+            pytest.fail("Input validation must precede plotting")
+
+        monkeypatch.setattr(plt, "subplot_mosaic", unexpected_plot)
+
     def test_closes_figure_when_histogram_construction_fails(self, monkeypatch):
         previous_figures = set(plt.get_fignums())
 
@@ -2377,26 +2384,14 @@ class TestReliabilityDiagram:
         "threshold", ["dirac_threshold", "log_plot_threshold", "min_density_bar_width"]
     )
     @pytest.mark.parametrize(
-        "value", [np.inf, -np.inf, np.nan, 10**400, True, np.bool_(True)]
+        "value", [0.0, np.inf, -np.inf, np.nan, 10**400, True, np.bool_(True)]
     )
-    def test_rejects_invalid_plotting_thresholds(self, monkeypatch, threshold, value):
-        def unexpected_plot(*args, **kwargs):
-            pytest.fail("Threshold validation must precede plotting")
-
-        monkeypatch.setattr(plt, "subplot_mosaic", unexpected_plot)
+    @pytest.mark.usefixtures("forbid_plotting")
+    def test_rejects_invalid_plotting_thresholds(self, threshold, value):
         with pytest.raises(
             ValueError, match=f"'{threshold}' must be finite and positive"
         ):
             build_reliability_diagram([0.1, 0.9], [0, 1], **{threshold: value})
-
-    @pytest.mark.parametrize(
-        "threshold", ["dirac_threshold", "log_plot_threshold", "min_density_bar_width"]
-    )
-    def test_rejects_nonpositive_plotting_thresholds(self, threshold):
-        with pytest.raises(
-            ValueError, match=f"'{threshold}' must be finite and positive"
-        ):
-            build_reliability_diagram([0.1, 0.9], [0, 1], **{threshold: 0.0})
 
     @pytest.mark.parametrize(
         "threshold", ["dirac_threshold", "log_plot_threshold", "min_density_bar_width"]
@@ -2410,21 +2405,15 @@ class TestReliabilityDiagram:
         "scores", [[np.nan, 0.9], [[np.nan], [0.9]], [[np.nan, 0.1], [0.1, 0.9]]]
     )
     @pytest.mark.parametrize("dtype", [float, object])
-    def test_rejects_nan_scores_before_plotting(self, monkeypatch, scores, dtype):
+    @pytest.mark.usefixtures("forbid_plotting")
+    def test_rejects_nan_scores_before_plotting(self, scores, dtype):
         # Reject NaN even in the unused column before allocating a figure
-        def unexpected_plot(*args, **kwargs):
-            pytest.fail("NaN validation must precede plotting")
-
-        monkeypatch.setattr(plt, "subplot_mosaic", unexpected_plot)
         with pytest.raises(ValueError, match="'y_scores' must not contain NaN"):
             build_reliability_diagram(np.array(scores, dtype=dtype), [0, 1])
 
     @pytest.mark.parametrize("scores", [[-np.inf, 0.9], [[0.9, -np.inf], [0.1, 0.9]]])
-    def test_rejects_infinite_scores_before_plotting(self, monkeypatch, scores):
-        def unexpected_plot(*args, **kwargs):
-            pytest.fail("Infinite-score validation must precede plotting")
-
-        monkeypatch.setattr(plt, "subplot_mosaic", unexpected_plot)
+    @pytest.mark.usefixtures("forbid_plotting")
+    def test_rejects_infinite_scores_before_plotting(self, scores):
         with pytest.raises(ValueError, match="'y_scores' must not contain infinite"):
             build_reliability_diagram(scores, [0, 1])
 
@@ -2437,13 +2426,8 @@ class TestReliabilityDiagram:
             [[0.9, 0.1], [0.1, -0.1]],
         ],
     )
-    def test_rejects_scores_outside_unit_interval_before_plotting(
-        self, monkeypatch, scores
-    ):
-        def unexpected_plot(*args, **kwargs):
-            pytest.fail("Score-range validation must precede plotting")
-
-        monkeypatch.setattr(plt, "subplot_mosaic", unexpected_plot)
+    @pytest.mark.usefixtures("forbid_plotting")
+    def test_rejects_scores_outside_unit_interval_before_plotting(self, scores):
         with pytest.raises(
             ValueError, match="'y_scores' must be in the range \\[0, 1\\]"
         ):
