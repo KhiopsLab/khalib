@@ -9,8 +9,12 @@ import pytest
 from khiops.sklearn import KhiopsClassifier
 from scipy.sparse import coo_matrix, csr_matrix, dok_matrix, lil_matrix
 from sklearn.datasets import make_classification
+from sklearn.exceptions import NotFittedError
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import get_scorer
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from sklearn.utils.validation import check_is_fitted
 
@@ -1591,6 +1595,421 @@ def fixture_clf_data():
 
 
 class TestKhalibClassifier:
+    @pytest.mark.parametrize("random_state", [True, np.bool_(True)])
+    def test_fit_rejects_boolean_random_state(self, random_state):
+        x = np.arange(60).reshape(-1, 1)
+        y = np.tile([0, 1, 2], 20)
+        calibrator = KhalibClassifier(LogisticRegression(), random_state=random_state)
+        with pytest.raises(TypeError, match="'random_state' must not be a boolean"):
+            calibrator.fit(x, y)
+        with pytest.raises(NotFittedError):
+            check_is_fitted(calibrator)
+
+    def test_classifier_accepts_sparse_feature_matrices(self):
+        x = np.arange(60).reshape(-1, 1)
+        y = np.tile([0, 1, 2], 20)
+        x_sparse = csr_matrix(x)
+        calibrator = KhalibClassifier(LogisticRegression()).fit(x_sparse, y)
+        assert calibrator.predict_proba(x_sparse[:5]).shape == (5, 3)
+
+    def test_fit_clones_unfitted_estimator(self):
+        x = np.arange(60).reshape(-1, 1)
+        y = np.tile([0, 1, 2], 20)
+        estimator = LogisticRegression()
+        calibrator = KhalibClassifier(estimator, random_state=0).fit(x, y)
+
+        assert not hasattr(estimator, "classes_")
+        assert calibrator.fitted_estimator_ is not estimator
+        assert calibrator.predict_proba(x[:5]).shape == (5, 3)
+
+    def test_fit_copies_prefitted_estimator(self):
+        x = np.arange(60).reshape(-1, 1)
+        y = np.tile([0, 1, 2], 20)
+        estimator = LogisticRegression().fit(x, y)
+        calibrator = KhalibClassifier(estimator).fit(x, y)
+        probabilities = calibrator.predict_proba(x[:5])
+
+        estimator.fit(x, np.tile([0, 1], 30))
+
+        assert calibrator.fitted_estimator_ is not estimator
+        np.testing.assert_array_equal(calibrator.classes_, [0, 1, 2])
+        np.testing.assert_allclose(calibrator.predict_proba(x[:5]), probabilities)
+
+    @pytest.mark.parametrize("missing", [np.nan, pd.NA])
+    def test_fit_rejects_missing_labels(self, missing):
+        x = np.arange(60).reshape(-1, 1)
+        y = np.tile([0, 1, 2], 20).astype(object)
+        y[0] = missing
+        calibrator = KhalibClassifier(LogisticRegression())
+        with pytest.raises(
+            ValueError, match="'y' must not contain NaN or missing values"
+        ):
+            calibrator.fit(x, y)
+        with pytest.raises(NotFittedError):
+            check_is_fitted(calibrator)
+
+    @pytest.mark.parametrize("parameter", ["X", "y", "train_size", "random_state"])
+    @pytest.mark.parametrize("as_object", [False, True])
+    def test_fit_rejects_complex_inputs(self, parameter, as_object):
+        x = np.arange(60).reshape(-1, 1)
+        y = np.tile([0, 1, 2], 20)
+        inputs = {"X": x, "y": y, "train_size": 0.75, "random_state": 0}
+        value = np.asarray(inputs[parameter], dtype=complex)
+        inputs[parameter] = value.astype(object) if as_object else value
+        calibrator = KhalibClassifier(
+            LogisticRegression(),
+            train_size=inputs["train_size"],
+            random_state=inputs["random_state"],
+        )
+        with pytest.raises(
+            ValueError, match=rf"'{parameter}' must contain only real values"
+        ):
+            calibrator.fit(inputs["X"], inputs["y"])
+        with pytest.raises(NotFittedError):
+            check_is_fitted(calibrator)
+
+    @pytest.mark.parametrize("sparse", [False, True])
+    def test_predict_rejects_complex_features(self, sparse):
+        x = np.arange(60).reshape(-1, 1)
+        y = np.tile([0, 1, 2], 20)
+        calibrator = KhalibClassifier(LogisticRegression().fit(x, y)).fit(x, y)
+        features = x[:2].astype(complex)
+        if sparse:
+            features = csr_matrix(features)
+        with pytest.raises(ValueError, match="'X' must contain only real values"):
+            calibrator.predict_proba(features)
+
+    @pytest.mark.parametrize("n_classes", [2, 3])
+    @pytest.mark.parametrize("during_fit", [False, True])
+    def test_rejects_complex_estimator_scores(self, monkeypatch, n_classes, during_fit):
+        x = np.arange(60).reshape(-1, 1)
+        y = np.tile(np.arange(n_classes), 60 // n_classes)
+        estimator = LogisticRegression().fit(x, y)
+        calibrator = KhalibClassifier(estimator)
+        if not during_fit:
+            calibrator.fit(x, y)
+        target = estimator if during_fit else calibrator.fitted_estimator_
+        predict_proba = target.predict_proba
+
+        def complex_proba(features):
+            return predict_proba(features).astype(complex)
+
+        monkeypatch.setattr(target, "predict_proba", complex_proba)
+        operation = calibrator.fit if during_fit else calibrator.predict_proba
+        args = (x, y) if during_fit else (x[:2],)
+        with pytest.raises(ValueError, match="'scores' must contain only real values"):
+            operation(*args)
+
+    @pytest.mark.parametrize("search_type", [GridSearchCV, RandomizedSearchCV])
+    @pytest.mark.parametrize("n_classes", [3, 4])
+    @pytest.mark.parametrize("prefitted", [False, True])
+    @pytest.mark.parametrize("pipeline_outside", [False, True])
+    def test_rejects_search_ovo_decision_scores(
+        self, search_type, n_classes, prefitted, pipeline_outside
+    ):
+        # Exercise delegation in both directions between pipelines and searches
+        x = np.arange(120).reshape(-1, 1)
+        y = np.tile(np.arange(n_classes), 120 // n_classes)
+        estimator = search_type(
+            make_pipeline(StandardScaler(), SVC(decision_function_shape="ovo")),
+            {"svc__C": [1.0]},
+            cv=2,
+            **({"n_iter": 1} if search_type is RandomizedSearchCV else {}),
+        )
+        if pipeline_outside:
+            estimator = make_pipeline(StandardScaler(), estimator)
+        if prefitted:
+            estimator.fit(x, y)
+        calibrator = KhalibClassifier(estimator, random_state=0)
+        with pytest.raises(ValueError, match='decision_function_shape="ovo"'):
+            calibrator.fit(x, y)
+        with pytest.raises(NotFittedError):
+            check_is_fitted(calibrator)
+
+    @pytest.mark.parametrize("search_type", [GridSearchCV, RandomizedSearchCV])
+    @pytest.mark.parametrize(
+        ("n_classes", "probability"), [(2, False), (3, True), (4, True)]
+    )
+    def test_search_ovo_setting_allows_binary_scores_and_probabilities(
+        self, search_type, n_classes, probability
+    ):
+        x = np.arange(120).reshape(-1, 1)
+        y = np.tile(np.arange(n_classes), 120 // n_classes)
+        estimator = search_type(
+            SVC(decision_function_shape="ovo", probability=probability, random_state=0),
+            {"C": [1.0]},
+            cv=2,
+            **({"n_iter": 1} if search_type is RandomizedSearchCV else {}),
+        ).fit(x, y)
+        calibrator = KhalibClassifier(estimator).fit(x, y)
+        probabilities = calibrator.predict_proba(x[:5])
+        assert probabilities.shape == (5, n_classes)
+        np.testing.assert_allclose(probabilities.sum(axis=1), 1.0)
+
+    @pytest.mark.parametrize("search_type", [GridSearchCV, RandomizedSearchCV])
+    @pytest.mark.parametrize("n_classes", [3, 4])
+    def test_predict_uses_snapshot_after_search_mutation(self, search_type, n_classes):
+        # Mutating the caller's fitted search does not alter calibrated predictions
+        x = np.arange(120).reshape(-1, 1)
+        y = np.tile(np.arange(n_classes), 120 // n_classes)
+        estimator = search_type(
+            SVC(decision_function_shape="ovr"),
+            {"C": [1.0]},
+            cv=2,
+            **({"n_iter": 1} if search_type is RandomizedSearchCV else {}),
+        ).fit(x, y)
+        calibrator = KhalibClassifier(estimator).fit(x, y)
+        probabilities = calibrator.predict_proba(x[:5])
+        estimator.best_estimator_.set_params(decision_function_shape="ovo")
+        np.testing.assert_allclose(calibrator.predict_proba(x[:5]), probabilities)
+
+    @pytest.mark.parametrize("n_classes", [3, 4])
+    @pytest.mark.parametrize("prefitted", [False, True])
+    @pytest.mark.parametrize("pipeline_depth", [0, 1, 2])
+    def test_rejects_multiclass_ovo_decision_scores(
+        self, n_classes, prefitted, pipeline_depth
+    ):
+        # Three-class pairwise scores have the same shape as classwise scores
+        x = np.arange(120).reshape(-1, 1)
+        y = np.tile(np.arange(n_classes), 120 // n_classes)
+        estimator = SVC(decision_function_shape="ovo")
+        for _ in range(pipeline_depth):
+            estimator = make_pipeline(StandardScaler(), estimator)
+        if prefitted:
+            estimator.fit(x, y)
+        calibrator = KhalibClassifier(estimator, random_state=0)
+        with pytest.raises(ValueError, match='decision_function_shape="ovo"'):
+            calibrator.fit(x, y)
+        with pytest.raises(NotFittedError):
+            check_is_fitted(calibrator)
+
+    @pytest.mark.parametrize(
+        ("n_classes", "probability"), [(2, False), (3, True), (4, True)]
+    )
+    @pytest.mark.parametrize("pipeline_depth", [0, 1, 2])
+    def test_ovo_setting_allows_binary_scores_and_probabilities(
+        self, n_classes, probability, pipeline_depth
+    ):
+        # The OVO setting does not affect binary scores or predict_proba columns
+        x = np.arange(120).reshape(-1, 1)
+        y = np.tile(np.arange(n_classes), 120 // n_classes)
+        estimator = SVC(
+            decision_function_shape="ovo", probability=probability, random_state=0
+        )
+        for _ in range(pipeline_depth):
+            estimator = make_pipeline(StandardScaler(), estimator)
+        estimator.fit(x, y)
+        calibrator = KhalibClassifier(estimator).fit(x, y)
+        probabilities = calibrator.predict_proba(x[:5])
+        assert probabilities.shape == (5, n_classes)
+        np.testing.assert_allclose(probabilities.sum(axis=1), 1.0)
+
+    @pytest.mark.parametrize("n_classes", [3, 4])
+    @pytest.mark.parametrize("pipeline_depth", [0, 1, 2])
+    def test_predict_uses_snapshot_after_estimator_mutation(
+        self, n_classes, pipeline_depth
+    ):
+        # Mutating the caller's estimator does not alter calibrated predictions
+        x = np.arange(60).reshape(-1, 1)
+        y = np.repeat(np.arange(n_classes), 60 // n_classes)
+        classifier = SVC(decision_function_shape="ovr")
+        estimator = classifier
+        for _ in range(pipeline_depth):
+            estimator = make_pipeline(StandardScaler(), estimator)
+        estimator.fit(x, y)
+        calibrator = KhalibClassifier(estimator).fit(x, y)
+        probabilities = calibrator.predict_proba(x[:5])
+        classifier.set_params(decision_function_shape="ovo")
+        np.testing.assert_allclose(calibrator.predict_proba(x[:5]), probabilities)
+
+    @pytest.mark.parametrize(
+        ("classes", "calibration_labels"),
+        [
+            ([10, 20], [10, 10]),
+            ([10, 20], [20, 20]),
+            (["a", "b", "c"], ["a", "c"]),
+            (["a", "b", "c"], ["a", "b", "d"]),
+        ],
+    )
+    def test_fit_rejects_mismatched_calibration_classes(
+        self, classes, calibration_labels
+    ):
+        # Use a fitted estimator whose classes differ from the calibration labels
+        x = np.arange(60).reshape(-1, 1)
+        y = np.repeat(classes, 60 // len(classes))
+        estimator = LogisticRegression().fit(x, y)
+        calibrator = KhalibClassifier(estimator)
+        with pytest.raises(ValueError, match="Calibration labels must.*exactly match"):
+            calibrator.fit(x[: len(calibration_labels)], calibration_labels)
+        assert not hasattr(calibrator, "histograms_")
+        with pytest.raises(NotFittedError):
+            check_is_fitted(calibrator)
+        with pytest.raises(NotFittedError):
+            calibrator.predict_proba(x[:1])
+
+    @pytest.mark.parametrize("n_classes", [2, 3])
+    def test_fit_rejects_split_missing_calibration_class(self, n_classes):
+        # The fixed split puts the only example of the last class in training
+        x = np.arange(12).reshape(-1, 1)
+        y = np.zeros(12, dtype=int)
+        y[0] = n_classes - 1
+        if n_classes == 3:
+            y[1:6] = 1
+        calibrator = KhalibClassifier(LogisticRegression(), random_state=0)
+        with pytest.raises(ValueError, match="Calibration labels must.*exactly match"):
+            calibrator.fit(x, y)
+        assert not hasattr(calibrator.estimator, "classes_")
+        assert not hasattr(calibrator, "histograms_")
+        with pytest.raises(NotFittedError):
+            check_is_fitted(calibrator)
+
+    @pytest.mark.parametrize("failure", ["labels", "histogram"])
+    def test_failed_refit_preserves_state(self, monkeypatch, failure):
+        # Retain a working model while fitting a replacement with different labels
+        x = np.arange(60).reshape(-1, 1)
+        y = np.repeat([0, 1, 2], 20)
+        calibrator = KhalibClassifier(LogisticRegression().fit(x, y))
+        calibrator.fit(x, y)
+        old_estimator = calibrator.fitted_estimator_
+        old_histograms = calibrator.histograms_
+        old_probas = calibrator.predict_proba(x)
+        new_y = np.repeat(["a", "b", "c"], 20)
+        calibrator.set_params(estimator=LogisticRegression().fit(x, new_y))
+
+        # Reject calibration labels missing two estimator classes
+        if failure == "labels":
+            new_y = np.repeat("a", len(x))
+            message = "Calibration labels must"
+        # Fail after the first class histogram has already been built
+        else:
+            build_histogram = Histogram.from_data
+            calls = 0
+
+            def failing_histogram(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise ValueError("Histogram construction failed")
+                return build_histogram(*args, **kwargs)
+
+            monkeypatch.setattr(Histogram, "from_data", failing_histogram)
+            message = "Histogram construction failed"
+        with pytest.raises(ValueError, match=message):
+            calibrator.fit(x, new_y)
+
+        # Preserve the previous model's calibration and class mapping
+        assert calibrator.fitted_estimator_ is old_estimator
+        assert calibrator.histograms_ is old_histograms
+        np.testing.assert_allclose(calibrator.predict_proba(x), old_probas)
+        np.testing.assert_array_equal(calibrator.classes_, [0, 1, 2])
+
+    @pytest.mark.parametrize("failure", ["labels", "histogram"])
+    def test_failed_first_fit_remains_unfitted(self, monkeypatch, failure):
+        # Start with a fitted base estimator but no calibration state
+        x = np.arange(60).reshape(-1, 1)
+        y = np.repeat(["a", "b", "c"], 20)
+        calibrator = KhalibClassifier(LogisticRegression().fit(x, y))
+
+        # Reject calibration labels missing two estimator classes
+        if failure == "labels":
+            y = np.repeat("a", len(x))
+            message = "Calibration labels must"
+        # Fail after the first class histogram has already been built
+        else:
+            build_histogram = Histogram.from_data
+            calls = 0
+
+            def failing_histogram(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise ValueError("Histogram construction failed")
+                return build_histogram(*args, **kwargs)
+
+            monkeypatch.setattr(Histogram, "from_data", failing_histogram)
+            message = "Histogram construction failed"
+        with pytest.raises(ValueError, match=message):
+            calibrator.fit(x, y)
+
+        # No partial fitted state is exposed after the failure
+        with pytest.raises(NotFittedError):
+            check_is_fitted(calibrator)
+        with pytest.raises(NotFittedError):
+            calibrator.predict_proba(x)
+        with pytest.raises(NotFittedError):
+            _ = calibrator.classes_
+
+    @pytest.mark.parametrize("classes", [[10, 20], ["a", "b", "c"]])
+    def test_predict_uses_calibrated_probabilities(self, classes):
+        # Fit the calibrator with non-positional class labels
+        x = np.arange(60).reshape(-1, 1)
+        y = np.repeat(classes, 60 // len(classes))
+        estimator = LogisticRegression().fit(x, y)
+        calibrator = KhalibClassifier(estimator).fit(x, y)
+        np.testing.assert_array_equal(calibrator.classes_, estimator.classes_)
+        assert calibrator.classes_ is not estimator.classes_
+
+        # Force calibration to favor the last class
+        n_histograms = 1 if len(classes) == 2 else len(classes)
+        calibrator.histograms_ = [
+            Histogram(
+                breakpoints=[0.0, 1.0],
+                freqs=[1],
+                target_freqs=[(0, 1) if k == n_histograms - 1 else (1, 0)],
+                classes=[0, 1],
+            )
+            for k in range(n_histograms)
+        ]
+
+        # Check class mapping and sklearn accuracy interfaces
+        expected = np.repeat(classes[-1], 3)
+        assert estimator.predict(x[:3])[0] != expected[0]
+        np.testing.assert_array_equal(calibrator.predict(x[:3]), expected)
+        assert calibrator.score(x[:3], expected) == 1
+        assert get_scorer("accuracy")(calibrator, x[:3], expected) == 1
+
+    def test_predict_requires_fit(self):
+        with pytest.raises(NotFittedError):
+            KhalibClassifier().predict(np.array([[0.0]]))
+
+    def test_classes_requires_fit(self):
+        with pytest.raises(NotFittedError):
+            _ = KhalibClassifier().classes_
+
+    def test_multiclass_zero_calibrated_probabilities_fall_back(self):
+        # Prepare a fitted estimator and zero-positive calibration bins
+        x = np.array([[0.0], [1.0], [2.0]])
+        y = np.array([0, 1, 2])
+        estimator = LogisticRegression().fit(x, y)
+        x_test = np.array([[0.5], [1.5]])
+        calibrator = KhalibClassifier()
+        calibrator.fitted_estimator_ = estimator
+        histogram = Histogram(
+            breakpoints=[0.0, 1.0], freqs=[1], target_freqs=[(1, 0)], classes=[0, 1]
+        )
+        calibrator.histograms_ = [histogram] * 3
+
+        # Check the warning and fallback probabilities
+        with pytest.warns(UserWarning, match=r"samples \[0, 1\]"):
+            probabilities = calibrator.predict_proba(x_test)
+        np.testing.assert_allclose(probabilities, estimator.predict_proba(x_test))
+
+    def test_multiclass_zero_calibration_requires_predict_proba(self):
+        # Prepare a decision-only estimator and zero-positive calibration bins
+        x = np.array([[-2.0], [-1.0], [0.0], [1.0], [2.0], [3.0]])
+        y = np.array([0, 0, 1, 1, 2, 2])
+        estimator = SVC().fit(x, y)
+        calibrator = KhalibClassifier()
+        calibrator.fitted_estimator_ = estimator
+        histogram = Histogram(
+            breakpoints=[0.0, 1.0], freqs=[1], target_freqs=[(1, 0)], classes=[0, 1]
+        )
+        calibrator.histograms_ = [histogram] * 3
+
+        # Reject decision scores as fallback probabilities
+        with pytest.raises(ValueError, match="does not provide predict_proba"):
+            calibrator.predict_proba(np.array([[-1.5], [1.5]]))
+
     @pytest.mark.filterwarnings("ignore:'force_all_finite' was renamed")
     # Notes:
     # - SVC does not have predict_proba

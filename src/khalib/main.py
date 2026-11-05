@@ -8,6 +8,7 @@ import tempfile
 import threading
 import warnings
 from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -18,9 +19,11 @@ from khiops.sklearn import KhiopsClassifier
 from matplotlib import pyplot as plt
 from matplotlib.ticker import LogLocator
 from scipy.sparse import issparse
-from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin, clone
 from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection._search import BaseSearchCV
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, label_binarize
 from sklearn.utils._response import _get_response_values
 from sklearn.utils.validation import check_consistent_length, check_is_fitted
@@ -78,6 +81,15 @@ def _check_real_values(values, name):
         )
     ):
         raise ValueError(f"'{name}' must contain only real values.")
+
+
+def _check_classifier_features(values):
+    """Allows sparse real feature matrices for scikit-learn estimators."""
+    if issparse(values):
+        if np.issubdtype(values.dtype, np.complexfloating):
+            raise ValueError("'X' must contain only real values.")
+    else:
+        _check_real_values(values, "X")
 
 
 def _as_1d_array(values, name):
@@ -177,6 +189,16 @@ def _validate_nonempty_bin_scores(histogram, y_scores):
             f"bin indices {bin_indexes[empty_bin_samples].tolist()}."
         )
     return bin_indexes
+
+
+def _get_decision_function_shape(estimator):
+    """Returns the decision score layout through pipelines and fitted searches."""
+    while isinstance(estimator, (Pipeline, BaseSearchCV)):
+        if isinstance(estimator, Pipeline):
+            estimator = estimator.steps[-1][1]
+        else:
+            estimator = estimator.best_estimator_
+    return getattr(estimator, "decision_function_shape", None)
 
 
 @dataclass()
@@ -1114,8 +1136,8 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
     estimator : estimator instance, default=None
         The classifier whose output need to be calibrated to provide more accurate
         `predict_proba` outputs. If not provided, it trains a `KhiopsClassifier`_. If
-        provided, but the estimator is not fitted then, on `fit`, it will
-        be fitted with :paramref:`train_size` elements.
+        provided and not fitted, a clone is fitted with :paramref:`train_size`
+        elements. If already fitted, the estimator is copied for calibration.
     train_size : float or int, default=0.75
         Same parameter as `~sklearn.model_selection.train_test_split`. Only used when
         :paramref:`estimator` is not provided or not fitted.
@@ -1127,13 +1149,16 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
     Attributes
     ----------
     fitted_estimator_ :
-        The underlying fitted classifier. It is the same instance as
-        :paramref:`estimator` if it was provided, otherwise it is an instance of
-        `KhiopsClassifier`_.
+        The independent fitted classifier used for calibration. It is an instance
+        of `KhiopsClassifier`_ when :paramref:`estimator` is not provided.
     histograms_ : list of size 1 or n_classes
         In the binary case: a list of size 1 with the `Histogram` instance for the
         positive class. In the multi class case: A list of size n_classes containing the
         one-vs-rest `Histogram` for each class.
+    classes_ : ndarray of shape (n_classes,)
+        Class labels in the order of the columns returned by `predict_proba`. For
+        binary classification, the second class is positive and its probability is
+        returned in column 1.
 
     """
 
@@ -1157,44 +1182,125 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         -------
         self
             The calling estimator instance.
-        """
-        # Check/initialize fitted estimator
-        if self.estimator is None:
-            self.fitted_estimator_ = KhiopsClassifier()
-        else:
-            self.fitted_estimator_ = self.estimator
 
-        # Fit the base predictor if not fitted
+        Raises
+        ------
+        ValueError
+            Raised in the following cases:
+
+            - Calibration labels contain fewer than two classes.
+            - Sparse matrices are used outside classifier feature input X.
+            - Features, labels, train_size, random_state, or estimator scores
+              contain complex values.
+            - Labels contain NaN or missing values.
+            - Calibration labels do not exactly match the fitted estimator's classes.
+            - Multiclass scores use a decision function with
+              decision_function_shape="ovo", including inside pipelines or searches.
+        TypeError
+            `random_state` is a boolean.
+
+        Notes
+        -----
+        Fitted attributes are updated only after calibration succeeds. A failed
+        refit preserves the previous fitted state. The supplied estimator is cloned
+        before fitting, or copied if already fitted, so later changes to it do not
+        affect this classifier.
+        """
+        # Validate features and reject unsupported sparse inputs
+        _check_classifier_features(X)
+        if isinstance(self.random_state, (bool, np.bool_)):
+            raise TypeError("'random_state' must not be a boolean.")
+        for name, values in (
+            ("y", y),
+            ("train_size", self.train_size),
+            ("random_state", self.random_state),
+        ):
+            _check_real_values(values, name)
+        _check_no_missing_values(y, "y")
+
+        # Isolate the estimator from subsequent changes by its caller
+        estimator = self.estimator if self.estimator is not None else KhiopsClassifier()
         try:
-            check_is_fitted(self.fitted_estimator_)
-            x_calib, y_calib = X, y
+            check_is_fitted(estimator)
         except NotFittedError:
+            fitted_estimator = clone(estimator)
             x_train, x_calib, y_train, y_calib = train_test_split(
                 X, y, train_size=self.train_size, random_state=self.random_state
             )
-            self.fitted_estimator_.fit(x_train, y_train)
+            fitted_estimator.fit(x_train, y_train)
+        else:
+            fitted_estimator = deepcopy(estimator)
+            x_calib, y_calib = X, y
+
+        # Require calibration examples for every estimator class
+        calibration_classes = np.unique(y_calib)
+        _check_real_values(fitted_estimator.classes_, "classes")
+        if len(calibration_classes) < 2 or not np.array_equal(
+            calibration_classes, fitted_estimator.classes_
+        ):
+            raise ValueError(
+                "Calibration labels must contain at least two classes and exactly "
+                "match the fitted estimator's classes. "
+                f"Got {calibration_classes.tolist()!r}; "
+                f"expected {fitted_estimator.classes_.tolist()!r}."
+            )
 
         # Estimate the uncalibrated scores
-        scores, _ = _get_response_values(
-            self.fitted_estimator_,
+        scores, _, response_method = _get_response_values(
+            fitted_estimator,
             x_calib,
             response_method=["predict_proba", "decision_function"],
+            return_response_method_used=True,
         )
+        _check_real_values(scores, "scores")
+        if (
+            len(fitted_estimator.classes_) > 2
+            and response_method == "decision_function"
+            and _get_decision_function_shape(fitted_estimator) == "ovo"
+        ):
+            raise ValueError(
+                "Multiclass calibration does not support "
+                'decision_function_shape="ovo". '
+                'Use decision_function_shape="ovr" or an estimator with predict_proba.'
+            )
 
         # Binary classification
-        if (n_classes := len(self.fitted_estimator_.classes_)) == 2:
-            self.histograms_ = [Histogram.from_data(scores, y_calib)]
+        if (n_classes := len(fitted_estimator.classes_)) == 2:
+            histograms = [Histogram.from_data(scores, y_calib)]
         # Multiclass classification: One-vs-Rest
         else:
-            y_binarized = label_binarize(
-                y_calib, classes=self.fitted_estimator_.classes_
-            )
-            self.histograms_ = [
-                Histogram.from_data(scores[:, k].reshape(-1, 1), y_binarized[:, k])
+            y_binarized = label_binarize(y_calib, classes=fitted_estimator.classes_)
+            histograms = [
+                Histogram.from_data(scores[:, k], y_binarized[:, k])
                 for k in range(n_classes)
             ]
 
+        # Publish matching estimator and calibration state only after success
+        self.fitted_estimator_ = fitted_estimator
+        self.histograms_ = histograms
         return self
+
+    @property
+    def classes_(self):
+        """Class labels in probability column order."""
+        check_is_fitted(self, ["fitted_estimator_", "histograms_"])
+        return self.fitted_estimator_.classes_
+
+    def predict(self, X):  # noqa: N803
+        """Predicts class labels using calibrated probabilities
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Input data.
+
+        Returns
+        -------
+        y : ndarray of shape (n_samples,)
+            Predicted class labels.
+        """
+        probabilities = self.predict_proba(X)
+        return self.classes_[np.argmax(probabilities, axis=1)]
 
     def predict_proba(self, X):  # noqa: N803
         """Estimates the calibrated classification probabilities
@@ -1208,16 +1314,47 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         -------
         P : array-like of shape (n_samples, n_classes)
             The estimated calibrated probabilities for each class.
+
+        Raises
+        ------
+        ValueError
+            Raised in the following cases:
+
+            - Multiclass calibrated probabilities sum to zero and the base
+              estimator cannot provide valid probabilities for the fallback.
+            - Sparse matrices are used outside classifier feature input X.
+            - Features or estimator scores contain complex values.
+            - Multiclass scores use a decision function with
+              decision_function_shape="ovo", including inside pipelines or searches.
+
+        Warns
+        -----
+        UserWarning
+            If multiclass calibrated probabilities sum to zero. The uncalibrated
+            probabilities are returned for those samples instead.
         """
         # Check that is fitted
-        check_is_fitted(self)
+        check_is_fitted(self, ["fitted_estimator_", "histograms_"])
+        _check_classifier_features(X)
 
         # Estimate the uncalibrated scores
-        scores, _ = _get_response_values(
+        scores, _, response_method = _get_response_values(
             self.fitted_estimator_,
             X,
             response_method=["predict_proba", "decision_function"],
+            return_response_method_used=True,
         )
+        _check_real_values(scores, "scores")
+        if (
+            len(self.fitted_estimator_.classes_) > 2
+            and response_method == "decision_function"
+            and _get_decision_function_shape(self.fitted_estimator_) == "ovo"
+        ):
+            raise ValueError(
+                "Multiclass calibration does not support "
+                'decision_function_shape="ovo". '
+                'Use decision_function_shape="ovr" or an estimator with predict_proba.'
+            )
 
         # Binary classification
         if len(self.histograms_) == 1:
@@ -1230,9 +1367,46 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
                     scores[:, k], histogram, only_positive=True
                 )
 
-            calibrated_probas = calibrated_probas / np.sum(
-                calibrated_probas, axis=1, keepdims=True
-            )
+            # Detect zero-sum calibration
+            normalization_factors = calibrated_probas.sum(axis=1)
+            zero_sum_rows = np.flatnonzero(normalization_factors == 0)
+            if zero_sum_rows.size:
+                # Decision scores cannot serve as fallback probabilities
+                if not hasattr(self.fitted_estimator_, "predict_proba"):
+                    raise ValueError(
+                        "Cannot fall back to uncalibrated probabilities for samples "
+                        f"{zero_sum_rows.tolist()}: the fitted estimator does not "
+                        "provide predict_proba."
+                    )
+
+                # Require valid probabilities for the fallback
+                fallback_probas = scores[zero_sum_rows]
+                if (
+                    not np.all(np.isfinite(fallback_probas))
+                    or np.any(fallback_probas < 0)
+                    or not np.allclose(fallback_probas.sum(axis=1), 1)
+                ):
+                    raise ValueError(
+                        "Cannot fall back to uncalibrated probabilities for samples "
+                        f"{zero_sum_rows.tolist()}: predict_proba returned invalid "
+                        "probabilities."
+                    )
+
+                # Fall back only for affected samples
+                warnings.warn(
+                    "Calibrated probabilities sum to zero for samples "
+                    f"{zero_sum_rows.tolist()}; using uncalibrated probabilities "
+                    "for those samples.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                calibrated_probas[zero_sum_rows] = fallback_probas
+
+            # Normalize only the calibrated samples
+            nonzero_sum_rows = normalization_factors != 0
+            calibrated_probas[nonzero_sum_rows] /= normalization_factors[
+                nonzero_sum_rows, np.newaxis
+            ]
 
         return calibrated_probas
 
