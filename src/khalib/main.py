@@ -1476,6 +1476,8 @@ def build_reliability_diagram(
     implements a heuristic to dectect when the scores is distributed as a sum of diracs
     and changes visualization accordingly.
 
+    The figure remains open on success and is closed if construction fails after
+    the base plot has been created.
 
     Parameters
     ----------
@@ -1572,136 +1574,128 @@ def build_reliability_diagram(
         height_ratios=(4, 1),
         sharex=True,
     )
-    fig.subplots_adjust(hspace=0)
-    fig.suptitle("Reliability Diagram")
-
-    # Build a unsupervised histogram
     try:
+        fig.subplots_adjust(hspace=0)
+        fig.suptitle("Reliability Diagram")
+
+        # Build an unsupervised histogram and identify Dirac masses
         uhist_y_scores = Histogram.from_data(y_scores, use_finest=True)
-    except Exception:
-        plt.close(fig)
-        raise
+        dirac_indexes = compute_dirac_indexes(uhist_y_scores, dirac_threshold)
 
-    # Compute the dirac mass indexes
-    dirac_indexes = compute_dirac_indexes(uhist_y_scores, dirac_threshold)
-
-    # Compute the supervised score histogram
-    try:
+        # Compute the supervised score histogram
         hist_y_scores = Histogram.from_data(y_scores, y)
+
+        # Case where are only dirac masses
+        n_nonzero_bins = sum(freq > 0 for freq in uhist_y_scores.freqs)
+        if sum(dirac_indexes) == n_nonzero_bins:
+            # Compute the dirac masses plot data
+            dirac_masses = [
+                freq / sum(uhist_y_scores.freqs)
+                for freq, is_dirac in zip(
+                    uhist_y_scores.freqs, dirac_indexes, strict=False
+                )
+                if is_dirac
+            ]
+            dirac_locations = [
+                (left + right) / 2
+                for (left, right), is_dirac in zip(
+                    uhist_y_scores.bins, dirac_indexes, strict=False
+                )
+                if is_dirac
+            ]
+            indexes = hist_y_scores.vfind(dirac_locations)
+            target_probas = [hist_y_scores.target_probas[i][1] for i in indexes]
+            axs["reliability_diagram"].scatter(
+                dirac_locations, target_probas, color="tab:red", alpha=0.8
+            )
+            axs["reliability_diagram"].plot(
+                (0, 1), (0, 1), color="tab:grey", linestyle="dotted"
+            )
+            for loc, mass in zip(dirac_locations, dirac_masses, strict=False):
+                axs["score_distribution"].annotate(
+                    "",
+                    xy=(loc, mass),
+                    xytext=(loc, 0.0),
+                    label="dirac masses",
+                    arrowprops={
+                        "arrowstyle": "-|>",
+                        "shrinkA": 0,
+                        "shrinkB": 0,
+                        "color": "tab:blue",
+                    },
+                )
+            axs["score_distribution"].grid(color="gainsboro")
+            axs["score_distribution"].set_xlabel("Score Positive Class")
+            axs["score_distribution"].set_ylabel("Probability")
+        # Case where there are only proper densities or a mix of both
+        else:
+            # Plot the reliability diagram
+            x = []
+            for intv in hist_y_scores.bins:
+                x.extend(intv)
+            x[0] = 0
+            x[-1] = 1
+            y = []
+            for probas in hist_y_scores.target_probas:
+                y.extend((probas[1], probas[1]))
+            axs["reliability_diagram"].plot(x, y)
+            axs["reliability_diagram"].plot(x, x, linestyle="dotted", color="gray")
+            axs["reliability_diagram"].fill_between(x, x, y, color="tab:red", alpha=0.2)
+            axs["reliability_diagram"].set_ylabel("Positive Class Probability")
+            axs["reliability_diagram"].grid(color="gainsboro")
+
+            # Recompute the density using the most interpretable histogram
+            uhist_y_scores = Histogram.from_data(y_scores)
+
+            # Plot the density
+            density_bar_starts = [
+                left
+                for (left, _), freq in zip(
+                    uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
+                )
+                if freq > 0
+            ]
+            density_bar_widths = [
+                right - left
+                if right - left >= min_density_bar_width
+                else min_density_bar_width
+                for (left, right), freq in zip(
+                    uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
+                )
+                if freq > 0
+            ]
+            density_bar_heights = [
+                density
+                for density, freq in zip(
+                    uhist_y_scores.densities,
+                    uhist_y_scores.freqs,
+                    strict=True,
+                )
+                if freq > 0
+            ]
+            density_bar_log_range = 0
+            if density_bar_heights:
+                density_bar_log_range = math.log10(
+                    max(density_bar_heights)
+                ) - math.log10(min(density_bar_heights))
+            axs["score_distribution"].bar(
+                x=density_bar_starts,
+                height=density_bar_heights,
+                width=density_bar_widths,
+                align="edge",
+                label="Density",
+            )
+            axs["score_distribution"].grid(color="gainsboro")
+            axs["score_distribution"].set_xlabel("Score Positive Class")
+            axs["score_distribution"].set_ylabel("Density")
+            if density_bar_log_range > log_plot_threshold:
+                axs["score_distribution"].set_yscale("log")
+                axs["score_distribution"].yaxis.set_major_locator(
+                    LogLocator(base=10, subs=[1], numticks=5)
+                )
     except Exception:
         plt.close(fig)
         raise
-
-    # Case where are only dirac masses
-    n_nonzero_bins = sum(freq > 0 for freq in uhist_y_scores.freqs)
-    if sum(dirac_indexes) == n_nonzero_bins:
-        # Compute the dirac masses plot data
-        dirac_masses = [
-            freq / sum(uhist_y_scores.freqs)
-            for freq, is_dirac in zip(uhist_y_scores.freqs, dirac_indexes, strict=False)
-            if is_dirac
-        ]
-        dirac_locations = [
-            (left + right) / 2
-            for (left, right), is_dirac in zip(
-                uhist_y_scores.bins, dirac_indexes, strict=False
-            )
-            if is_dirac
-        ]
-        indexes = hist_y_scores.vfind(dirac_locations)
-        target_probas = [hist_y_scores.target_probas[i][1] for i in indexes]
-        axs["reliability_diagram"].scatter(
-            dirac_locations, target_probas, color="tab:red", alpha=0.8
-        )
-        axs["reliability_diagram"].plot(
-            (0, 1), (0, 1), color="tab:grey", linestyle="dotted"
-        )
-        for loc, mass in zip(dirac_locations, dirac_masses, strict=False):
-            axs["score_distribution"].annotate(
-                "",
-                xy=(loc, mass),
-                xytext=(loc, 0.0),
-                label="dirac masses",
-                arrowprops={
-                    "arrowstyle": "-|>",
-                    "shrinkA": 0,
-                    "shrinkB": 0,
-                    "color": "tab:blue",
-                },
-            )
-        axs["score_distribution"].grid(color="gainsboro")
-        axs["score_distribution"].set_xlabel("Score Positive Class")
-        axs["score_distribution"].set_ylabel("Probability")
-    # Case where there are only proper densities or a mix of both
-    else:
-        # Plot the reliability diagram
-        x = []
-        for intv in hist_y_scores.bins:
-            x.extend(intv)
-        x[0] = 0
-        x[-1] = 1
-        y = []
-        for probas in hist_y_scores.target_probas:
-            y.extend((probas[1], probas[1]))
-        axs["reliability_diagram"].plot(x, y)
-        axs["reliability_diagram"].plot(x, x, linestyle="dotted", color="gray")
-        axs["reliability_diagram"].fill_between(x, x, y, color="tab:red", alpha=0.2)
-        axs["reliability_diagram"].set_ylabel("Positive Class Probability")
-        axs["reliability_diagram"].grid(color="gainsboro")
-
-        # Recompute the density, this time we took the most interpretable histogram
-        try:
-            uhist_y_scores = Histogram.from_data(y_scores)
-        except Exception:
-            plt.close(fig)
-            raise
-
-        # Plot the density
-        density_bar_starts = [
-            left
-            for (left, _), freq in zip(
-                uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
-            )
-            if freq > 0
-        ]
-        density_bar_widths = [
-            right - left
-            if right - left >= min_density_bar_width
-            else min_density_bar_width
-            for (left, right), freq in zip(
-                uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
-            )
-            if freq > 0
-        ]
-        density_bar_heights = [
-            density
-            for density, freq in zip(
-                uhist_y_scores.densities,
-                uhist_y_scores.freqs,
-                strict=True,
-            )
-            if freq > 0
-        ]
-        density_bar_log_range = 0
-        if density_bar_heights:
-            density_bar_log_range = math.log10(max(density_bar_heights)) - math.log10(
-                min(density_bar_heights)
-            )
-        axs["score_distribution"].bar(
-            x=density_bar_starts,
-            height=density_bar_heights,
-            width=density_bar_widths,
-            align="edge",
-            label="Density",
-        )
-        axs["score_distribution"].grid(color="gainsboro")
-        axs["score_distribution"].set_xlabel("Score Positive Class")
-        axs["score_distribution"].set_ylabel("Density")
-        if density_bar_log_range > log_plot_threshold:
-            axs["score_distribution"].set_yscale("log")
-            axs["score_distribution"].yaxis.set_major_locator(
-                LogLocator(base=10, subs=[1], numticks=5)
-            )
 
     return fig, axs
 
@@ -1712,7 +1706,7 @@ def compute_dirac_indexes(uhist, dirac_threshold):
     We declare a dirac mass bin if:
 
     - it contains observations
-    - it is surrounded by empty bins or if it is the only one
+    - all existing neighboring bins are empty
     - its length is less than ``dirac_threshold``
 
     Raises
@@ -1722,43 +1716,18 @@ def compute_dirac_indexes(uhist, dirac_threshold):
     """
     _check_real_values(dirac_threshold, "dirac_threshold")
 
-    # Early return for just one bin
-    if len(uhist.freqs) == 1:
-        if uhist.freqs[0] > 0 and uhist.bins[0][1] - uhist.bins[0][0] < dirac_threshold:
-            return [True]
-        else:
-            return [False]
-
-    # More than one bin
+    # Apply the same isolation rule to interior, edge, and single bins
     dirac_indexes = []
-    if (
-        len(uhist.freqs) > 1
-        and uhist.freqs[0] > 0
-        and uhist.freqs[1] == 0
-        and (uhist.bins[0][1] - uhist.bins[0][0] < dirac_threshold)
+    for i, (freq, (left, right)) in enumerate(
+        zip(uhist.freqs, uhist.bins, strict=True)
     ):
-        dirac_indexes.append(True)
-    else:
-        dirac_indexes.append(False)
-    for i in range(1, uhist.n_bins - 1):
-        cur_left, cur_right = uhist.bins[i]
-        if (
-            uhist.freqs[i] > 0
-            and uhist.freqs[i - 1] == 0
-            and uhist.freqs[i + 1] == 0
-            and (cur_right - cur_left < dirac_threshold)
-        ):
-            dirac_indexes.append(True)
-        else:
-            dirac_indexes.append(False)
-    if (
-        len(uhist.freqs) > 1
-        and uhist.freqs[-1] > 0
-        and uhist.freqs[-2] == 0
-        and (uhist.bins[-1][1] - uhist.bins[-1][0] < dirac_threshold)
-    ):
-        dirac_indexes.append(True)
-    else:
-        dirac_indexes.append(False)
+        dirac_indexes.append(
+            bool(
+                freq > 0
+                and (i == 0 or uhist.freqs[i - 1] == 0)
+                and (i == uhist.n_bins - 1 or uhist.freqs[i + 1] == 0)
+                and right - left < dirac_threshold
+            )
+        )
 
     return dirac_indexes

@@ -9,6 +9,8 @@ import pandas as pd
 import pytest
 from khiops.sklearn import KhiopsClassifier
 from matplotlib import pyplot as plt
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 from scipy.sparse import coo_matrix, csr_matrix, dok_matrix, lil_matrix
 from sklearn.datasets import make_classification
 from sklearn.exceptions import NotFittedError
@@ -2376,16 +2378,54 @@ class TestReliabilityDiagram:
 
         monkeypatch.setattr(plt, "subplot_mosaic", unexpected_plot)
 
-    def test_closes_figure_when_histogram_construction_fails(self, monkeypatch):
+    @pytest.mark.parametrize("failure_call", [1, 2, 3])
+    def test_closes_figure_when_histogram_construction_fails(
+        self, monkeypatch, failure_call, y_scores_fixtures, y_fixtures
+    ):
         previous_figures = set(plt.get_fignums())
+        build_histogram = Histogram.from_data
+        error = RuntimeError("Histogram construction failed")
+        calls = 0
 
         def fail_histogram(*args, **kwargs):
-            raise RuntimeError("Histogram construction failed")
+            nonlocal calls
+            calls += 1
+            if calls == failure_call:
+                raise error
+            return build_histogram(*args, **kwargs)
 
         monkeypatch.setattr(Histogram, "from_data", fail_histogram)
-        with pytest.raises(RuntimeError, match="Histogram construction failed"):
-            build_reliability_diagram([0.1, 0.9], [0, 1])
+        with pytest.raises(RuntimeError, match="Histogram construction failed") as exc:
+            build_reliability_diagram(y_scores_fixtures["original"], y_fixtures["int"])
 
+        assert exc.value is error
+        assert calls == failure_call
+        assert set(plt.get_fignums()) == previous_figures
+
+    @pytest.mark.parametrize(
+        ("target", "method", "score_fixture"),
+        [
+            (Figure, "suptitle", "original"),
+            (Axes, "scatter", "constant"),
+            (Axes, "bar", "original"),
+        ],
+    )
+    def test_closes_figure_when_plotting_fails(
+        self, monkeypatch, target, method, score_fixture, y_scores_fixtures, y_fixtures
+    ):
+        previous_figures = set(plt.get_fignums())
+        error = RuntimeError("Plotting failed")
+
+        def fail_plot(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(target, method, fail_plot)
+        with pytest.raises(RuntimeError, match="Plotting failed") as exc:
+            build_reliability_diagram(
+                y_scores_fixtures[score_fixture], y_fixtures["int"]
+            )
+
+        assert exc.value is error
         assert set(plt.get_fignums()) == previous_figures
 
     @pytest.mark.parametrize(
@@ -2487,6 +2527,7 @@ class TestReliabilityDiagram:
             ):
                 figure, _ = build_reliability_diagram(values, labels)
                 figures.append(figure)
+                assert plt.fignum_exists(figure.number)
                 figure.canvas.draw()
             np.testing.assert_array_equal(
                 np.asarray(figures[0].canvas.buffer_rgba()),
@@ -2508,6 +2549,9 @@ class TestDiracHeuristic:
     @pytest.mark.parametrize(
         ("freqs", "expected"),
         [
+            ([1, 0], [True, False]),
+            ([0, 1], [False, True]),
+            ([1, 1], [False, False]),
             ([0, 0, 1, 0, 0], [False, False, True, False, False]),
             ([1, 0, 0, 0, 1], [True, False, False, False, True]),
             ([1, 1, 0, 1, 1], [False, False, False, False, False]),
@@ -2515,7 +2559,7 @@ class TestDiracHeuristic:
     )
     def test_only_populated_isolated_bins_are_diracs(self, freqs, expected):
         histogram = Histogram(
-            breakpoints=[0.0, 1e-8, 2e-8, 3e-8, 4e-8, 5e-8], freqs=freqs
+            breakpoints=[i * 1e-8 for i in range(len(freqs) + 1)], freqs=freqs
         )
         assert compute_dirac_indexes(histogram, 1e-6) == expected
 
