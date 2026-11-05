@@ -1210,24 +1210,8 @@ class TestECE:
 
     @pytest.mark.parametrize("method", ["bin", "label-bin"])
     @pytest.mark.parametrize("labels", [[0, 1], ["no", "yes"]])
-    def test_rejects_scores_in_empty_bins(self, method, labels):
-        histogram = Histogram(
-            breakpoints=[0.0, 0.3, 0.7, 1.0],
-            freqs=[1, 0, 1],
-            target_freqs=[(1, 0), (0, 0), (0, 1)],
-            classes=[0, 1],
-        )
-        with pytest.raises(
-            ValueError,
-            match=r"sample indices \[1\], bin indices \[1\]",
-        ):
-            calibration_error(
-                [0.1, 0.5], labels, method=method, histogram=histogram, reuse_stats=True
-            )
-
-    @pytest.mark.parametrize("method", ["bin", "label-bin"])
     @pytest.mark.parametrize("reuse_stats", [False, True])
-    def test_rejects_empty_supplied_bins_before_ece_refresh(self, method, reuse_stats):
+    def test_rejects_scores_in_empty_bins(self, method, labels, reuse_stats):
         histogram = Histogram(
             breakpoints=[0.0, 0.3, 0.7, 1.0],
             freqs=[1, 0, 1],
@@ -1240,7 +1224,7 @@ class TestECE:
         ):
             calibration_error(
                 [0.1, 0.5],
-                [0, 1],
+                labels,
                 method=method,
                 histogram=histogram,
                 reuse_stats=reuse_stats,
