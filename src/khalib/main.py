@@ -3,6 +3,7 @@
 import bisect
 import math
 import os
+import sys
 import tempfile
 import threading
 import warnings
@@ -16,12 +17,13 @@ from khiops.core.internals.runner import KhiopsLocalRunner
 from khiops.sklearn import KhiopsClassifier
 from matplotlib import pyplot as plt
 from matplotlib.ticker import LogLocator
+from scipy.sparse import issparse
 from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin
 from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, label_binarize
 from sklearn.utils._response import _get_response_values
-from sklearn.utils.validation import check_is_fitted
+from sklearn.utils.validation import check_consistent_length, check_is_fitted
 
 khiops_single_core_runner: KhiopsLocalRunner | None = None
 _khiops_runner_lock = threading.RLock()
@@ -62,6 +64,108 @@ def single_core_khiops_runner():
             kh.set_runner(default_runner)
 
 
+def _check_real_values(values, name):
+    """Rejects sparse or complex values."""
+    if issparse(values):
+        raise ValueError(f"'{name}' must not be a sparse matrix.")
+    values = np.asarray(
+        values, dtype=None if isinstance(values, np.ndarray) else object
+    )
+    if values.dtype.kind == "c" or (
+        values.dtype.kind == "O"
+        and any(
+            isinstance(value, (complex, np.complexfloating)) for value in values.flat
+        )
+    ):
+        raise ValueError(f"'{name}' must contain only real values.")
+
+
+def _as_1d_array(values, name):
+    """Converts a vector or single-column matrix to a 1-D array."""
+    _check_real_values(values, name)
+    values = np.asarray(values)
+    if values.ndim != 1 and not (values.ndim == 2 and values.shape[1] == 1):
+        raise ValueError(
+            f"{name} must be 1-D or a single-column matrix, "
+            f"but it has shape {values.shape}."
+        )
+    return values.reshape(-1)
+
+
+def _as_score_array(values, name):
+    """Validates real scores while preserving finite-range integer precision."""
+    _check_real_values(values, name)
+    values = np.asarray(
+        values, dtype=None if isinstance(values, np.ndarray) else object
+    )
+    _check_no_missing_values(values, name)
+    if values.dtype.kind in "SU":
+        raise ValueError(f"'{name}' must contain only numeric values.")
+    if values.dtype.kind == "b":
+        raise ValueError(f"'{name}' must not contain boolean values.")
+    integer_scores = values.dtype.kind in "iu"
+    if values.dtype.kind == "O":
+        integer_scores = True
+        for value in values.flat:
+            if isinstance(value, (str, bytes, np.str_, np.bytes_)):
+                raise ValueError(f"'{name}' must contain only numeric values.")
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError(f"'{name}' must not contain boolean values.")
+            integer_scores &= isinstance(value, (int, np.integer))
+    if values.dtype.kind in "iu":
+        values = values.astype(object)
+    elif integer_scores:
+        values = np.array([int(value) for value in values.flat], dtype=object).reshape(
+            values.shape
+        )
+
+    try:
+        float_values = np.asarray(values, dtype=float)
+    except OverflowError as error:
+        raise ValueError(
+            f"'{name}' must contain values within the finite floating-point range."
+        ) from error
+    return values if integer_scores else float_values
+
+
+def _check_no_infinite_values(values, name):
+    """Rejects infinite values without converting arbitrary-size integers."""
+    if any(value in (math.inf, -math.inf) for value in values.flat):
+        raise ValueError(f"'{name}' must not contain infinite values.")
+
+
+def _check_no_missing_values(values, name):
+    """Rejects NaN or missing values."""
+    if pd.isna(np.asarray(values, dtype=object)).any():
+        raise ValueError(f"'{name}' must not contain NaN or missing values.")
+
+
+def _validate_max_bins(max_bins):
+    """Validates and normalizes a nonnegative integer bin limit."""
+    _check_real_values(max_bins, "max_bins")
+    if isinstance(max_bins, (bool, np.bool_)) or not isinstance(
+        max_bins, (int, np.integer)
+    ):
+        raise ValueError("'max_bins' must be a nonnegative integer.")
+    if max_bins < 0:
+        raise ValueError(f"'max_bins' must be nonnegative. It is {max_bins}.")
+    return int(max_bins)
+
+
+def _find_bin_indexes(breakpoints, values):
+    """Finds left-open, right-closed bins with exact integer comparisons."""
+    values = np.asarray(values)
+    if values.dtype.kind in "iuO" or any(
+        isinstance(value, (int, np.integer)) for value in breakpoints
+    ):
+        boundaries = np.asarray(breakpoints, dtype=object)
+        values = np.asarray(values, dtype=object)
+    else:
+        boundaries = np.asarray(breakpoints)
+    indexes = np.searchsorted(boundaries[:-1], values, side="left") - 1
+    return np.clip(indexes, 0, len(breakpoints) - 2)
+
+
 @dataclass()
 class Histogram:
     """A histogram with optional target variable statistics
@@ -73,19 +177,41 @@ class Histogram:
     Attributes
     ----------
     breakpoints : list[float]
-        The breakpoints defining the histogram in increasing order.
+        The breakpoints defining the histogram in increasing order. NumPy integer
+        endpoints are stored as Python integers to avoid fixed-width overflow.
+        Integer scores and endpoints retain exact comparisons during bin lookup.
     freqs : list of float
-        The frequencies of each bin.
+        The finite, nonnegative frequencies of each bin.
     densities : list[float]
-        The densities of each bin.
+        The densities of each bin. Positive infinite densities caused by overflow
+        are capped at the largest finite float. For capped bins, density times
+        bin width no longer equals the bin's probability mass. Widths exceeding
+        the floating-point range are scaled to preserve representable densities.
     classes : list
         The class labels.
     target_freqs : list[tuple], optional
-        The target frequencies in each bin. Each tuple is has the same size as
-        :paramref:`classes`.
+        The finite, nonnegative target frequencies in each bin. Each tuple has the
+        same size as :paramref:`classes`.
     target_probas : list[tuple], optional
         The target conditional probabilites in each bin. Each tuple is has the same size
         as :paramref:`classes`.
+
+    Raises
+    ------
+    ValueError
+        Raised in the following cases:
+
+        - Bin or target frequencies are negative or nonfinite.
+        - Breakpoints, frequencies, target frequencies, or classes contain
+          complex values.
+        - Bin frequencies have a zero or nonfinite total.
+        - Fewer than two breakpoints are supplied.
+        - Breakpoints contain NaN or infinite values.
+        - Classes contain NaN or missing values.
+        - Breakpoints are not strictly increasing.
+        - Bin frequencies, target frequencies, or classes have inconsistent sizes.
+        - Target frequencies do not sum to their bin frequency.
+        - Breakpoints contain infinite values.
     """
 
     breakpoints: list[float]
@@ -148,24 +274,47 @@ class Histogram:
               intervals.
         use_finest: bool, default=False
             *Unsupervised 'khiops' histogram only*: If `True` it builds the finest
-            histogram instead of the most interpretable.
+            histogram instead of the most interpretable. If no histogram has an
+            information rate of 100, the last histogram is used.
 
         Returns
         -------
         `Histogram`
             The histogram object containing the bin limits and frequencies.
+
+        Raises
+        ------
+        ValueError
+            Raised in the following cases:
+
+            - x contains NaN or missing values.
+            - x contains nonnumeric values.
+            - x contains boolean values.
+            - x contains infinite values.
+            - x contains values outside the finite floating-point range.
+            - x contains no samples.
+            - x or y contains complex values.
+            - y contains NaN or missing values.
+            - max_bins is not a nonnegative integer.
+            - x and y have different numbers of samples.
+        TypeError
+            `use_finest` is not a boolean.
         """
         # Check inputs
-        if len(x.shape) > 1 and x.shape[1] > 1:
-            raise ValueError(f"x must be 1-D but it has shape {x.shape}.")
-        if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
-            raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
+        if not isinstance(use_finest, (bool, np.bool_)):
+            raise TypeError("'use_finest' must be a boolean.")
+        max_bins = _validate_max_bins(max_bins)
+        x = _as_1d_array(_as_score_array(x, "x"), "x")
+        _check_no_infinite_values(x, "x")
+        if y is not None:
+            y = _as_1d_array(y, "y")
+            _check_no_missing_values(y, "y")
+            check_consistent_length(x, y)
+        if x.size == 0:
+            raise ValueError("'x' must contain at least one sample.")
         valid_methods = ["khiops", "eq-freq", "eq-width"]
         if method not in valid_methods:
             raise ValueError(f"method must be in {valid_methods}. It is '{method}'")
-        if max_bins < 0:
-            raise ValueError(f"max_bins must be non-negative. It is {max_bins}")
-
         # Set the y vector to be used by khiops
         # This is necessary because for the "eq-freq" and "eq-width" methods if
         # target is set then it uses 'khiops'.
@@ -211,9 +360,9 @@ class Histogram:
             ctx_stack.enter_context(single_core_khiops_runner())
 
             # Create data table file for khiops
-            df_spec = {"x": x if len(x.shape) == 1 else x.flatten()}
+            df_spec = {"x": x}
             if y_khiops is not None:
-                df_spec["y"] = y_khiops if len(y.shape) == 1 else y.flatten()
+                df_spec["y"] = y_khiops
             output_df = pd.DataFrame(df_spec)
             output_table_path = f"{work_dir}/hist-data.txt"
             output_df.to_csv(output_table_path, sep="\t", index=False)
@@ -255,7 +404,7 @@ class Histogram:
                 casted_target_values = [val == "True" for val in target_values]
             else:
                 casted_target_values = [type(classes[0])(val) for val in target_values]
-            target_indexes = le.transform(casted_target_values)
+            target_indexes = np.argsort(le.transform(casted_target_values))
 
         # Recover the breakpoints from the variable statistics objects
         # Normal case: There is a data grid
@@ -296,8 +445,7 @@ class Histogram:
                             score_stats.modl_histograms.information_rates.index(100)
                         )
                     else:
-                        assert len(score_stats.modl_histograms.information_rates) == 1
-                        histogram_index = 0
+                        histogram_index = -1
                     breakpoints = score_stats.modl_histograms.histograms[
                         histogram_index
                     ].bounds
@@ -309,10 +457,7 @@ class Histogram:
                 if y is not None:
                     # Compute the class and  bin indexes
                     y_indexes = le.transform(y)
-                    x_bin_indexes = (
-                        np.searchsorted(breakpoints[:-1], x, side="left") - 1
-                    ).reshape(-1)
-                    x_bin_indexes[x_bin_indexes < 0] = 0
+                    x_bin_indexes = _find_bin_indexes(breakpoints, x)
 
                     # Compute the target frequencies
                     target_freqs = [[0 for _ in le.classes_] for _ in breakpoints[:-1]]
@@ -326,9 +471,14 @@ class Histogram:
             # Non-informative variable: histogram with only the bin (min, max)
             if score_stats.min < score_stats.max:
                 breakpoints = [score_stats.min, score_stats.max]
-            # Single-valued variable: histogram with only the bin (min, min + eps)
+            # Keep constant-score endpoints distinct despite floating-point rounding
             else:
-                breakpoints = [score_stats.min, score_stats.min + 1.0e-9]
+                value = score_stats.min
+                upper = math.nextafter(value, math.inf)
+                if math.isfinite(upper):
+                    breakpoints = [value, upper]
+                else:
+                    breakpoints = [math.nextafter(value, -math.inf), value]
 
             # Add the total frequency and, if y was provided, the target frequencies
             freqs = [results.preparation_report.instance_number]
@@ -357,22 +507,50 @@ class Histogram:
         x : array-like of shape (n_samples,) or (n_samples, 1)
             Vector with the values to discretize for the histogram.
         breakpoints : list[float]
-            A sorted list of floats defining the bin edges.
+            At least two sorted floats defining the bin edges, without NaN values.
         y : array-like of shape (n_samples,) or (n_samples, 1), optional
             Target values associated to each element in 'x'.
+
+        Raises
+        ------
+        ValueError
+            Raised in the following cases:
+
+            - x contains NaN or missing values.
+            - x contains nonnumeric values.
+            - x contains boolean values.
+            - x contains infinite values.
+            - x contains values outside the finite floating-point range.
+            - x contains no samples.
+            - x, y, or breakpoints contains complex values.
+            - y contains NaN or missing values.
+            - x and y have different numbers of samples.
+            - Breakpoints contain NaN or infinite values.
+            - Fewer than two breakpoints are supplied.
         """
         # Check inputs
-        if len(x.shape) > 1 and x.shape[1] > 1:
-            raise ValueError(f"x must be 1-D but it has shape {x.shape}.")
-        if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
-            raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
+        x = _as_1d_array(_as_score_array(x, "x"), "x")
+        _check_no_infinite_values(x, "x")
+        if y is not None:
+            y = _as_1d_array(y, "y")
+            _check_no_missing_values(y, "y")
+            check_consistent_length(x, y)
+        if x.size == 0:
+            raise ValueError("'x' must contain at least one sample.")
+        if len(breakpoints) < 2:
+            raise ValueError("`breakpoints` must contain at least two values.")
+        _check_real_values(breakpoints, "breakpoints")
+        for i, breakpoint in enumerate(breakpoints):
+            if not isinstance(breakpoint, (int, np.integer)) and math.isnan(breakpoint):
+                raise ValueError(f"`breakpoints` contains NaN at index {i}.")
+            if not isinstance(breakpoint, (int, np.integer)) and math.isinf(breakpoint):
+                raise ValueError(f"`breakpoints` contains infinity at index {i}.")
         for i in range(len(breakpoints) - 1):
             if (left := breakpoints[i]) > breakpoints[i + 1]:
                 raise ValueError(f"Breakpoint at index {i} is not sorted: {left}")
 
         # Initialize the breakpoints and bin frequencies
-        x_bin_indexes = np.searchsorted(breakpoints[:-1], x, side="left") - 1
-        x_bin_indexes[x_bin_indexes < 0] = 0
+        x_bin_indexes = _find_bin_indexes(breakpoints, x)
         freqs = [0] * (len(breakpoints) - 1)
         for x_bin_index in x_bin_indexes:
             freqs[x_bin_index] += 1
@@ -397,7 +575,25 @@ class Histogram:
             )
 
     def __post_init__(self):
+        # Reject complex inputs before comparisons or arithmetic can discard them
+        for name in ("breakpoints", "freqs", "target_freqs", "classes"):
+            _check_real_values(getattr(self, name), name)
+        _check_no_missing_values(self.classes, "classes")
+
+        # Preserve exact integer endpoints without fixed-width arithmetic
+        self.breakpoints = [
+            int(value) if isinstance(value, np.integer) else value
+            for value in self.breakpoints
+        ]
+
         # Check consistency of the constructor parameters
+        if len(self.breakpoints) < 2:
+            raise ValueError("`breakpoints` must contain at least two values.")
+        for i, breakpoint in enumerate(self.breakpoints):
+            if not isinstance(breakpoint, int) and math.isnan(breakpoint):
+                raise ValueError(f"`breakpoints` contains NaN at index {i}.")
+            if not isinstance(breakpoint, int) and math.isinf(breakpoint):
+                raise ValueError(f"`breakpoints` contains infinity at index {i}.")
         for i in range(n_bins := len(self.breakpoints) - 1):
             if (left := self.breakpoints[i]) >= (right := self.breakpoints[i + 1]):
                 raise ValueError(
@@ -409,7 +605,21 @@ class Histogram:
                 "`freqs` must match the size of `breakpoints` minus 1: "
                 f"{n_freqs} != {n_bins}"
             )
+        for i, freq in enumerate(self.freqs):
+            if not isinstance(freq, (int, np.integer)) and not math.isfinite(freq):
+                raise ValueError(
+                    f"`freqs` must be finite, but at bin index {i} got {freq}."
+                )
+            if freq < 0:
+                raise ValueError(
+                    f"`freqs` must be nonnegative, but at bin index {i} got {freq}."
+                )
         if self.target_freqs:
+            if len(set(self.classes)) != len(self.classes):
+                raise ValueError(
+                    "`classes` must contain unique labels when `target_freqs` are "
+                    "provided."
+                )
             if (n_target_freqs := len(self.target_freqs)) != n_freqs:
                 raise ValueError(
                     "`target_freqs` length different from that of `freqs`: "
@@ -421,19 +631,63 @@ class Histogram:
                         f"`target_freqs` at bin index {i} has a length different from "
                         f"the number of classes: {len(tfreqs)} != {len(self.classes)}."
                     )
-                if sum(tfreqs) != self.freqs[i]:
+                for k, tfreq in enumerate(tfreqs):
+                    if not isinstance(tfreq, (int, np.integer)) and not math.isfinite(
+                        tfreq
+                    ):
+                        raise ValueError(
+                            "`target_freqs` must be finite, "
+                            f"but at bin index {i}, class index {k} got {tfreq}."
+                        )
+                    if tfreq < 0:
+                        raise ValueError(
+                            "`target_freqs` must be nonnegative, "
+                            f"but at bin index {i}, class index {k} got {tfreq}."
+                        )
+                target_total = sum(
+                    int(freq) if isinstance(freq, np.integer) else freq
+                    for freq in tfreqs
+                )
+                if target_total != self.freqs[i]:
                     raise ValueError(
                         f"`target_freqs` at bin index {i} sums different from the bin "
-                        f"frequency: {sum(tfreqs)} != {self.freqs[i]}"
+                        f"frequency: {target_total} != {self.freqs[i]}"
                     )
 
+        # Promote NumPy integers to avoid fixed-width overflow during summation
+        total_freq = sum(
+            int(freq) if isinstance(freq, np.integer) else freq for freq in self.freqs
+        )
+        if not isinstance(total_freq, int) and not math.isfinite(total_freq):
+            raise ValueError("`freqs` must have a finite total frequency.")
+        if total_freq == 0:
+            raise ValueError("`freqs` must have a positive total frequency.")
+
         # Initialize the densities and target probabilities
-        self.densities = [
-            self.freqs[i]
-            / sum(self.freqs)
-            / (self.breakpoints[i + 1] - self.breakpoints[i])
-            for i in range(len(self.freqs))
-        ]
+        self.densities = []
+        for i, freq in enumerate(self.freqs):
+            left, right = self.breakpoints[i : i + 2]
+            probability = freq / total_freq
+            # Halve finite endpoints when their difference would overflow
+            if (
+                not isinstance(left, int)
+                and not isinstance(right, int)
+                and math.isfinite(left)
+                and math.isfinite(right)
+                and left < 0 < right
+                and right > sys.float_info.max + left
+            ):
+                density = (probability / 2) / (right / 2 - left / 2)
+            else:
+                width = right - left
+                if isinstance(width, int) and width.bit_length() > 1023:
+                    shift = width.bit_length() - 1023
+                    density = math.ldexp(probability / (width >> shift), -shift)
+                else:
+                    density = probability / width
+            self.densities.append(
+                sys.float_info.max if density == math.inf else density
+            )
         if self.target_freqs:
             target_probas = []
             for bin_freq, bin_target_freqs in zip(
@@ -461,13 +715,26 @@ class Histogram:
         -------
         int
             The index of the bin containing the value.
+
+        Raises
+        ------
+        ValueError
+            If value is nonnumeric, NaN, missing, boolean, infinite, complex,
+            sparse, outside the finite floating-point range, or is not scalar.
         """
+        value = _as_score_array(value, "value")
+        if value.ndim != 0:
+            raise ValueError("'value' must be a scalar.")
+        _check_no_infinite_values(value, "value")
+        value = value.item()
+        if isinstance(value, np.integer):
+            value = int(value)
         if value <= self.breakpoints[0]:
             return 0
         elif value >= self.breakpoints[-1]:
             return len(self.breakpoints) - 2
         else:
-            return bisect.bisect_right(self.breakpoints, value) - 1
+            return bisect.bisect_left(self.breakpoints, value) - 1
 
     def vfind(self, values):
         """Returns the histogram bin indexes for a value sequence
@@ -481,11 +748,16 @@ class Histogram:
         -------
         :external:term:`array-like`
             The indexes of the bins containing the values.
+
+        Raises
+        ------
+        ValueError
+            If values contain nonnumeric, NaN, missing, boolean, infinite,
+            complex, or out-of-range values.
         """
-        indexes = np.searchsorted(self.breakpoints[:-1], values, side="right") - 1
-        indexes[np.array(values) < self.breakpoints[0]] = 0
-        indexes[np.array(values) > self.breakpoints[-2]] = self.n_bins - 1
-        return indexes
+        values = _as_score_array(values, "values")
+        _check_no_infinite_values(values, "values")
+        return _find_bin_indexes(self.breakpoints, values)
 
 
 def calibration_error(
