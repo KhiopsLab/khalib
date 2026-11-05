@@ -1753,6 +1753,21 @@ def fixture_clf_data():
     }
 
 
+def _fail_second_histogram(monkeypatch):
+    """Injects a failure after one real histogram has been built."""
+    build_histogram = Histogram.from_data
+    calls = 0
+
+    def failing_histogram(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("Histogram construction failed")
+        return build_histogram(*args, **kwargs)
+
+    monkeypatch.setattr(Histogram, "from_data", failing_histogram)
+
+
 class TestKhalibClassifier:
     @pytest.mark.parametrize("random_state", [True, np.bool_(True)])
     def test_fit_rejects_boolean_random_state(self, random_state):
@@ -2041,17 +2056,7 @@ class TestKhalibClassifier:
             message = "Calibration labels must"
         # Fail after the first class histogram has already been built
         else:
-            build_histogram = Histogram.from_data
-            calls = 0
-
-            def failing_histogram(*args, **kwargs):
-                nonlocal calls
-                calls += 1
-                if calls == 2:
-                    raise ValueError("Histogram construction failed")
-                return build_histogram(*args, **kwargs)
-
-            monkeypatch.setattr(Histogram, "from_data", failing_histogram)
+            _fail_second_histogram(monkeypatch)
             message = "Histogram construction failed"
         with pytest.raises(ValueError, match=message):
             calibrator.fit(x, new_y)
@@ -2075,17 +2080,7 @@ class TestKhalibClassifier:
             message = "Calibration labels must"
         # Fail after the first class histogram has already been built
         else:
-            build_histogram = Histogram.from_data
-            calls = 0
-
-            def failing_histogram(*args, **kwargs):
-                nonlocal calls
-                calls += 1
-                if calls == 2:
-                    raise ValueError("Histogram construction failed")
-                return build_histogram(*args, **kwargs)
-
-            monkeypatch.setattr(Histogram, "from_data", failing_histogram)
+            _fail_second_histogram(monkeypatch)
             message = "Histogram construction failed"
         with pytest.raises(ValueError, match=message):
             calibrator.fit(x, y)
