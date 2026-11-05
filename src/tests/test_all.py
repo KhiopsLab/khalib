@@ -1173,7 +1173,7 @@ def identity(x):
     return x
 
 
-@pytest.fixture(name="distorted_scores")
+@pytest.fixture(name="distorted_scores", scope="session")
 def fixture_distorted_scores():
     # Create the random scores
     rng = np.random.default_rng(seed=1234567)
@@ -1184,36 +1184,27 @@ def fixture_distorted_scores():
         "fake-2d": np.array(y_scores).reshape(y_scores.shape[0], 1),
     }
     # Build the fixture data dictionary
-    data = {}
-    data["y_scores_fixtures"] = y_scores_fixtures
-    for distortion_fun in (sigmoid_stair, sine_cube_root, identity):
+    data = {"y_scores_fixtures": y_scores_fixtures}
+
+    # Expected ECE values were calculated with a grid of 1e-8 intervals
+    for distortion_fun, expected_ece, tolerance in (
+        (sigmoid_stair, 0.07390433812747241, 1.0e-3),
+        (sine_cube_root, 0.2381850813972994, 1.0e-3),
+        (identity, 0, 2.5e-2),
+    ):
         # Sample a binary distribution according to the distorted probabilities
-        distortion_data = {}
         y_cond_probas = distortion_fun(y_scores)
         y = rng.binomial(1, y_cond_probas)
 
-        # Store the distorted sample and its variants
-        distortion_data["y_fixtures"] = {
-            "int": (y, False),
-            "str": (np.where(y == 0, "zero", "one"), True),
+        # Store the label variants and their calibration expectations
+        data[distortion_fun.__name__] = {
+            "y_fixtures": {
+                "int": (y, False),
+                "str": (np.where(y == 0, "zero", "one"), True),
+            },
+            "theoretical_ece": expected_ece,
+            "approx_kwargs": {"abs": tolerance},
         }
-
-        # Store the expecte ECE and error margin for each distortion function
-        # Note: These were calculated with a grid of 1e-8 intervals
-        if distortion_fun.__name__ == "sine_cube_root":
-            distortion_data |= {
-                "theoretical_ece": 0.2381850813972994,
-                "approx_kwargs": {"abs": 1.0e-3},
-            }
-        elif distortion_fun.__name__ == "sigmoid_stair":
-            distortion_data |= {
-                "theoretical_ece": 0.07390433812747241,
-                "approx_kwargs": {"abs": 1.0e-3},
-            }
-        else:
-            assert distortion_fun.__name__ == "identity"
-            distortion_data |= {"theoretical_ece": 0, "approx_kwargs": {"abs": 2.5e-2}}
-        data[distortion_fun.__name__] = distortion_data
 
     return data
 
@@ -1301,11 +1292,12 @@ class TestECE:
                 [0.1, 0.9], [0, 1], method=method, histogram=histogram, reuse_stats=True
             )
 
-    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    @pytest.mark.parametrize(("method", "expected"), [("bin", 0.0), ("label-bin", 0.4)])
     @pytest.mark.parametrize("classes", [[], [0, 1]])
-    def test_rebuilds_missing_histogram_target_statistics(self, method, classes):
+    def test_rebuilds_missing_histogram_target_statistics(
+        self, method, expected, classes
+    ):
         histogram = Histogram(breakpoints=[0.0, 1.0], freqs=[2], classes=classes)
-        expected = 0.0 if method == "bin" else 0.4
         assert calibration_error(
             [0.1, 0.9], [0, 1], method=method, histogram=histogram
         ) == pytest.approx(expected)
@@ -1525,8 +1517,13 @@ class TestECE:
                 reuse_stats=reuse_stats,
             )
 
-    @pytest.mark.parametrize("method", ["bin", "label-bin"])
-    def test_reused_binary_histogram_requires_matching_class_order(self, method):
+    @pytest.mark.parametrize(
+        ("method", "expected"),
+        [("bin", 0.2666666666666666), ("label-bin", 0.3555555555555556)],
+    )
+    def test_reused_binary_histogram_requires_matching_class_order(
+        self, method, expected
+    ):
         histogram = Histogram(
             breakpoints=[0.0, 1.0],
             freqs=[3],
@@ -1546,9 +1543,7 @@ class TestECE:
 
         assert calibration_error(
             [0.1, 0.3, 0.8], [0, 1, 1], method=method, histogram=histogram
-        ) == pytest.approx(
-            0.2666666666666666 if method == "bin" else 0.3555555555555556
-        )
+        ) == pytest.approx(expected)
 
     def test_classwise_target_error_has_context(self, monkeypatch):
         # Simulate a one-vs-rest target that lacks one outcome
@@ -1563,15 +1558,20 @@ class TestECE:
             )
 
     @pytest.mark.parametrize("method", ["bin", "label-bin"])
-    @pytest.mark.parametrize("as_list", [False, True])
-    def test_binary_vector_inputs(self, method, as_list):
+    @pytest.mark.parametrize(
+        "convert",
+        [
+            pytest.param(lambda values: values[:, np.newaxis], id="column"),
+            pytest.param(lambda values: values.tolist(), id="list"),
+        ],
+    )
+    def test_binary_vector_inputs(self, method, convert):
         # Compare list and single-column inputs with vector inputs
         scores = np.array([0.1, 0.9])
         y = np.array([0, 1])
         histogram = Histogram.from_data_and_breakpoints(scores, [0.0, 1.0], y)
         expected = calibration_error(scores, y, method=method, histogram=histogram)
-        scores = scores.tolist() if as_list else scores[:, np.newaxis]
-        y = y.tolist() if as_list else y[:, np.newaxis]
+        scores, y = convert(scores), convert(y)
 
         assert calibration_error(
             scores, y, method=method, histogram=histogram
@@ -1580,8 +1580,17 @@ class TestECE:
     @pytest.mark.parametrize(
         ("method", "expected"), [("bin", 0.1), ("label-bin", 2 / 15)]
     )
-    @pytest.mark.parametrize("score_shape", ["1d", "column", "binary"])
-    def test_supplied_histogram_uses_current_data(self, method, expected, score_shape):
+    @pytest.mark.parametrize(
+        "convert",
+        [
+            pytest.param(lambda scores: scores, id="1d"),
+            pytest.param(lambda scores: scores.reshape(-1, 1), id="column"),
+            pytest.param(
+                lambda scores: np.column_stack([1 - scores, scores]), id="binary"
+            ),
+        ],
+    )
+    def test_supplied_histogram_uses_current_data(self, method, expected, convert):
         # Recompute statistics from current data using the supplied boundaries
         histogram = Histogram(
             breakpoints=[0.0, 0.3, 0.7, 1.0],
@@ -1589,12 +1598,8 @@ class TestECE:
             target_freqs=[(0, 10), (0, 10), (20, 0)],
             classes=[0, 1],
         )
-        scores = np.array([0.1, 0.2, 0.4, 0.6, 0.8, 0.9])
+        scores = convert(np.array([0.1, 0.2, 0.4, 0.6, 0.8, 0.9]))
         y = np.array([0, 0, 1, 0, 1, 1])
-        if score_shape == "column":
-            scores = scores.reshape(-1, 1)
-        elif score_shape == "binary":
-            scores = np.column_stack([1 - scores, scores])
 
         # Check current-data statistics and preserve the supplied histogram
         assert calibration_error(
