@@ -209,6 +209,28 @@ def _get_decision_function_shape(estimator):
     return getattr(estimator, "decision_function_shape", None)
 
 
+def _get_classifier_scores(estimator, features):
+    """Extracts real class scores, rejecting multiclass pairwise decisions."""
+    scores, _, response_method = _get_response_values(
+        estimator,
+        features,
+        response_method=["predict_proba", "decision_function"],
+        return_response_method_used=True,
+    )
+    _check_real_values(scores, "scores")
+    if (
+        len(estimator.classes_) > 2
+        and response_method == "decision_function"
+        and _get_decision_function_shape(estimator) == "ovo"
+    ):
+        raise ValueError(
+            "Multiclass calibration does not support "
+            'decision_function_shape="ovo". '
+            'Use decision_function_shape="ovr" or an estimator with predict_proba.'
+        )
+    return scores
+
+
 @dataclass()
 class Histogram:
     """A histogram with optional target variable statistics
@@ -1243,23 +1265,7 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
             )
 
         # Estimate the uncalibrated scores
-        scores, _, response_method = _get_response_values(
-            fitted_estimator,
-            x_calib,
-            response_method=["predict_proba", "decision_function"],
-            return_response_method_used=True,
-        )
-        _check_real_values(scores, "scores")
-        if (
-            len(fitted_estimator.classes_) > 2
-            and response_method == "decision_function"
-            and _get_decision_function_shape(fitted_estimator) == "ovo"
-        ):
-            raise ValueError(
-                "Multiclass calibration does not support "
-                'decision_function_shape="ovo". '
-                'Use decision_function_shape="ovr" or an estimator with predict_proba.'
-            )
+        scores = _get_classifier_scores(fitted_estimator, x_calib)
 
         # Binary classification
         if (n_classes := len(fitted_estimator.classes_)) == 2:
@@ -1335,23 +1341,7 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         _check_classifier_features(X)
 
         # Estimate the uncalibrated scores
-        scores, _, response_method = _get_response_values(
-            self.fitted_estimator_,
-            X,
-            response_method=["predict_proba", "decision_function"],
-            return_response_method_used=True,
-        )
-        _check_real_values(scores, "scores")
-        if (
-            len(self.fitted_estimator_.classes_) > 2
-            and response_method == "decision_function"
-            and _get_decision_function_shape(self.fitted_estimator_) == "ovo"
-        ):
-            raise ValueError(
-                "Multiclass calibration does not support "
-                'decision_function_shape="ovo". '
-                'Use decision_function_shape="ovr" or an estimator with predict_proba.'
-            )
+        scores = _get_classifier_scores(self.fitted_estimator_, X)
 
         # Binary classification
         if len(self.histograms_) == 1:
