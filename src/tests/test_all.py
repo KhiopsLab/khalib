@@ -443,6 +443,14 @@ class TestSingleCoreRunner:
 
 
 class TestHistogram:
+    @pytest.mark.parametrize("method", ["typo", "", None, []])
+    def test_rejects_invalid_binning_method(self, method):
+        with pytest.raises(ValueError, match="method must be in") as exc:
+            Histogram.from_data([0.1, 0.9], method=method)
+        assert str(exc.value) == (
+            f"method must be in ['khiops', 'eq-freq', 'eq-width']. It is '{method}'"
+        )
+
     @pytest.mark.parametrize("classes", [["cat", "cat"], [0, 0]])
     def test_rejects_duplicate_classes_with_target_statistics(self, classes):
         with pytest.raises(

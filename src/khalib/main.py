@@ -178,6 +178,14 @@ def _find_bin_indexes(breakpoints, values):
     return np.clip(indexes, 0, len(breakpoints) - 2)
 
 
+def _count_target_frequencies(bin_indexes, class_indexes, n_bins, n_classes):
+    """Counts observations for each bin and encoded target class."""
+    target_freqs = [[0] * n_classes for _ in range(n_bins)]
+    for bin_index, class_index in zip(bin_indexes, class_indexes, strict=True):
+        target_freqs[bin_index][class_index] += 1
+    return [tuple(freqs) for freqs in target_freqs]
+
+
 def _validate_nonempty_bin_scores(histogram, y_scores):
     """Rejects score samples that map to empty bins."""
     bin_indexes = histogram.vfind(y_scores)
@@ -347,26 +355,21 @@ class Histogram:
             check_consistent_length(x, y)
         if x.size == 0:
             raise ValueError("'x' must contain at least one sample.")
-        valid_methods = ["khiops", "eq-freq", "eq-width"]
-        if method not in valid_methods:
-            raise ValueError(f"method must be in {valid_methods}. It is '{method}'")
-        # Set the y vector to be used by khiops
-        # This is necessary because for the "eq-freq" and "eq-width" methods if
-        # target is set then it uses 'khiops'.
-        y_khiops = y if method == "khiops" else None
 
-        # Transform the binning methods to the Khiops names
-        if method == "khiops":
-            khiops_method = "MODL"
-        elif method == "eq-freq":
-            khiops_method = "EqualFrequency"
-        elif method == "eq-width":
-            khiops_method = "EqualWidth"
-        else:
+        # Validate and translate the binning method to its Khiops name
+        khiops_methods = {
+            "khiops": "MODL",
+            "eq-freq": "EqualFrequency",
+            "eq-width": "EqualWidth",
+        }
+        if not isinstance(method, str) or method not in khiops_methods:
             raise ValueError(
-                f"Unknown binning method '{method}'. "
-                "Choose between 'khiops', 'eq-freq' and 'eq-width'"
+                f"method must be in {list(khiops_methods)}. It is '{method}'"
             )
+        khiops_method = khiops_methods[method]
+
+        # Supplying a target would make Khiops ignore equal-frequency/width binning
+        y_khiops = y if method == "khiops" else None
 
         # Create Khiops dictionary
         kdom = kh.DictionaryDomain()
@@ -490,17 +493,11 @@ class Histogram:
 
                 # Compute the supervised fields if y was provided
                 if y is not None:
-                    # Compute the class and  bin indexes
                     y_indexes = le.transform(y)
                     x_bin_indexes = _find_bin_indexes(breakpoints, x)
-
-                    # Compute the target frequencies
-                    target_freqs = [[0 for _ in le.classes_] for _ in breakpoints[:-1]]
-                    for y_score_bin_index, y_index in np.nditer(
-                        [x_bin_indexes, y_indexes]
-                    ):
-                        target_freqs[y_score_bin_index][y_index] += 1
-                    target_freqs = [tuple(tf) for tf in target_freqs]
+                    target_freqs = _count_target_frequencies(
+                        x_bin_indexes, y_indexes, len(breakpoints) - 1, len(le.classes_)
+                    )
         # Otherwise there is just one interval
         else:
             # Non-informative variable: histogram with only the bin (min, max)
@@ -597,15 +594,15 @@ class Histogram:
             le = LabelEncoder().fit(y)
             y_indexes = le.transform(y)
 
-            # Initialize the target frequencies per bin
-            target_freqs = [[0 for _ in le.classes_] for _ in breakpoints[:-1]]
-            for x_bin_index, y_index in np.nditer([x_bin_indexes, y_indexes]):
-                target_freqs[x_bin_index][y_index] += 1
+            # Count target observations in each bin
+            target_freqs = _count_target_frequencies(
+                x_bin_indexes, y_indexes, len(breakpoints) - 1, len(le.classes_)
+            )
 
             return cls(
                 breakpoints=breakpoints,
                 freqs=freqs,
-                target_freqs=[tuple(freqs) for freqs in target_freqs],
+                target_freqs=target_freqs,
                 classes=le.classes_.tolist(),
             )
 
