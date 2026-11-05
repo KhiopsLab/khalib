@@ -46,6 +46,15 @@ def test_manual_histogram_rejects_complex_breakpoints(breakpoints):
 @pytest.mark.parametrize(
     "matrix_type", [coo_matrix, csr_matrix, dok_matrix, lil_matrix]
 )
+def test_sparse_multiclass_scores_are_rejected(matrix_type):
+    scores = matrix_type([[0.7, 0.2, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]])
+    with pytest.raises(ValueError, match="must not be a sparse matrix"):
+        calibration_error(scores, [0, 1, 2])
+
+
+@pytest.mark.parametrize(
+    "matrix_type", [coo_matrix, csr_matrix, dok_matrix, lil_matrix]
+)
 def test_sparse_labels_are_rejected(matrix_type):
     labels = matrix_type([[0], [1]])
     with pytest.raises(ValueError, match="must not be a sparse matrix"):
@@ -87,6 +96,22 @@ def test_histogram_rejects_negative_max_bins():
         Histogram.from_data([0.1, 0.9], max_bins=-1)
 
 
+@pytest.mark.parametrize("value", [1.5, 1.0, np.inf, np.nan, True, "2", -1])
+def test_calibration_error_rejects_invalid_max_bins(value):
+    with pytest.raises(ValueError, match="'max_bins'.*nonnegative"):
+        calibration_error([0.1, 0.9], [0, 1], max_bins=value)
+
+
+@pytest.mark.parametrize("max_bins", [1.5, np.inf, np.nan, True, "2", -1])
+def test_calibration_error_ignores_max_bins_with_histogram(max_bins):
+    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
+    expected = calibration_error([0.1, 0.9], [0, 1], histogram=histogram)
+    assert (
+        calibration_error([0.1, 0.9], [0, 1], histogram=histogram, max_bins=max_bins)
+        == expected
+    )
+
+
 def test_histogram_accepts_numpy_integer_max_bins():
     histogram = Histogram.from_data([0.1, 0.9], method="eq-width", max_bins=np.int64(2))
     assert histogram.n_bins <= 2
@@ -103,6 +128,22 @@ def test_histogram_accepts_numpy_boolean_use_finest():
         [0.1, 0.9], method="eq-width", use_finest=np.bool_(True)
     )
     assert histogram.n_bins > 0
+
+
+@pytest.mark.parametrize("reuse_stats", ["yes", 1, None])
+def test_calibration_error_rejects_nonboolean_reuse_stats(reuse_stats):
+    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
+    with pytest.raises(TypeError, match="'reuse_stats' must be a boolean"):
+        calibration_error(
+            [0.1, 0.9], [0, 1], histogram=histogram, reuse_stats=reuse_stats
+        )
+
+
+def test_calibration_error_accepts_numpy_boolean_reuse_stats():
+    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
+    assert calibration_error(
+        [0.1, 0.9], [0, 1], histogram=histogram, reuse_stats=np.bool_(True)
+    ) == pytest.approx(0.4)
 
 
 @pytest.fixture(name="data_root_dir")
@@ -990,6 +1031,416 @@ def fixture_distorted_scores():
 
 
 class TestECE:
+    @pytest.mark.parametrize("multi_class_method", ["top-label", "classwise"])
+    @pytest.mark.parametrize("supply_histogram", [False, True])
+    def test_rejects_reused_statistics_for_multiclass_scores(
+        self, multi_class_method, supply_histogram
+    ):
+        scores = [[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]
+        histogram = Histogram(breakpoints=[0.0, 1.0], freqs=[3])
+        with pytest.raises(
+            ValueError, match="'reuse_stats' is not supported for multiclass scores"
+        ):
+            calibration_error(
+                scores,
+                [0, 1, 2],
+                multi_class_method=multi_class_method,
+                histogram=histogram if supply_histogram else None,
+                reuse_stats=True,
+            )
+
+    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    @pytest.mark.parametrize("labels", [[0, 1], ["no", "yes"]])
+    def test_rejects_scores_in_empty_bins(self, method, labels):
+        histogram = Histogram(
+            breakpoints=[0.0, 0.3, 0.7, 1.0],
+            freqs=[1, 0, 1],
+            target_freqs=[(1, 0), (0, 0), (0, 1)],
+            classes=[0, 1],
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"sample indices \[1\], bin indices \[1\]",
+        ):
+            calibration_error(
+                [0.1, 0.5], labels, method=method, histogram=histogram, reuse_stats=True
+            )
+
+    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    @pytest.mark.parametrize("reuse_stats", [False, True])
+    def test_rejects_empty_supplied_bins_before_ece_refresh(self, method, reuse_stats):
+        histogram = Histogram(
+            breakpoints=[0.0, 0.3, 0.7, 1.0],
+            freqs=[1, 0, 1],
+            target_freqs=[(1, 0), (0, 0), (0, 1)],
+            classes=[0, 1],
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"sample indices \[1\], bin indices \[1\]",
+        ):
+            calibration_error(
+                [0.1, 0.5],
+                [0, 1],
+                method=method,
+                histogram=histogram,
+                reuse_stats=reuse_stats,
+            )
+
+    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    def test_large_integer_scores_do_not_overflow_accumulation(self, method):
+        score = 2**62
+        histogram = Histogram([score - 1, score + 1], [5])
+        assert calibration_error(
+            np.full(5, score, dtype=np.int64),
+            [0, 1, 0, 1, 0],
+            method=method,
+            histogram=histogram,
+        ) == pytest.approx(float(score))
+
+    @pytest.mark.parametrize("parameter", ["method", "multi_class_method"])
+    @pytest.mark.parametrize("invalid", ["typo", "", None])
+    @pytest.mark.parametrize(
+        ("scores", "labels"),
+        [
+            ([0.1, 0.9], [0, 1]),
+            ([[0.4, 0.4, 0.2], [0.1, 0.8, 0.1], [0.7, 0.2, 0.1]], [0, 1, 2]),
+        ],
+    )
+    @pytest.mark.parametrize("supply_histogram", [False, True])
+    def test_rejects_invalid_estimation_methods(
+        self, parameter, invalid, scores, labels, supply_histogram
+    ):
+        histogram = Histogram(breakpoints=[0.0, 1.0], freqs=[2])
+        with pytest.raises(ValueError, match=rf"'{parameter}' must be"):
+            calibration_error(
+                scores,
+                labels,
+                histogram=histogram if supply_histogram else None,
+                **{parameter: invalid},
+            )
+
+    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    @pytest.mark.parametrize("classes", [[], [0, 1]])
+    def test_rejects_reused_histogram_without_target_statistics(self, method, classes):
+        histogram = Histogram(breakpoints=[0.0, 1.0], freqs=[2], classes=classes)
+        with pytest.raises(ValueError, match="'histogram' must have target statistics"):
+            calibration_error(
+                [0.1, 0.9], [0, 1], method=method, histogram=histogram, reuse_stats=True
+            )
+
+    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    @pytest.mark.parametrize("classes", [[], [0, 1]])
+    def test_rebuilds_missing_histogram_target_statistics(self, method, classes):
+        histogram = Histogram(breakpoints=[0.0, 1.0], freqs=[2], classes=classes)
+        expected = 0.0 if method == "bin" else 0.4
+        assert calibration_error(
+            [0.1, 0.9], [0, 1], method=method, histogram=histogram
+        ) == pytest.approx(expected)
+        assert histogram.target_freqs == []
+
+    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    @pytest.mark.parametrize("multi_class_method", ["top-label", "classwise"])
+    @pytest.mark.parametrize("reuse_stats", [False, True])
+    @pytest.mark.parametrize(
+        ("scores", "labels"),
+        [
+            ([np.nan, 0.9], [0, 1]),
+            ([[np.nan], [0.9]], [0, 1]),
+            ([[np.nan, 0.1], [0.1, 0.9]], [0, 1]),
+            ([[0.8, 0.1, np.nan], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]], [0, 1, 2]),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [float, object])
+    def test_rejects_nan_scores(
+        self, method, multi_class_method, reuse_stats, scores, labels, dtype
+    ):
+        # Neither unused score columns nor reused statistics may hide NaN inputs
+        scores = np.array(scores, dtype=dtype)
+        histogram = Histogram(
+            breakpoints=[0.0, 1.0], freqs=[2], target_freqs=[(1, 1)], classes=[0, 1]
+        )
+        with pytest.raises(ValueError, match="'y_scores' must not contain NaN"):
+            calibration_error(
+                scores,
+                labels,
+                method=method,
+                multi_class_method=multi_class_method,
+                histogram=histogram,
+                reuse_stats=reuse_stats,
+            )
+
+    @pytest.mark.parametrize(
+        "scores",
+        [
+            [-np.inf, 0.9],
+            [[0.9, -np.inf, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]],
+        ],
+    )
+    def test_rejects_infinite_scores(self, scores):
+        labels = [0, 1] if np.asarray(scores).ndim == 1 else [0, 1, 2]
+        with pytest.raises(ValueError, match="'y_scores' must not contain infinite"):
+            calibration_error(scores, labels)
+
+    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    @pytest.mark.parametrize("multi_class_method", ["top-label", "classwise"])
+    @pytest.mark.parametrize(
+        ("scores", "labels", "reuse_stats"),
+        [
+            ([0.1, 0.9], [0, 1], False),
+            ([0.1, 0.9], [0, 1], True),
+            ([[0.1], [0.9]], [0, 1], False),
+            ([[0.1], [0.9]], [0, 1], True),
+            ([[0.9, 0.1], [0.1, 0.9]], [0, 1], False),
+            ([[0.9, 0.1], [0.1, 0.9]], [0, 1], True),
+            ([[0.4, 0.4, 0.2], [0.1, 0.8, 0.1], [0.7, 0.2, 0.1]], [0, 1, 2], False),
+        ],
+    )
+    def test_numeric_object_scores(
+        self, method, multi_class_method, reuse_stats, scores, labels
+    ):
+        # Object scores must behave like floating-point scores in every ECE mode
+        histogram = Histogram(
+            breakpoints=[0.0, 1.0], freqs=[2], target_freqs=[(1, 1)], classes=[0, 1]
+        )
+        kwargs = {
+            "method": method,
+            "multi_class_method": multi_class_method,
+            "histogram": histogram,
+            "reuse_stats": reuse_stats,
+        }
+        expected = calibration_error(np.array(scores, dtype=float), labels, **kwargs)
+        assert calibration_error(
+            np.array(scores, dtype=object), labels, **kwargs
+        ) == pytest.approx(expected)
+
+    @pytest.mark.parametrize(
+        ("method", "expected"), [("bin", 1 / 30), ("label-bin", 13 / 90)]
+    )
+    @pytest.mark.parametrize("labels", [[0, 1, 2], ["bird", "cat", "dog"]])
+    def test_top_label_ties_select_first_class(self, method, expected, labels):
+        # The tied first row is correct only when the first maximum is selected
+        scores = [[0.4, 0.4, 0.2], [0.1, 0.8, 0.1], [0.7, 0.2, 0.1]]
+        histogram = Histogram(breakpoints=[0.0, 1.0], freqs=[3])
+        assert calibration_error(
+            scores, labels, method=method, histogram=histogram
+        ) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("multi_class_method", ["top-label", "classwise"])
+    @pytest.mark.parametrize("reuse_stats", [False, True])
+    @pytest.mark.parametrize(
+        ("scores", "y"),
+        [
+            ([0.1], [0, 1]),
+            ([0.1, 0.9], [0]),
+            ([[0.9, 0.1]], [0, 1]),
+            ([[0.1, 0.2, 0.7]], [0, 1, 2]),
+            ([[0.1, 0.2, 0.7], [0.8, 0.1, 0.1]], [0]),
+            ([0.1, 0.5, 0.9], [0, 1]),
+        ],
+    )
+    def test_rejects_mismatched_sample_counts(
+        self, scores, y, multi_class_method, reuse_stats
+    ):
+        # Supplied statistics must not bypass sample-count validation
+        histogram = Histogram(
+            breakpoints=[0.0, 1.0],
+            freqs=[2],
+            target_freqs=[(1, 1)],
+            classes=[0, 1],
+        )
+        with pytest.raises(ValueError, match="inconsistent numbers of samples"):
+            calibration_error(
+                scores,
+                y,
+                multi_class_method=multi_class_method,
+                histogram=histogram,
+                reuse_stats=reuse_stats,
+            )
+
+    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    @pytest.mark.parametrize("multi_class_method", ["top-label", "classwise"])
+    @pytest.mark.parametrize(
+        "y",
+        [
+            [0, 0, 0, 0],
+            [0, 2, 0, 2],
+            ["cat", "dog", "cat", "dog"],
+            [0, 1, 2, 3],
+        ],
+    )
+    def test_multiclass_rejects_mismatched_classes(self, method, multi_class_method, y):
+        # Reject missing or extra labels before mapping score columns to classes
+        scores = np.array(
+            [[0.1, 0.2, 0.7], [0.8, 0.1, 0.1], [0.2, 0.6, 0.2], [0.3, 0.3, 0.4]]
+        )
+        with pytest.raises(
+            ValueError,
+            match="Number of distinct labels in 'y' must match.*"
+            rf"{len(set(y))} != 3",
+        ):
+            calibration_error(
+                scores, y, method=method, multi_class_method=multi_class_method
+            )
+
+    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    @pytest.mark.parametrize("all_correct", [False, True])
+    @pytest.mark.parametrize("histogram_source", ["internal", "boundaries"])
+    def test_top_label_rejects_single_correctness_outcome(
+        self, method, all_correct, histogram_source
+    ):
+        # Vary confidence while keeping every prediction correct or incorrect
+        scores = np.array([[0.8, 0.1, 0.1], [0.1, 0.7, 0.2], [0.2, 0.2, 0.6]])
+        y = np.array([0, 1, 2]) if all_correct else np.array([1, 2, 0])
+        confidence = scores.max(axis=1)
+        correctness = np.full(3, int(all_correct))
+        histogram = None
+        if histogram_source == "boundaries":
+            histogram = Histogram.from_data_and_breakpoints(
+                confidence, [0.0, 0.65, 0.75, 1.0], correctness
+            )
+
+        # Reject single-outcome data regardless of the histogram source
+        with pytest.raises(
+            ValueError, match="Top-label ECE requires both correct and incorrect"
+        ):
+            calibration_error(
+                scores,
+                y,
+                method=method,
+                histogram=histogram,
+            )
+
+    @pytest.mark.parametrize(
+        "scores", [[0.8, 0.9], [[0.8], [0.9]], [[0.2, 0.8], [0.1, 0.9]]]
+    )
+    @pytest.mark.parametrize("reuse_stats", [False, True])
+    def test_binary_rejects_single_class_target(self, scores, reuse_stats):
+        # A supplied two-class histogram must not bypass target validation
+        histogram = None
+        if reuse_stats:
+            histogram = Histogram(
+                breakpoints=[0.0, 1.0],
+                freqs=[2],
+                target_freqs=[(1, 1)],
+                classes=["cat", "dog"],
+            )
+        with pytest.raises(ValueError, match="Binary ECE requires exactly two"):
+            calibration_error(
+                np.array(scores),
+                np.array(["cat", "cat"]),
+                histogram=histogram,
+                reuse_stats=reuse_stats,
+            )
+
+    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    def test_reused_binary_histogram_requires_matching_class_order(self, method):
+        histogram = Histogram(
+            breakpoints=[0.0, 1.0],
+            freqs=[3],
+            target_freqs=[(2, 1)],
+            classes=[1, 0],
+        )
+        with pytest.raises(
+            ValueError, match="Reused binary histogram classes must match"
+        ):
+            calibration_error(
+                [0.1, 0.3, 0.8],
+                [0, 1, 1],
+                method=method,
+                histogram=histogram,
+                reuse_stats=True,
+            )
+
+        assert calibration_error(
+            [0.1, 0.3, 0.8], [0, 1, 1], method=method, histogram=histogram
+        ) == pytest.approx(
+            0.2666666666666666 if method == "bin" else 0.3555555555555556
+        )
+
+    def test_classwise_target_error_has_context(self, monkeypatch):
+        # Simulate a one-vs-rest target that lacks one outcome
+        monkeypatch.setattr(
+            khalib_main, "label_binarize", lambda *args, **kwargs: np.zeros((3, 3))
+        )
+        with pytest.raises(
+            ValueError, match="Classwise ECE requires both positive and negative"
+        ):
+            calibration_error(
+                np.eye(3), np.array(["a", "b", "c"]), multi_class_method="classwise"
+            )
+
+    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    @pytest.mark.parametrize("as_list", [False, True])
+    def test_binary_vector_inputs(self, method, as_list):
+        # Compare list and single-column inputs with vector inputs
+        scores = np.array([0.1, 0.9])
+        y = np.array([0, 1])
+        histogram = Histogram.from_data_and_breakpoints(scores, [0.0, 1.0], y)
+        expected = calibration_error(scores, y, method=method, histogram=histogram)
+        scores = scores.tolist() if as_list else scores[:, np.newaxis]
+        y = y.tolist() if as_list else y[:, np.newaxis]
+
+        assert calibration_error(
+            scores, y, method=method, histogram=histogram
+        ) == pytest.approx(expected)
+
+    @pytest.mark.parametrize(
+        ("method", "expected"), [("bin", 0.1), ("label-bin", 2 / 15)]
+    )
+    @pytest.mark.parametrize("score_shape", ["1d", "column", "binary"])
+    def test_supplied_histogram_uses_current_data(self, method, expected, score_shape):
+        # Recompute statistics from current data using the supplied boundaries
+        histogram = Histogram(
+            breakpoints=[0.0, 0.3, 0.7, 1.0],
+            freqs=[10, 10, 20],
+            target_freqs=[(0, 10), (0, 10), (20, 0)],
+            classes=[0, 1],
+        )
+        scores = np.array([0.1, 0.2, 0.4, 0.6, 0.8, 0.9])
+        y = np.array([0, 0, 1, 0, 1, 1])
+        if score_shape == "column":
+            scores = scores.reshape(-1, 1)
+        elif score_shape == "binary":
+            scores = np.column_stack([1 - scores, scores])
+
+        # Check current-data statistics and preserve the supplied histogram
+        assert calibration_error(
+            scores, y, method=method, histogram=histogram
+        ) == pytest.approx(expected)
+        assert histogram.freqs == [10, 10, 20]
+        assert histogram.target_freqs == [(0, 10), (0, 10), (20, 0)]
+
+    @pytest.mark.parametrize(
+        ("method", "expected"), [("bin", 0.1), ("label-bin", 2 / 15)]
+    )
+    @pytest.mark.parametrize("supply_histogram", [False, True])
+    def test_histogram_statistics_are_not_recomputed(
+        self, method, expected, supply_histogram, monkeypatch
+    ):
+        # Provide same-data statistics through either histogram source
+        scores = np.array([0.1, 0.2, 0.4, 0.6, 0.8, 0.9])
+        y = np.array([0, 0, 1, 0, 1, 1])
+        histogram = Histogram.from_data_and_breakpoints(scores, [0.0, 0.3, 0.7, 1.0], y)
+        monkeypatch.setattr(Histogram, "from_data", lambda *args, **kwargs: histogram)
+
+        # Reject a second statistics pass
+        def unexpected_recomputation(*args, **kwargs):
+            pytest.fail("Histogram statistics must not be recomputed")
+
+        monkeypatch.setattr(
+            Histogram, "from_data_and_breakpoints", unexpected_recomputation
+        )
+
+        # Reuse supplied statistics or use the internally built histogram directly
+        assert calibration_error(
+            scores,
+            y,
+            method=method,
+            histogram=histogram if supply_histogram else None,
+            reuse_stats=supply_histogram,
+        ) == pytest.approx(expected)
+
     @pytest.mark.parametrize("y_fixture", ["bool", "float", "int", "intnl", "str"])
     @pytest.mark.parametrize("y_scores_fixture", ["original", "original-2d"])
     @pytest.mark.parametrize(
@@ -1021,12 +1472,20 @@ class TestECE:
         ("multi_class_method", "expected_ece"),
         [("top-label", 0.0723944), ("classwise", 0.04642129)],
     )
+    @pytest.mark.parametrize("as_list", [False, True])
     def test_fast_multi_class_ece(
-        self, multi_class_method, expected_ece, vehicles_scores_df
+        self, multi_class_method, expected_ece, as_list, vehicles_scores_df
     ):
+        # Preserve multiclass score matrices while normalizing target vectors
+        scores = vehicles_scores_df.drop("y", axis=1).to_numpy()
+        y = vehicles_scores_df.y.to_numpy()
+        if as_list:
+            scores, y = scores.tolist(), y.tolist()
+        else:
+            y = y[:, np.newaxis]
         ece = calibration_error(
-            vehicles_scores_df.drop("y", axis=1).__array__(),
-            vehicles_scores_df.y,
+            scores,
+            y,
             multi_class_method=multi_class_method,
         )
         assert ece == pytest.approx(expected_ece)

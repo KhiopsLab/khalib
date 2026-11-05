@@ -166,6 +166,19 @@ def _find_bin_indexes(breakpoints, values):
     return np.clip(indexes, 0, len(breakpoints) - 2)
 
 
+def _validate_nonempty_bin_scores(histogram, y_scores):
+    """Rejects score samples that map to empty bins."""
+    bin_indexes = histogram.vfind(y_scores)
+    empty_bin_samples = np.flatnonzero(np.asarray(histogram.freqs)[bin_indexes] == 0)
+    if empty_bin_samples.size:
+        raise ValueError(
+            "Cannot compute ECE for scores in empty histogram bins: "
+            f"sample indices {empty_bin_samples.tolist()}, "
+            f"bin indices {bin_indexes[empty_bin_samples].tolist()}."
+        )
+    return bin_indexes
+
+
 @dataclass()
 class Histogram:
     """A histogram with optional target variable statistics
@@ -768,6 +781,7 @@ def calibration_error(
     max_bins: int = 0,
     multi_class_method: str = "top-label",
     histogram: Histogram | None = None,
+    reuse_stats: bool = False,
 ):
     r"""Estimates the ECE via binning
 
@@ -776,10 +790,14 @@ def calibration_error(
 
     Parameters
     ----------
-    y_scores : array-like of shape (n_samples,) or (n_samples, 1) or (n_samples, 2)
-        Scores/probabilities. If it is a 2-D array the column indexed as 1 will be used
-        for the estimation.
-    y : array-like of shape (n_samples,) or (n_samples, n_classes)
+    y_scores : array-like of shape (n_samples,) or (n_samples, n_classes)
+        Scores/probabilities. For binary ECE, the positive class is the second
+        distinct label in sorted order. For two-column binary scores, column 1
+        must contain scores for that class.
+        For multiclass scores, columns must correspond to the numerical or
+        lexicographical order of the labels in y, with every class present in y.
+        Single-column binary scores are also accepted.
+    y : array-like of shape (n_samples,) or (n_samples, 1)
         Target values (class labels).
     method : {"label-bin", "bin"}, default="label-bin"
         ECE estimation method. See below for details.
@@ -787,9 +805,10 @@ def calibration_error(
         Multi-class ECE estimation method:
 
         - "top-label": Estimates the ECE for the confidence scores (ie. the predicted
-          class score).
-        - "classwise": Estimates the ECE for each class in a one-vs-rest fashion and the
-          averages it.
+          class score). Ties select the first maximal score column.
+          Requires both correct and incorrect predictions.
+        - "classwise": Estimates the ECE for each class in a one-vs-rest fashion and
+          averages the class ECEs weighted by each class's prevalence in `y`.
     histogram_method : {"khiops", "eq-freq", "eq-width"}, default="khiops"
         Histogram method:
 
@@ -808,9 +827,42 @@ def calibration_error(
         - For "khiops": that there is no limit to the number of intervals.
         - For "eq-freq" or "eq-width": that 10 is the maximum number of intervals.
     histogram : `Histogram`, optional
-        A ready-made histogram. If set then it is used for the ECE computation and the
-        parameters histogram_method and max_bins are ignored.
+        A histogram providing the bin boundaries. If set, histogram_method and
+        max_bins are ignored. Bin and target frequencies are recomputed from
+        y_scores and y unless reuse_stats is True. When reusing binary statistics,
+        the histogram's classes must match the sorted distinct labels in y.
+    reuse_stats : bool, default=False
+        Reuse the supplied histogram's statistics without recomputing them. Set
+        this to True only if it was built from the same scores and labels used
+        for this ECE computation. Multiclass score matrices are rejected when
+        this is True. For binary scores, it has no effect when histogram is None.
 
+    Raises
+    ------
+    ValueError
+        Raised in the following cases:
+
+        - Binary targets do not contain exactly two distinct labels.
+        - Top-label predictions are all correct or all incorrect.
+        - A classwise target lacks positive or negative examples.
+        - The number of distinct labels differs from the number of multiclass
+          score columns.
+        - Scores and labels have different numbers of samples.
+        - Scores contain nonnumeric values.
+        - Scores contain NaN or missing values.
+        - Scores contain boolean values.
+        - Scores contain infinite values.
+        - Scores contain values outside the finite floating-point range.
+        - Scores or labels contain complex values.
+        - Labels contain NaN or missing values.
+        - max_bins is not a nonnegative integer when histogram is None.
+        - Reused histogram statistics lack target frequencies.
+        - Reused binary histogram classes do not match the sorted labels in y.
+        - reuse_stats is True for multiclass scores.
+        - Scores map to empty bins in the supplied or constructed histogram.
+        - method or multi_class_method is not a supported estimation method.
+    TypeError
+        `reuse_stats` is not a boolean.
 
     Notes
     -----
@@ -865,42 +917,68 @@ def calibration_error(
     histogram estimation of the ECE.
 
     """
-    if len(y_scores.shape) > 2:
+    # Validate estimation methods before computing histogram statistics
+    if not isinstance(reuse_stats, (bool, np.bool_)):
+        raise TypeError("'reuse_stats' must be a boolean.")
+    if histogram is None:
+        max_bins = _validate_max_bins(max_bins)
+    if method not in ("label-bin", "bin"):
+        raise ValueError(f"'method' must be 'label-bin' or 'bin'. Got {method!r}.")
+    if multi_class_method not in ("top-label", "classwise"):
+        raise ValueError(
+            "'multi_class_method' must be 'top-label' or 'classwise'. "
+            f"Got {multi_class_method!r}."
+        )
+
+    # Normalize labels while preserving binary and multiclass score matrices
+    y = _as_1d_array(y, "y")
+    _check_no_missing_values(y, "y")
+    y_scores = _as_score_array(y_scores, "y_scores")
+    if y_scores.ndim not in (1, 2) or (y_scores.ndim == 2 and y_scores.shape[1] == 0):
         raise ValueError(
             "'y_scores' must be either a 1-D or 2-D array-like object, "
             f"but its shape is {y_scores.shape}"
         )
-    # 1-D or 2-D array with 1 column: Binary ECE
-    if len(y_scores.shape) == 1 or (
-        len(y_scores.shape) == 2 and y_scores.shape[1] == 1
-    ):
+    check_consistent_length(y_scores, y)
+    _check_no_infinite_values(y_scores, "y_scores")
+
+    # Keep reusable histogram statistics restricted to binary score inputs
+    if reuse_stats and y_scores.ndim == 2 and y_scores.shape[1] > 2:
+        raise ValueError("'reuse_stats' is not supported for multiclass scores.")
+
+    # Binary ECE uses the positive-class column when two columns are supplied
+    if y_scores.ndim == 1 or y_scores.shape[1] <= 2:
+        binary_scores = y_scores if y_scores.ndim == 1 else y_scores[:, -1]
+        if len(np.unique(y)) != 2:
+            raise ValueError(
+                "Binary ECE requires exactly two distinct target labels in 'y'."
+            )
         return _binary_ece(
-            y_scores,
+            binary_scores,
             y,
             method=method,
             histogram_method=histogram_method,
             max_bins=max_bins,
             histogram=histogram,
-        )
-    # 2-D array with 2 columns: Also Binary ECE but a little pre-treatment is needed
-    elif len(y_scores.shape) == 2 and y_scores.shape[1] == 2:
-        # le = LabelEncoder().fit(y)
-        # y_binarized = label_binarize(y, classes=le.classes_)
-        return _binary_ece(
-            y_scores[:, 1],
-            y,
-            method=method,
-            histogram_method=histogram_method,
-            max_bins=max_bins,
-            histogram=histogram,
+            reuse_stats=reuse_stats,
         )
     # 2-D array with > 2 columns: Multi-class ECE
     else:
         le = LabelEncoder().fit(y)
+        if len(le.classes_) != y_scores.shape[1]:
+            raise ValueError(
+                "Number of distinct labels in 'y' must match the number of "
+                "columns in multiclass 'y_scores': "
+                f"{len(le.classes_)} != {y_scores.shape[1]}."
+            )
         if multi_class_method == "top-label":
-            prediction_indexes = np.argsort(y_scores, axis=1)[:, -1]
+            prediction_indexes = np.argmax(y_scores, axis=1)
             y_preds = (y == le.classes_[prediction_indexes]).astype(int)
             y_pred_scores = y_scores[np.arange(len(y)), prediction_indexes]
+            if len(np.unique(y_preds)) != 2:
+                raise ValueError(
+                    "Top-label ECE requires both correct and incorrect predictions."
+                )
             return _binary_ece(
                 y_pred_scores,
                 y_preds,
@@ -908,21 +986,29 @@ def calibration_error(
                 histogram_method=histogram_method,
                 max_bins=max_bins,
                 histogram=histogram,
+                reuse_stats=reuse_stats,
             )
         else:
             assert multi_class_method == "classwise"
             y_binarized = label_binarize(y, classes=le.classes_)
-            class_eces = [
-                _binary_ece(
-                    y_scores[:, k],
-                    y_binarized[:, k],
-                    method=method,
-                    histogram_method=histogram_method,
-                    max_bins=max_bins,
-                    histogram=histogram,
+            class_eces = []
+            for k in range(y_scores.shape[1]):
+                if len(np.unique(y_binarized[:, k])) != 2:
+                    raise ValueError(
+                        "Classwise ECE requires both positive and negative examples "
+                        f"for class {le.classes_[k]!r}."
+                    )
+                class_eces.append(
+                    _binary_ece(
+                        y_scores[:, k],
+                        y_binarized[:, k],
+                        method=method,
+                        histogram_method=histogram_method,
+                        max_bins=max_bins,
+                        histogram=histogram,
+                        reuse_stats=reuse_stats,
+                    )
                 )
-                for k in range(y_scores.shape[1])
-            ]
             class_probas = np.unique(y, return_counts=True)[1] / len(y)
             return float(np.dot(class_eces, class_probas))
 
@@ -934,25 +1020,57 @@ def _binary_ece(
     histogram_method: str = "khiops",
     max_bins: int = 0,
     histogram: Histogram | None = None,
+    reuse_stats: bool = False,
 ):
     """Estimates the ECE for a 2-class problem
 
     See the function `calibration_error` docstring for more details.
     """
-    # Compute the histogram if necessary
+    # Normalize binary scores and labels
+    y_scores = _as_1d_array(y_scores, "y_scores")
+    y = _as_1d_array(y, "y")
+    assert len(np.unique(y)) == 2
+
+    # Validate supplied statistics before any refresh can populate empty bins
+    supplied_histogram = histogram is not None
+    if supplied_histogram:
+        bin_indexes = _validate_nonempty_bin_scores(histogram, y_scores)
+
+    # Build or refresh statistics unless reuse is explicitly requested
     if histogram is None:
         histogram = Histogram.from_data(
             y_scores, y=y, method=histogram_method, max_bins=max_bins
         )
+    elif not reuse_stats:
+        histogram = Histogram.from_data_and_breakpoints(
+            y_scores,
+            histogram.breakpoints,
+            y=y,
+        )
 
-    # Check that the histogram has only two classes
+    # Require target statistics for exactly two classes
+    if not histogram.target_freqs:
+        raise ValueError("'histogram' must have target statistics.")
     if (n_classes := len(histogram.classes)) != 2:
-        raise ValueError(f"Target 'y' must have only 2 classes. It has {n_classes}.")
+        raise ValueError(
+            f"The histogram must have exactly 2 target classes. It has {n_classes}."
+        )
+    expected_classes = LabelEncoder().fit(y).classes_
+    if reuse_stats and not np.array_equal(histogram.classes, expected_classes):
+        raise ValueError(
+            "Reused binary histogram classes must match the sorted distinct labels "
+            f"in 'y'. Got {histogram.classes!r}; expected "
+            f"{expected_classes.tolist()!r}."
+        )
+
+    # Validate the constructed histogram when no statistics were supplied
+    if not supplied_histogram:
+        bin_indexes = _validate_nonempty_bin_scores(histogram, y_scores)
 
     # Estimate the ECE with the histogram
     if method == "label-bin":
         sum_diffs = 0
-        for y_score, i in np.nditer([y_scores, histogram.vfind(y_scores)]):
+        for y_score, i in zip(y_scores, bin_indexes, strict=True):
             sum_diffs += math.fabs(
                 y_score - histogram.target_freqs[i][1] / histogram.freqs[i]
             )
@@ -960,7 +1078,7 @@ def _binary_ece(
     else:
         assert method == "bin"
         sum_score_by_bin = [0 for _ in histogram.bins]
-        for y_score, i in np.nditer([y_scores, histogram.vfind(y_scores)]):
+        for y_score, i in zip(y_scores, bin_indexes, strict=True):
             sum_score_by_bin[i] += y_score
         return sum(
             [
