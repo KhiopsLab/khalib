@@ -2,7 +2,7 @@ import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+from functools import cache, partial
 
 import numpy as np
 import pandas as pd
@@ -1707,44 +1707,25 @@ def _clf_data_builder(n_train, n_calib, n_test, n_classes, n_features, n_informa
 
 @pytest.fixture(name="clf_data", scope="session")
 def fixture_clf_data():
-    return {
-        "binary": {
-            "slow": _clf_data_builder(
-                n_train=10_000,
-                n_calib=10_000,
-                n_test=30_000,
-                n_classes=2,
-                n_features=10,
-                n_informative=2,
-            ),
-            "fast": _clf_data_builder(
-                n_train=1_000,
-                n_calib=1_000,
-                n_test=1_000,
-                n_classes=2,
-                n_features=10,
-                n_informative=2,
-            ),
-        },
-        "multi_class": {
-            "slow": _clf_data_builder(
-                n_train=10_000,
-                n_calib=10_000,
-                n_test=30_000,
-                n_classes=4,
-                n_features=10,
-                n_informative=4,
-            ),
-            "fast": _clf_data_builder(
-                n_train=1_000,
-                n_calib=1_000,
-                n_test=1_000,
-                n_classes=4,
-                n_features=10,
-                n_informative=4,
-            ),
-        },
-    }
+    """Builds each requested dataset once per session."""
+
+    @cache
+    def build_data(class_mode, train_mode):
+        n_classes = {"binary": 2, "multi_class": 4}[class_mode]
+        n_train, n_calib, n_test = {
+            "fast": (1_000, 1_000, 1_000),
+            "slow": (10_000, 10_000, 30_000),
+        }[train_mode]
+        return _clf_data_builder(
+            n_train=n_train,
+            n_calib=n_calib,
+            n_test=n_test,
+            n_classes=n_classes,
+            n_features=10,
+            n_informative=n_classes,
+        )
+
+    return build_data
 
 
 def _fail_second_histogram(monkeypatch):
@@ -2163,34 +2144,47 @@ class TestKhalibClassifier:
     # - SVC does not have predict_proba
     # - MC LR OVR+normalization worsens the calibration
     @pytest.mark.parametrize(
-        ("clf", "class_mode", "expected_ece"),
+        ("clf_factory", "train_clf", "class_mode", "expected_ece"),
         [
-            (KhiopsClassifier(), "binary", 0.005826),
-            (KhiopsClassifier(), "multi_class", 0.017015),
-            (LogisticRegression(), "binary", 0.009168),
-            (LogisticRegression(), "multi_class", 0.103714),
-            (SVC(), "binary", 0.006882),
-            (SVC(), "multi_class", 0.052011),
-            (None, "binary", 0.005826),
-            (None, "multi_class", 0.017015),
+            (KhiopsClassifier, False, "binary", 0.005826),
+            (KhiopsClassifier, True, "binary", 0.005826),
+            (KhiopsClassifier, False, "multi_class", 0.017015),
+            (KhiopsClassifier, True, "multi_class", 0.017015),
+            (LogisticRegression, False, "binary", 0.009168),
+            (LogisticRegression, True, "binary", 0.009168),
+            (LogisticRegression, False, "multi_class", 0.103714),
+            (LogisticRegression, True, "multi_class", 0.103714),
+            (SVC, False, "binary", 0.006882),
+            (SVC, True, "binary", 0.006882),
+            (SVC, False, "multi_class", 0.052011),
+            (SVC, True, "multi_class", 0.052011),
+            (None, False, "binary", 0.005826),
+            (None, False, "multi_class", 0.017015),
         ],
     )
     @pytest.mark.parametrize(
         ("train_mode", "train_size"),
         [pytest.param("slow", 10000, marks=pytest.mark.slow), ("fast", 1000)],
     )
-    @pytest.mark.parametrize("train_clf", [False, True])
     def test_calibrator(
-        self, train_clf, train_mode, train_size, clf, class_mode, expected_ece, clf_data
+        self,
+        train_clf,
+        train_mode,
+        train_size,
+        clf_factory,
+        class_mode,
+        expected_ece,
+        clf_data,
     ):
-        # Explose the input data to variables
-        x_train, x_calib, x_test, y_train, y_calib, y_test = clf_data[class_mode][
-            train_mode
-        ]
+        # Prepare fresh estimator state and reproducible train/calibration data
+        clf = clf_factory() if clf_factory is not None else None
+        x_train, x_calib, x_test, y_train, y_calib, y_test = clf_data(
+            class_mode, train_mode
+        )
 
         # Create the calibrated classifier
         train_calib_split_state = 2
-        if clf is not None and train_clf:
+        if train_clf:
             # Control the train/calib split: This is only for reproducibility of the
             # case where the classifier is fitted or None versos the pre-fitted case
             x_not_test = np.vstack([x_train, x_calib])
