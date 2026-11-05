@@ -1282,9 +1282,6 @@ class TestECE:
         ) == pytest.approx(expected)
         assert histogram.target_freqs == []
 
-    @pytest.mark.parametrize("method", ["bin", "label-bin"])
-    @pytest.mark.parametrize("multi_class_method", ["top-label", "classwise"])
-    @pytest.mark.parametrize("reuse_stats", [False, True])
     @pytest.mark.parametrize(
         ("scores", "labels"),
         [
@@ -1295,11 +1292,34 @@ class TestECE:
         ],
     )
     @pytest.mark.parametrize("dtype", [float, object])
-    def test_rejects_nan_scores(
-        self, method, multi_class_method, reuse_stats, scores, labels, dtype
-    ):
-        # Neither unused score columns nor reused statistics may hide NaN inputs
+    def test_rejects_nan_scores(self, scores, labels, dtype):
+        # Reject NaN in every score shape, including unused columns
         scores = np.array(scores, dtype=dtype)
+        with pytest.raises(ValueError, match="'y_scores' must not contain NaN"):
+            calibration_error(scores, labels)
+
+    @pytest.mark.parametrize("method", ["bin", "label-bin"])
+    @pytest.mark.parametrize("reuse_stats", [False, True])
+    @pytest.mark.parametrize(
+        ("scores", "labels", "multi_class_method"),
+        [
+            ([np.nan, 0.9], [0, 1], "top-label"),
+            (
+                [[0.8, 0.1, np.nan], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]],
+                [0, 1, 2],
+                "top-label",
+            ),
+            (
+                [[0.8, 0.1, np.nan], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]],
+                [0, 1, 2],
+                "classwise",
+            ),
+        ],
+    )
+    def test_ece_modes_do_not_bypass_nan_validation(
+        self, method, reuse_stats, scores, labels, multi_class_method
+    ):
+        # Supplied statistics must not bypass validation in any estimation mode
         histogram = Histogram(
             breakpoints=[0.0, 1.0], freqs=[2], target_freqs=[(1, 1)], classes=[0, 1]
         )
