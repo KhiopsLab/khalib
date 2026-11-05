@@ -1250,7 +1250,10 @@ class TestECE:
         )
         with pytest.raises(
             ValueError,
-            match=r"sample indices \[1\], bin indices \[1\]",
+            match=(
+                r"Cannot compute ECE for scores in empty histogram bins: "
+                r"sample indices \[1\], bin indices \[1\]\."
+            ),
         ):
             calibration_error(
                 [0.1, 0.5],
@@ -2320,7 +2323,10 @@ class TestCalibrateBinary:
             scores = scores[:, np.newaxis]
         with pytest.raises(
             ValueError,
-            match=r"sample indices \[1, 2, 3\], bin indices \[1, 2, 1\]",
+            match=(
+                r"Cannot calibrate scores in empty histogram bins: "
+                r"sample indices \[1, 2, 3\], bin indices \[1, 2, 1\]\."
+            ),
         ):
             calibrate_binary(scores, histogram, only_positive=only_positive)
 

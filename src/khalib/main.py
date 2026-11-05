@@ -186,13 +186,13 @@ def _count_target_frequencies(bin_indexes, class_indexes, n_bins, n_classes):
     return [tuple(freqs) for freqs in target_freqs]
 
 
-def _validate_nonempty_bin_scores(histogram, y_scores):
+def _validate_nonempty_bin_scores(histogram, y_scores, operation):
     """Rejects score samples that map to empty bins."""
     bin_indexes = histogram.vfind(y_scores)
     empty_bin_samples = np.flatnonzero(np.asarray(histogram.freqs)[bin_indexes] == 0)
     if empty_bin_samples.size:
         raise ValueError(
-            "Cannot compute ECE for scores in empty histogram bins: "
+            f"Cannot {operation} scores in empty histogram bins: "
             f"sample indices {empty_bin_samples.tolist()}, "
             f"bin indices {bin_indexes[empty_bin_samples].tolist()}."
         )
@@ -1075,7 +1075,9 @@ def _binary_ece(
     # Validate supplied statistics before any refresh can populate empty bins
     supplied_histogram = histogram is not None
     if supplied_histogram:
-        bin_indexes = _validate_nonempty_bin_scores(histogram, y_scores)
+        bin_indexes = _validate_nonempty_bin_scores(
+            histogram, y_scores, operation="compute ECE for"
+        )
 
     # Build or refresh statistics unless reuse is explicitly requested
     if histogram is None:
@@ -1106,7 +1108,9 @@ def _binary_ece(
 
     # Validate the constructed histogram when no statistics were supplied
     if not supplied_histogram:
-        bin_indexes = _validate_nonempty_bin_scores(histogram, y_scores)
+        bin_indexes = _validate_nonempty_bin_scores(
+            histogram, y_scores, operation="compute ECE for"
+        )
 
     # Estimate the ECE with the histogram
     if method == "label-bin":
@@ -1444,16 +1448,9 @@ def calibrate_binary(y_scores, histogram: Histogram, only_positive: bool = False
         raise ValueError(f"'histogram' must have only 2 classes (it has {n_classes})")
 
     # Reject scores without calibration observations in their bins
-    y_scores_bin_indexes = histogram.vfind(y_scores)
-    empty_bin_samples = np.flatnonzero(
-        np.asarray(histogram.freqs)[y_scores_bin_indexes] == 0
+    y_scores_bin_indexes = _validate_nonempty_bin_scores(
+        histogram, y_scores, operation="calibrate"
     )
-    if empty_bin_samples.size:
-        raise ValueError(
-            "Cannot calibrate scores in empty histogram bins: "
-            f"sample indices {empty_bin_samples.tolist()}, "
-            f"bin indices {y_scores_bin_indexes[empty_bin_samples].tolist()}."
-        )
 
     # Map each score to its bin target probabilities
     calibrated_probas = np.asarray(histogram.target_probas)[y_scores_bin_indexes]
