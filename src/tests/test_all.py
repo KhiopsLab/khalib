@@ -2,6 +2,7 @@ import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 import numpy as np
 import pandas as pd
@@ -30,6 +31,25 @@ from khalib import main as khalib_main
 from khalib.main import compute_dirac_indexes
 
 
+@pytest.fixture(
+    name="score_api",
+    params=["histogram", "manual", "calibrate", "ece", "diagram", "vfind"],
+)
+def fixture_score_api(request):
+    """Returns a score API with valid non-score inputs."""
+    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
+    return {
+        "histogram": partial(Histogram.from_data, y=[0, 1]),
+        "manual": partial(
+            Histogram.from_data_and_breakpoints, breakpoints=[0.0, 1.0], y=[0, 1]
+        ),
+        "calibrate": partial(calibrate_binary, histogram=histogram),
+        "ece": partial(calibration_error, y=[0, 1]),
+        "diagram": partial(build_reliability_diagram, y=[0, 1]),
+        "vfind": histogram.vfind,
+    }[request.param]
+
+
 @pytest.mark.parametrize(
     "scores",
     [
@@ -40,42 +60,18 @@ from khalib.main import compute_dirac_indexes
         np.array([[0.1 + 100j], [0.9 - 100j]]),
     ],
 )
-@pytest.mark.parametrize(
-    "api", ["histogram", "manual", "calibrate", "ece", "diagram", "vfind"]
-)
-def test_score_apis_reject_complex_values(scores, api):
-    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
-    function, args = {
-        "histogram": (Histogram.from_data, ([0, 1],)),
-        "manual": (Histogram.from_data_and_breakpoints, ([0.0, 1.0], [0, 1])),
-        "calibrate": (calibrate_binary, (histogram,)),
-        "ece": (calibration_error, ([0, 1],)),
-        "diagram": (build_reliability_diagram, ([0, 1],)),
-        "vfind": (histogram.vfind, ()),
-    }[api]
+def test_score_apis_reject_complex_values(scores, score_api):
     with pytest.raises(ValueError, match="must contain only real values"):
-        function(scores, *args)
+        score_api(scores)
 
 
 @pytest.mark.parametrize(
     "scores",
     [[True, False], np.array([True, False]), np.array([0.1, True], dtype=object)],
 )
-@pytest.mark.parametrize(
-    "api", ["histogram", "manual", "calibrate", "ece", "diagram", "vfind"]
-)
-def test_score_apis_reject_boolean_values(scores, api):
-    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
-    function, args = {
-        "histogram": (Histogram.from_data, ([0, 1],)),
-        "manual": (Histogram.from_data_and_breakpoints, ([0.0, 1.0], [0, 1])),
-        "calibrate": (calibrate_binary, (histogram,)),
-        "ece": (calibration_error, ([0, 1],)),
-        "diagram": (build_reliability_diagram, ([0, 1],)),
-        "vfind": (histogram.vfind, ()),
-    }[api]
+def test_score_apis_reject_boolean_values(scores, score_api):
     with pytest.raises(ValueError, match="must not contain boolean values"):
-        function(scores, *args)
+        score_api(scores)
 
 
 @pytest.mark.parametrize(
@@ -86,39 +82,15 @@ def test_score_apis_reject_boolean_values(scores, api):
         np.array([0.1, "0.9"], dtype=object),
     ],
 )
-@pytest.mark.parametrize(
-    "api", ["histogram", "manual", "calibrate", "ece", "diagram", "vfind"]
-)
-def test_score_apis_reject_numeric_strings(scores, api):
-    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
-    function, args = {
-        "histogram": (Histogram.from_data, ([0, 1],)),
-        "manual": (Histogram.from_data_and_breakpoints, ([0.0, 1.0], [0, 1])),
-        "calibrate": (calibrate_binary, (histogram,)),
-        "ece": (calibration_error, ([0, 1],)),
-        "diagram": (build_reliability_diagram, ([0, 1],)),
-        "vfind": (histogram.vfind, ()),
-    }[api]
+def test_score_apis_reject_numeric_strings(scores, score_api):
     with pytest.raises(ValueError, match="must contain only numeric values"):
-        function(scores, *args)
+        score_api(scores)
 
 
-@pytest.mark.parametrize(
-    "api", ["histogram", "manual", "calibrate", "ece", "diagram", "vfind"]
-)
-def test_score_apis_reject_missing_values(api):
+def test_score_apis_reject_missing_values(score_api):
     scores = np.array([0.1, pd.NA], dtype=object)
-    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
-    function, args = {
-        "histogram": (Histogram.from_data, ([0, 1],)),
-        "manual": (Histogram.from_data_and_breakpoints, ([0.0, 1.0], [0, 1])),
-        "calibrate": (calibrate_binary, (histogram,)),
-        "ece": (calibration_error, ([0, 1],)),
-        "diagram": (build_reliability_diagram, ([0, 1],)),
-        "vfind": (histogram.vfind, ()),
-    }[api]
     with pytest.raises(ValueError, match="must not contain NaN or missing values"):
-        function(scores, *args)
+        score_api(scores)
 
 
 @pytest.mark.parametrize("dtype", [complex, np.complex64, np.complex128])
@@ -148,22 +120,10 @@ def test_manual_histogram_rejects_complex_breakpoints(breakpoints):
 @pytest.mark.parametrize(
     "matrix_type", [coo_matrix, csr_matrix, dok_matrix, lil_matrix]
 )
-@pytest.mark.parametrize(
-    "api", ["histogram", "manual", "calibrate", "ece", "diagram", "vfind"]
-)
-def test_sparse_scores_are_rejected(matrix_type, api):
+def test_sparse_scores_are_rejected(matrix_type, score_api):
     scores = matrix_type(np.array([[0.1], [0.9]]))
-    histogram = Histogram([0.0, 0.5, 1.0], [1, 1], [(1, 0), (0, 1)], [0, 1])
-    function, args = {
-        "histogram": (Histogram.from_data, ([0, 1],)),
-        "manual": (Histogram.from_data_and_breakpoints, ([0.0, 1.0], [0, 1])),
-        "calibrate": (calibrate_binary, (histogram,)),
-        "ece": (calibration_error, ([0, 1],)),
-        "diagram": (build_reliability_diagram, ([0, 1],)),
-        "vfind": (histogram.vfind, ()),
-    }[api]
     with pytest.raises(ValueError, match="must not be a sparse matrix"):
-        function(scores, *args)
+        score_api(scores)
 
 
 @pytest.mark.parametrize(
