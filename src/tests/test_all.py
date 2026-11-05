@@ -1659,14 +1659,8 @@ class TestECE:
     @pytest.mark.parametrize(
         "distortion_fun_name", ["sine_cube_root", "sigmoid_stair", "identity"]
     )
-    @pytest.mark.parametrize(
-        ("method", "expected_ece"), [("label-bin", 0)]
-    )  # [("bin", 0.036162213), ("label-bin", 0.086438357)]
-    # )
     def test_accuracy_binary_ece(
         self,
-        method,
-        expected_ece,
         distorted_scores,
         distortion_fun_name,
         y_scores_fixture_name,
@@ -1684,7 +1678,7 @@ class TestECE:
                 y_scores[:, [0, 1]] = y_scores[:, [1, 0]]
 
         # Estimate the ECE
-        ece = calibration_error(y_scores, y, method=method)
+        ece = calibration_error(y_scores, y, method="label-bin")
         assert ece == pytest.approx(
             distorted_scores[distortion_fun_name]["theoretical_ece"],
             **distorted_scores[distortion_fun_name]["approx_kwargs"],
