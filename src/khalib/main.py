@@ -242,41 +242,38 @@ class Histogram:
     Attributes
     ----------
     breakpoints : list[float]
-        The breakpoints defining the histogram in increasing order. NumPy integer
-        endpoints are stored as Python integers to avoid fixed-width overflow.
-        Integer scores and endpoints retain exact comparisons during bin lookup.
+        The breakpoints defining the histogram in increasing order.
     freqs : list of float
         The finite, nonnegative frequencies of each bin.
     densities : list[float]
-        The densities of each bin. Positive infinite densities caused by overflow
-        are capped at the largest finite float. For capped bins, density times
-        bin width no longer equals the bin's probability mass. Widths exceeding
-        the floating-point range are scaled to preserve representable densities.
+        The densities of each bin.
     classes : list
         The class labels.
     target_freqs : list[tuple], optional
         The finite, nonnegative target frequencies in each bin. Each tuple has the
         same size as :paramref:`classes`.
     target_probas : list[tuple], optional
-        The target conditional probabilites in each bin. Each tuple is has the same size
-        as :paramref:`classes`.
+        The target conditional probabilities in each bin, in class order.
 
     Raises
     ------
     ValueError
-        Raised in the following cases:
+        If fields violate the :ref:`input-requirements`, have inconsistent
+        dimensions, or target frequencies do not sum to their bin frequency.
 
-        - Bin or target frequencies are negative or nonfinite.
-        - Breakpoints, frequencies, target frequencies, or classes contain
-          complex values.
-        - Bin frequencies have a zero or nonfinite total.
-        - Fewer than two breakpoints are supplied.
-        - Breakpoints contain NaN or infinite values.
-        - Classes contain NaN or missing values.
-        - Breakpoints are not strictly increasing.
-        - Bin frequencies, target frequencies, or classes have inconsistent sizes.
-        - Target frequencies do not sum to their bin frequency.
-        - Breakpoints contain infinite values.
+    Notes
+    -----
+    .. rubric:: Integer precision
+
+    NumPy integer endpoints are stored as Python integers to avoid fixed-width
+    overflow. Integer scores and endpoints retain exact comparisons during lookup.
+
+    .. rubric:: Density limits
+
+    Positive infinite densities caused by overflow are capped at the largest
+    finite float. For capped bins, density times bin width no longer equals the
+    bin's probability mass. Widths exceeding the floating-point range are scaled
+    to preserve representable densities.
     """
 
     breakpoints: list[float]
@@ -329,7 +326,7 @@ class Histogram:
               be larger than the other ones.
             - "eq-width": All bins have the same width.
 
-            If the method is set to "eq-freq" or "eq-width" is set then 'y' is ignored.
+            For "eq-freq" and "eq-width", y does not affect the bin boundaries.
         max_bins: int, default=0
             The maximum number of bins to be created. The algorithms usually create this
             number of bins but they may create less. The default value 0 means:
@@ -350,20 +347,10 @@ class Histogram:
         Raises
         ------
         ValueError
-            Raised in the following cases:
-
-            - x contains NaN or missing values.
-            - x contains nonnumeric values.
-            - x contains boolean values.
-            - x contains infinite values.
-            - x contains values outside the finite floating-point range.
-            - x contains no samples.
-            - x or y contains complex values.
-            - y contains NaN or missing values.
-            - max_bins is not a nonnegative integer.
-            - x and y have different numbers of samples.
+            If scores, labels, or max_bins violate the :ref:`input-requirements`,
+            scores are empty, sample counts differ, or method is unsupported.
         TypeError
-            `use_finest` is not a boolean.
+            ``use_finest`` is not a boolean.
         """
         # Check inputs
         if not isinstance(use_finest, (bool, np.bool_)):
@@ -561,26 +548,15 @@ class Histogram:
         x : array-like of shape (n_samples,) or (n_samples, 1)
             Vector with the values to discretize for the histogram.
         breakpoints : list[float]
-            At least two sorted floats defining the bin edges, without NaN values.
+            The increasing bin edges.
         y : array-like of shape (n_samples,) or (n_samples, 1), optional
             Target values associated to each element in 'x'.
 
         Raises
         ------
         ValueError
-            Raised in the following cases:
-
-            - x contains NaN or missing values.
-            - x contains nonnumeric values.
-            - x contains boolean values.
-            - x contains infinite values.
-            - x contains values outside the finite floating-point range.
-            - x contains no samples.
-            - x, y, or breakpoints contains complex values.
-            - y contains NaN or missing values.
-            - x and y have different numbers of samples.
-            - Breakpoints contain NaN or infinite values.
-            - Fewer than two breakpoints are supplied.
+            If scores, labels, or breakpoints violate the
+            :ref:`input-requirements`, scores are empty, or sample counts differ.
         """
         # Check inputs
         x = _as_1d_array(_as_score_array(x, "x"), "x")
@@ -773,8 +749,7 @@ class Histogram:
         Raises
         ------
         ValueError
-            If value is nonnumeric, NaN, missing, boolean, infinite, complex,
-            sparse, outside the finite floating-point range, or is not scalar.
+            If value violates the score :ref:`input-requirements` or is not scalar.
         """
         value = _as_score_array(value, "value")
         if value.ndim != 0:
@@ -806,8 +781,7 @@ class Histogram:
         Raises
         ------
         ValueError
-            If values contain nonnumeric, NaN, missing, boolean, infinite,
-            complex, or out-of-range values.
+            If values violate the score :ref:`input-requirements`.
         """
         values = _as_score_array(values, "values")
         _check_no_infinite_values(values, "values")
@@ -847,9 +821,8 @@ def calibration_error(
 
         - "top-label": Estimates the ECE for the confidence scores (ie. the predicted
           class score). Ties select the first maximal score column.
-          Requires both correct and incorrect predictions.
         - "classwise": Estimates the ECE for each class in a one-vs-rest fashion and
-          averages the class ECEs weighted by each class's prevalence in `y`.
+          averages the class ECEs weighted by each class's prevalence in ``y``.
     histogram_method : {"khiops", "eq-freq", "eq-width"}, default="khiops"
         Histogram method:
 
@@ -860,7 +833,7 @@ def calibration_error(
           larger than the other ones.
         - "eq-width": All bins have the same width.
 
-        If the method is set to "eq-freq" or "eq-width" is set then 'y' is ignored.
+        For "eq-freq" and "eq-width", y does not affect the bin boundaries.
     max_bins : int, default=0
         The maximum number of bins to be created. The algorithms usually create this
         number of bins but they may create less. The default value 0 means:
@@ -870,43 +843,42 @@ def calibration_error(
     histogram : `Histogram`, optional
         A histogram providing the bin boundaries. If set, histogram_method and
         max_bins are ignored. Bin and target frequencies are recomputed from
-        y_scores and y unless reuse_stats is True. When reusing binary statistics,
-        the histogram's classes must match the sorted distinct labels in y.
+        y_scores and y unless reuse_stats is True.
     reuse_stats : bool, default=False
         Reuse the supplied histogram's statistics without recomputing them. Set
         this to True only if it was built from the same scores and labels used
-        for this ECE computation. Multiclass score matrices are rejected when
-        this is True. For binary scores, it has no effect when histogram is None.
+        for this ECE computation. Has no effect when histogram is None.
 
     Raises
     ------
     ValueError
-        Raised in the following cases:
-
-        - Binary targets do not contain exactly two distinct labels.
-        - Top-label predictions are all correct or all incorrect.
-        - A classwise target lacks positive or negative examples.
-        - The number of distinct labels differs from the number of multiclass
-          score columns.
-        - Scores and labels have different numbers of samples.
-        - Scores contain nonnumeric values.
-        - Scores contain NaN or missing values.
-        - Scores contain boolean values.
-        - Scores contain infinite values.
-        - Scores contain values outside the finite floating-point range.
-        - Scores or labels contain complex values.
-        - Labels contain NaN or missing values.
-        - max_bins is not a nonnegative integer when histogram is None.
-        - Reused histogram statistics lack target frequencies.
-        - Reused binary histogram classes do not match the sorted labels in y.
-        - reuse_stats is True for multiclass scores.
-        - Scores map to empty bins in the supplied or constructed histogram.
-        - method or multi_class_method is not a supported estimation method.
+        If inputs violate the :ref:`input-requirements` or the estimation and
+        histogram requirements described in Notes.
     TypeError
-        `reuse_stats` is not a boolean.
+        ``reuse_stats`` is not a boolean.
 
     Notes
     -----
+    .. rubric:: Input and estimation requirements
+
+    Binary targets must contain exactly two distinct labels. Multiclass targets
+    must contain one distinct label per score column. Top-label ECE requires both
+    correct and incorrect predictions; classwise ECE requires both positive and
+    negative examples for each class. Scores and labels must have matching sample
+    counts. See :ref:`input-requirements` for common score and label rules.
+
+    Both method and multi_class_method must be supported. When no histogram is
+    supplied, max_bins must be a nonnegative integer.
+
+    .. rubric:: Histogram statistics
+
+    Reusing statistics is supported only for binary scores and requires target
+    frequencies for two classes in the same order as the sorted labels in y.
+    Scores mapping to empty histogram bins are rejected, including before any
+    supplied statistics are refreshed.
+
+    .. rubric:: Mathematical definition
+
     We present the formulas for the two binary ECE estimators used in this function, as
     described in [RCSM22]_. Both approximate the theoretical calibration error:
 
@@ -1209,21 +1181,23 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         Raises
         ------
         ValueError
-            Raised in the following cases:
-
-            - Calibration labels contain fewer than two classes.
-            - Sparse matrices are used outside classifier feature input X.
-            - Features, labels, train_size, random_state, or estimator scores
-              contain complex values.
-            - Labels contain NaN or missing values.
-            - Calibration labels do not exactly match the fitted estimator's classes.
-            - Multiclass scores use a decision function with
-              decision_function_shape="ovo", including inside pipelines or searches.
+            If inputs violate the :ref:`input-requirements`, calibration labels
+            do not match the estimator's classes, or multiclass decision scores
+            use an unsupported layout.
         TypeError
-            `random_state` is a boolean.
+            ``random_state`` is a boolean.
 
         Notes
         -----
+        .. rubric:: Calibration requirements
+
+        Calibration labels must contain at least two classes and exactly match
+        the fitted estimator's classes. Features may be sparse, unlike scores
+        and labels. Multiclass decision scores must not use
+        ``decision_function_shape="ovo"``, including inside pipelines or searches.
+
+        .. rubric:: Fitted state
+
         Fitted attributes are updated only after calibration succeeds. A failed
         refit preserves the previous fitted state. The supplied estimator is cloned
         before fitting, or copied if already fitted, so later changes to it do not
@@ -1325,20 +1299,28 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         Raises
         ------
         ValueError
-            Raised in the following cases:
-
-            - Multiclass calibrated probabilities sum to zero and the base
-              estimator cannot provide valid probabilities for the fallback.
-            - Sparse matrices are used outside classifier feature input X.
-            - Features or estimator scores contain complex values.
-            - Multiclass scores use a decision function with
-              decision_function_shape="ovo", including inside pipelines or searches.
+            If features or scores violate the :ref:`input-requirements`,
+            multiclass decision scores use an unsupported layout, or zero-sum
+            calibrated probabilities have no valid fallback.
 
         Warns
         -----
         UserWarning
             If multiclass calibrated probabilities sum to zero. The uncalibrated
             probabilities are returned for those samples instead.
+
+        Notes
+        -----
+        .. rubric:: Score layout
+
+        Multiclass decision scores must not use ``decision_function_shape="ovo"``,
+        including inside pipelines or searches. Features may be sparse.
+
+        .. rubric:: Zero-sum probabilities
+
+        If all calibrated class probabilities for a sample are zero, the fitted
+        estimator must provide finite, nonnegative ``predict_proba`` values
+        summing to one. These are used only for the affected samples.
         """
         # Check that is fitted
         check_is_fitted(self, ["fitted_estimator_", "histograms_"])
@@ -1411,14 +1393,10 @@ def calibrate_binary(y_scores, histogram: Histogram, only_positive: bool = False
     Parameters
     ----------
     y_scores : array-like of shape (n_samples,) or (n_samples, 1)
-        Scores for the second class in ``histogram.classes``. NaN, missing,
-        infinite, complex, and values outside the finite floating-point range are
-        not accepted. Finite scores outside the histogram's breakpoint range map
-        to the nearest end bin.
+        Scores for the second class in ``histogram.classes``.
     histogram : `Histogram`
-        A histogram with target statistics (ie. :paramref:`Histogram.target_freqs` must
-        be non-empty). Its class order defines the output probability-column order;
-        the second class is the positive class.
+        Binary histogram with target statistics. Its class order defines the
+        output probability-column order; the second class is positive.
     only_positive : bool, default=False
         If ``True`` it returns only 1-D array with the probabilities of the positive
         class. Otherwise it returns a 2-D array with the probabilities for both classes.
@@ -1426,17 +1404,23 @@ def calibrate_binary(y_scores, histogram: Histogram, only_positive: bool = False
     Raises
     ------
     ValueError
-        Raised in the following cases:
-
-        - The histogram lacks target statistics.
-        - The histogram does not have exactly two classes.
-        - Any score is NaN, missing, infinite, or complex.
-        - Any score is nonnumeric.
-        - Any score is boolean.
-        - Any score is outside the finite floating-point range.
-        - Any score maps to an empty bin.
+        If scores violate the :ref:`input-requirements`, the histogram lacks
+        binary target statistics, or scores map to empty bins.
     TypeError
         ``only_positive`` is not a boolean.
+
+    Notes
+    -----
+    .. rubric:: Input requirements
+
+    The histogram must have target frequencies for exactly two classes.
+    Empty score arrays are accepted. See :ref:`input-requirements` for common
+    score rules.
+
+    .. rubric:: Bin lookup
+
+    Finite scores outside the histogram range map to the nearest end bin.
+    Scores mapping to empty bins are rejected.
     """
     # Check the inputs
     if not isinstance(only_positive, (bool, np.bool_)):
@@ -1473,14 +1457,11 @@ def build_reliability_diagram(
     implements a heuristic to dectect when the scores is distributed as a sum of diracs
     and changes visualization accordingly.
 
-    The figure remains open on success and is closed if construction fails after
-    the base plot has been created.
-
     Parameters
     ----------
     y_scores : array-like of shape (n_samples,) or (n_samples, 1) or (n_samples, 2)
-        Positive-class scores/probabilities. For a two-column array, column 1
-        is used; a single-column array is flattened.
+        Positive-class scores/probabilities in [0, 1]. For a two-column array,
+        column 1 is used; a single-column array is flattened.
     y : array-like of shape (n_samples,) or (n_samples, 1)
         Target values containing exactly two distinct class labels.
     dirac_threshold : float, default=1.0e-06
@@ -1507,21 +1488,25 @@ def build_reliability_diagram(
     Raises
     ------
     ValueError
-        Raised in the following cases:
-
-        - Scores and labels have different numbers of samples.
-        - Target labels do not contain exactly two distinct classes.
-        - Scores contain nonnumeric values.
-        - Scores contain NaN or missing values.
-        - Scores contain boolean values.
-        - Scores contain infinite values.
-        - Scores contain values outside the finite floating-point range.
-        - Scores are outside the range [0, 1].
-        - Labels contain NaN or missing values.
-        - Plotting thresholds are nonfinite or nonpositive.
-        - Scores, labels, or plotting thresholds contain complex values.
+        If inputs violate the :ref:`input-requirements`, scores fall outside
+        [0, 1], labels are not binary, sample counts differ, or plotting
+        thresholds are invalid.
     TypeError
         A plotting threshold is not a real number.
+
+    Notes
+    -----
+    .. rubric:: Input requirements
+
+    All score columns must contain values in [0, 1], including unused columns.
+    Labels must contain exactly two distinct classes and match the score sample
+    count. Plotting thresholds must be finite, positive real numbers, not
+    booleans. See :ref:`input-requirements` for common score and label rules.
+
+    .. rubric:: Figure lifecycle
+
+    The figure remains open on success and is closed if construction fails after
+    the base plot has been created.
     """
     # Check the input parameters
     for name, value in (
