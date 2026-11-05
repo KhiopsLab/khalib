@@ -4,6 +4,7 @@ import bisect
 import math
 import os
 import tempfile
+import threading
 import warnings
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
@@ -23,36 +24,42 @@ from sklearn.utils._response import _get_response_values
 from sklearn.utils.validation import check_is_fitted
 
 khiops_single_core_runner: KhiopsLocalRunner | None = None
+_khiops_runner_lock = threading.RLock()
 
 
 def build_single_core_khiops_runner():
     """Build a Khiops runner with one core
 
     Running with a single core is faster for most of the calibration use-cases.
+    The process core limit is restored even if runner initialization fails.
     """
-    default_max_cores = os.environ.get("KHIOPS_PROC_NUMBER")
-    os.environ["KHIOPS_PROC_NUMBER"] = "1"
-    with warnings.catch_warnings():
-        warnings.filterwarnings(action="ignore", message=".*Too few cores:.*")
-        global khiops_single_core_runner
-        khiops_single_core_runner = KhiopsLocalRunner()
-        if default_max_cores is None:
-            del os.environ["KHIOPS_PROC_NUMBER"]
-        else:
-            os.environ["KHIOPS_PROC_NUMBER"] = default_max_cores
+    with _khiops_runner_lock:
+        default_max_cores = os.environ.get("KHIOPS_PROC_NUMBER")
+        os.environ["KHIOPS_PROC_NUMBER"] = "1"
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(action="ignore", message=".*Too few cores:.*")
+                global khiops_single_core_runner
+                khiops_single_core_runner = KhiopsLocalRunner()
+        finally:
+            if default_max_cores is None:
+                del os.environ["KHIOPS_PROC_NUMBER"]
+            else:
+                os.environ["KHIOPS_PROC_NUMBER"] = default_max_cores
 
 
 @contextmanager
 def single_core_khiops_runner():
     """A context manager to run Khiops with a single core"""
-    if khiops_single_core_runner is None:
-        build_single_core_khiops_runner()
-    default_runner = kh.get_runner()
-    kh.set_runner(khiops_single_core_runner)
-    try:
-        yield
-    finally:
-        kh.set_runner(default_runner)
+    with _khiops_runner_lock:
+        if khiops_single_core_runner is None:
+            build_single_core_khiops_runner()
+        default_runner = kh.get_runner()
+        kh.set_runner(khiops_single_core_runner)
+        try:
+            yield
+        finally:
+            kh.set_runner(default_runner)
 
 
 @dataclass()

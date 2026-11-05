@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -12,6 +14,7 @@ from sklearn.svm import SVC
 from sklearn.utils.validation import check_is_fitted
 
 from khalib import Histogram, KhalibClassifier, calibrate_binary, calibration_error
+from khalib import main as khalib_main
 from khalib.main import compute_dirac_indexes
 
 
@@ -77,6 +80,83 @@ def read_histogram_from_json_data(json_data):
 
 def is_target_inverted(y_fixture):
     return y_fixture in ["float", "intnl", "str"]
+
+
+class TestSingleCoreRunner:
+    def test_context_serializes_runner_changes(self, monkeypatch):
+        default_runner = object()
+        single_core_runner = object()
+        active_runner = [default_runner]
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_attempting = threading.Event()
+        second_entered = threading.Event()
+
+        monkeypatch.setattr(
+            khalib_main, "khiops_single_core_runner", single_core_runner
+        )
+        monkeypatch.setattr(khalib_main.kh, "get_runner", lambda: active_runner[0])
+        monkeypatch.setattr(
+            khalib_main.kh,
+            "set_runner",
+            lambda runner: active_runner.__setitem__(0, runner),
+        )
+
+        def first_call():
+            with khalib_main.single_core_khiops_runner():
+                first_entered.set()
+                assert release_first.wait(timeout=5)
+
+        def second_call():
+            second_attempting.set()
+            with khalib_main.single_core_khiops_runner():
+                second_entered.set()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(first_call)
+            assert first_entered.wait(timeout=5)
+            second = executor.submit(second_call)
+            assert second_attempting.wait(timeout=5)
+            assert not second_entered.wait(timeout=0.1)
+            release_first.set()
+            first.result(timeout=5)
+            second.result(timeout=5)
+
+        assert second_entered.is_set()
+        assert active_runner[0] is default_runner
+
+    @pytest.mark.parametrize("core_limit", [None, "8"])
+    def test_initialization_failure_restores_environment(self, monkeypatch, core_limit):
+        # Preserve both an absent core limit and an explicitly configured one
+        if core_limit is None:
+            monkeypatch.delenv("KHIOPS_PROC_NUMBER", raising=False)
+        else:
+            monkeypatch.setenv("KHIOPS_PROC_NUMBER", core_limit)
+        monkeypatch.setattr(khalib_main, "khiops_single_core_runner", None)
+        error = RuntimeError("Runner initialization failed")
+
+        def failing_runner():
+            assert os.environ["KHIOPS_PROC_NUMBER"] == "1"
+            raise error
+
+        monkeypatch.setattr(khalib_main, "KhiopsLocalRunner", failing_runner)
+        with pytest.raises(RuntimeError, match="Runner initialization failed") as exc:
+            khalib_main.build_single_core_khiops_runner()
+        assert exc.value is error
+        assert os.environ.get("KHIOPS_PROC_NUMBER") == core_limit
+        assert khalib_main.khiops_single_core_runner is None
+
+    @pytest.mark.parametrize("core_limit", [None, "8"])
+    def test_initialization_restores_environment(self, monkeypatch, core_limit):
+        # Build a real runner while keeping the cached runner isolated
+        if core_limit is None:
+            monkeypatch.delenv("KHIOPS_PROC_NUMBER", raising=False)
+        else:
+            monkeypatch.setenv("KHIOPS_PROC_NUMBER", core_limit)
+        monkeypatch.setattr(khalib_main, "khiops_single_core_runner", None)
+        khalib_main.build_single_core_khiops_runner()
+        assert khalib_main.khiops_single_core_runner is not None
+        assert os.environ.get("KHIOPS_PROC_NUMBER") == core_limit
 
 
 class TestHistogram:
