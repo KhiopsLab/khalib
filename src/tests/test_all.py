@@ -469,16 +469,18 @@ class TestHistogram:
                 [], [0.0, 1.0], y=[] if supervised else None
             )
 
-    @pytest.mark.parametrize("input_type", ["list", "array", "object", "column"])
+    @pytest.mark.parametrize(
+        "convert",
+        [
+            pytest.param(list, id="list"),
+            pytest.param(np.array, id="array"),
+            pytest.param(partial(np.array, dtype=object), id="object"),
+            pytest.param(lambda scores: np.array(scores).reshape(-1, 1), id="column"),
+        ],
+    )
     @pytest.mark.parametrize("base", [2**60, 2**63])
-    def test_large_integer_scores_retain_bin_assignments(self, input_type, base):
-        scores = [base, base + 2]
-        if input_type == "array":
-            scores = np.array(scores)
-        elif input_type == "object":
-            scores = np.array(scores, dtype=object)
-        elif input_type == "column":
-            scores = np.array(scores).reshape(-1, 1)
+    def test_large_integer_scores_retain_bin_assignments(self, convert, base):
+        scores = convert([base, base + 2])
         histogram = Histogram.from_data_and_breakpoints(
             scores, [base - 1, base + 1, base + 3], [0, 1]
         )
@@ -867,10 +869,23 @@ class TestHistogram:
 
     @pytest.mark.parametrize("method", ["khiops", "eq-freq", "eq-width", "manual"])
     @pytest.mark.parametrize(
-        "input_type", ["list", "array", "series", "column", "object", "object-column"]
+        "convert",
+        [
+            pytest.param(lambda x, y: (x.tolist(), y.tolist()), id="list"),
+            pytest.param(lambda x, y: (x, y), id="array"),
+            pytest.param(lambda x, y: (pd.Series(x), pd.Series(y)), id="series"),
+            pytest.param(
+                lambda x, y: (x.reshape(-1, 1), y.reshape(-1, 1)), id="column"
+            ),
+            pytest.param(lambda x, y: (x.astype(object), y), id="object"),
+            pytest.param(
+                lambda x, y: (x.astype(object).reshape(-1, 1), y),
+                id="object-column",
+            ),
+        ],
     )
     @pytest.mark.parametrize("use_y", [False, True])
-    def test_array_like_inputs(self, method, input_type, use_y):
+    def test_array_like_inputs(self, method, convert, use_y):
         # Compare supported representations with a one-dimensional array
         x = np.array([0.1, 0.2, 0.4, 0.6, 0.8, 0.9])
         y = np.array(["a", "a", "b", "a", "b", "b"])
@@ -881,33 +896,32 @@ class TestHistogram:
             factory = Histogram.from_data
             kwargs = {"method": method}
         expected = factory(x, y=y if use_y else None, **kwargs)
-        if input_type == "list":
-            x, y = x.tolist(), y.tolist()
-        elif input_type == "series":
-            x, y = pd.Series(x), pd.Series(y)
-        elif input_type == "column":
-            x, y = x.reshape(-1, 1), y.reshape(-1, 1)
-        elif input_type == "object":
-            x = x.astype(object)
-        elif input_type == "object-column":
-            x = x.astype(object).reshape(-1, 1)
+        x, y = convert(x, y)
 
         # Check frequencies, target statistics and class labels remain unchanged
         assert factory(x, y=y if use_y else None, **kwargs) == expected
 
-    @pytest.mark.parametrize("manual", [False, True])
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            pytest.param(Histogram.from_data, id="automatic"),
+            pytest.param(
+                partial(
+                    Histogram.from_data_and_breakpoints,
+                    breakpoints=[0.0, 0.5, 1.0],
+                ),
+                id="manual",
+            ),
+        ],
+    )
     @pytest.mark.parametrize("argument", ["x", "y"])
     @pytest.mark.parametrize(
         "invalid",
         [np.array(0.5), np.empty((2, 0)), np.ones((2, 2)), np.ones((2, 1, 1))],
     )
-    def test_invalid_input_shapes(self, manual, argument, invalid):
+    def test_invalid_input_shapes(self, factory, argument, invalid):
         inputs = {"x": np.array([0.2, 0.8]), "y": np.array([0, 1])}
         inputs[argument] = invalid
-        factory = Histogram.from_data
-        if manual:
-            factory = Histogram.from_data_and_breakpoints
-            inputs["breakpoints"] = [0.0, 0.5, 1.0]
         with pytest.raises(ValueError, match=f"{argument} must be 1-D"):
             factory(**inputs)
 
