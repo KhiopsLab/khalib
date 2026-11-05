@@ -24,7 +24,7 @@ extensions = [
 # Basic Sphinx config
 default_role = "obj"
 templates_path = ["_templates"]
-exclude_patterns = []
+exclude_patterns = ["_build"]
 html_theme = "furo"
 html_static_path = ["_static"]
 html_title = f"<h6><center>{project} {release}</center></h6>"
