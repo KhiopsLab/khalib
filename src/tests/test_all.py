@@ -273,6 +273,26 @@ class TestHistogram:
                 [], [0.0, 1.0], y=[] if supervised else None
             )
 
+    @pytest.mark.parametrize("input_type", ["list", "array", "object", "column"])
+    @pytest.mark.parametrize("base", [2**60, 2**63])
+    def test_large_integer_scores_retain_bin_assignments(self, input_type, base):
+        scores = [base, base + 2]
+        if input_type == "array":
+            scores = np.array(scores)
+        elif input_type == "object":
+            scores = np.array(scores, dtype=object)
+        elif input_type == "column":
+            scores = np.array(scores).reshape(-1, 1)
+        histogram = Histogram.from_data_and_breakpoints(
+            scores, [base - 1, base + 1, base + 3], [0, 1]
+        )
+        assert histogram.freqs == [1, 1]
+        assert histogram.target_freqs == [(1, 0), (0, 1)]
+        np.testing.assert_array_equal(histogram.vfind(scores).reshape(-1), [0, 1])
+        np.testing.assert_array_equal(
+            calibrate_binary(scores, histogram), [[1.0, 0.0], [0.0, 1.0]]
+        )
+
     def test_mixed_signed_unsigned_integer_lookup(self):
         base = 2**63
         scores = [np.int64(-1), np.uint64(base), np.uint64(base + 2)]
@@ -1176,6 +1196,114 @@ class TestKhalibClassifier:
                 y_scores_calib_test, y_test, multi_class_method="top-label"
             )
             assert ece == pytest.approx(expected_ece, rel=1e-2)
+
+
+class TestCalibrateBinary:
+    @pytest.mark.parametrize("only_positive", ["yes", 1, None])
+    def test_rejects_nonboolean_only_positive(self, only_positive):
+        histogram = Histogram(
+            breakpoints=[0.0, 1.0], freqs=[2], target_freqs=[(1, 1)], classes=[0, 1]
+        )
+        with pytest.raises(TypeError, match="'only_positive' must be a boolean"):
+            calibrate_binary([0.1, 0.9], histogram, only_positive=only_positive)
+
+    @pytest.mark.parametrize("only_positive", [False, True])
+    @pytest.mark.parametrize("scores", [[], np.empty((0, 1))])
+    def test_empty_scores_return_empty_probabilities(self, only_positive, scores):
+        histogram = Histogram(
+            breakpoints=[0.0, 1.0], freqs=[2], target_freqs=[(1, 1)], classes=[0, 1]
+        )
+        probabilities = calibrate_binary(scores, histogram, only_positive=only_positive)
+        assert probabilities.shape == ((0,) if only_positive else (0, 2))
+
+    @pytest.mark.parametrize("only_positive", [False, True])
+    @pytest.mark.parametrize("classes", [[], [0, 1]])
+    def test_rejects_missing_target_statistics(self, only_positive, classes):
+        histogram = Histogram(breakpoints=[0.0, 1.0], freqs=[2], classes=classes)
+        with pytest.raises(ValueError, match="'histogram' must have target statistics"):
+            calibrate_binary([0.5], histogram, only_positive=only_positive)
+
+    @pytest.mark.parametrize("only_positive", [False, True])
+    @pytest.mark.parametrize("scores", [[np.nan], [0.1, np.nan, 0.9], [[np.nan]]])
+    @pytest.mark.parametrize("dtype", [float, object])
+    def test_rejects_nan_scores(self, only_positive, scores, dtype):
+        scores = np.array(scores, dtype=dtype)
+        histogram = Histogram.from_data_and_breakpoints(
+            [0.1, 0.9], [0.0, 0.5, 1.0], [0, 1]
+        )
+        with pytest.raises(ValueError, match="'y_scores' must not contain NaN"):
+            calibrate_binary(scores, histogram, only_positive=only_positive)
+
+    @pytest.mark.parametrize("value", [-np.inf, np.inf])
+    @pytest.mark.parametrize("dtype", [float, object])
+    def test_rejects_infinite_scores(self, value, dtype):
+        histogram = Histogram.from_data_and_breakpoints(
+            [0.1, 0.9], [0.0, 0.5, 1.0], [0, 1]
+        )
+        scores = np.array([0.1, value], dtype=dtype)
+        with pytest.raises(ValueError, match="'values' must not contain infinite"):
+            calibrate_binary(scores, histogram)
+
+    @pytest.mark.parametrize("only_positive", [False, True])
+    @pytest.mark.parametrize("as_column", [False, True])
+    def test_rejects_scores_in_empty_bins(self, only_positive, as_column):
+        # Mix populated bins with two empty bins, including repeated hits
+        histogram = Histogram.from_data_and_breakpoints(
+            [0.1, 0.9], [0.0, 0.2, 0.4, 0.6, 1.0], [0, 1]
+        )
+        scores = np.array([0.1, 0.3, 0.5, 0.3, 0.9])
+        if as_column:
+            scores = scores[:, np.newaxis]
+        with pytest.raises(
+            ValueError,
+            match=r"sample indices \[1, 2, 3\], bin indices \[1, 2, 1\]",
+        ):
+            calibrate_binary(scores, histogram, only_positive=only_positive)
+
+    @pytest.mark.parametrize("only_positive", [False, True])
+    @pytest.mark.parametrize("dtype", [float, object])
+    def test_unused_empty_bins_allow_calibration(self, only_positive, dtype):
+        # Empty bins are harmless when no input score maps to them
+        histogram = Histogram.from_data_and_breakpoints(
+            [0.1, 0.9], [0.0, 0.2, 0.4, 0.6, 1.0], [0, 1]
+        )
+        scores = np.array([-0.5, -0.1, 0.2, 0.9, 1.1, 1.5], dtype=dtype)
+        expected = (
+            [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+            if only_positive
+            else [[1.0, 0.0]] * 3 + [[0.0, 1.0]] * 3
+        )
+        np.testing.assert_array_equal(
+            calibrate_binary(scores, histogram, only_positive=only_positive), expected
+        )
+
+    @pytest.mark.parametrize("only_positive", [False, True])
+    @pytest.mark.parametrize("as_list", [False, True])
+    @pytest.mark.parametrize("dtype", [float, object])
+    def test_vector_inputs(self, only_positive, as_list, dtype):
+        # Compare lists and single-column inputs with vector calibration
+        scores = np.array([0.1, 0.9])
+        histogram = Histogram(
+            breakpoints=[0.0, 0.5, 1.0],
+            freqs=[1, 1],
+            target_freqs=[(1, 0), (0, 1)],
+            classes=[0, 1],
+        )
+        expected = calibrate_binary(scores, histogram, only_positive=only_positive)
+        scores = scores.astype(dtype)
+        scores = scores.tolist() if as_list else scores[:, np.newaxis]
+        np.testing.assert_array_equal(
+            calibrate_binary(scores, histogram, only_positive=only_positive),
+            expected,
+        )
+
+    @pytest.mark.parametrize("scores", [np.array(0.5), np.ones((2, 2))])
+    def test_invalid_score_shapes(self, scores):
+        histogram = Histogram(
+            breakpoints=[0.0, 1.0], freqs=[2], target_freqs=[(1, 1)], classes=[0, 1]
+        )
+        with pytest.raises(ValueError, match="y_scores must be 1-D"):
+            calibrate_binary(scores, histogram)
 
 
 class TestDiracHeuristic:

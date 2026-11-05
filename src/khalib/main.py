@@ -1128,33 +1128,58 @@ def calibrate_binary(y_scores, histogram: Histogram, only_positive: bool = False
     Parameters
     ----------
     y_scores : array-like of shape (n_samples,) or (n_samples, 1)
-        Scores for the positive class.
+        Scores for the second class in ``histogram.classes``. NaN, missing,
+        infinite, complex, and values outside the finite floating-point range are
+        not accepted. Finite scores outside the histogram's breakpoint range map
+        to the nearest end bin.
     histogram : `Histogram`
         A histogram with target statistics (ie. :paramref:`Histogram.target_freqs` must
-        be non-empty).
+        be non-empty). Its class order defines the output probability-column order;
+        the second class is the positive class.
     only_positive : bool, default=False
         If ``True`` it returns only 1-D array with the probabilities of the positive
         class. Otherwise it returns a 2-D array with the probabilities for both classes.
+
+    Raises
+    ------
+    ValueError
+        Raised in the following cases:
+
+        - The histogram lacks target statistics.
+        - The histogram does not have exactly two classes.
+        - Any score is NaN, missing, infinite, or complex.
+        - Any score is nonnumeric.
+        - Any score is boolean.
+        - Any score is outside the finite floating-point range.
+        - Any score maps to an empty bin.
+    TypeError
+        ``only_positive`` is not a boolean.
     """
     # Check the inputs
-    if not histogram.classes:
+    if not isinstance(only_positive, (bool, np.bool_)):
+        raise TypeError("'only_positive' must be a boolean.")
+    y_scores = _as_1d_array(_as_score_array(y_scores, "y_scores"), "y_scores")
+    if not histogram.classes or not histogram.target_freqs:
         raise ValueError("'histogram' must have target statistics.")
     if (n_classes := len(histogram.classes)) != 2:
         raise ValueError(f"'histogram' must have only 2 classes (it has {n_classes})")
 
-    # Map the scores to their corresponding bin target probability
+    # Reject scores without calibration observations in their bins
     y_scores_bin_indexes = histogram.vfind(y_scores)
-    it = np.nditer(y_scores_bin_indexes, flags=["f_index"])
-    if only_positive:
-        calibrated_probas = np.empty(y_scores.shape[0])
-        for bin_i in it:
-            calibrated_probas[it.index] = histogram.target_probas[bin_i][1]
-    else:
-        calibrated_probas = np.empty((y_scores.shape[0], 2))
-        for bin_i in it:
-            calibrated_probas[it.index][0] = histogram.target_probas[bin_i][0]
-            calibrated_probas[it.index][1] = histogram.target_probas[bin_i][1]
+    empty_bin_samples = np.flatnonzero(
+        np.asarray(histogram.freqs)[y_scores_bin_indexes] == 0
+    )
+    if empty_bin_samples.size:
+        raise ValueError(
+            "Cannot calibrate scores in empty histogram bins: "
+            f"sample indices {empty_bin_samples.tolist()}, "
+            f"bin indices {y_scores_bin_indexes[empty_bin_samples].tolist()}."
+        )
 
+    # Map each score to its bin target probabilities
+    calibrated_probas = np.asarray(histogram.target_probas)[y_scores_bin_indexes]
+    if only_positive:
+        return calibrated_probas[:, 1]
     return calibrated_probas
 
 
