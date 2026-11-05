@@ -30,6 +30,97 @@ from khalib import main as khalib_main
 from khalib.main import compute_dirac_indexes
 
 
+@pytest.mark.parametrize(
+    "scores",
+    [
+        [0.1 + 100j, 0.9 - 100j],
+        np.array([0.1 + 100j, 0.9 - 100j]),
+        np.array([0.1 + 100j, 0.9 - 100j], dtype=object),
+        np.array([0.1 + 0j, 0.9 + 0j]),
+        np.array([[0.1 + 100j], [0.9 - 100j]]),
+    ],
+)
+@pytest.mark.parametrize(
+    "api", ["histogram", "manual", "calibrate", "ece", "diagram", "vfind"]
+)
+def test_score_apis_reject_complex_values(scores, api):
+    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
+    function, args = {
+        "histogram": (Histogram.from_data, ([0, 1],)),
+        "manual": (Histogram.from_data_and_breakpoints, ([0.0, 1.0], [0, 1])),
+        "calibrate": (calibrate_binary, (histogram,)),
+        "ece": (calibration_error, ([0, 1],)),
+        "diagram": (build_reliability_diagram, ([0, 1],)),
+        "vfind": (histogram.vfind, ()),
+    }[api]
+    with pytest.raises(ValueError, match="must contain only real values"):
+        function(scores, *args)
+
+
+@pytest.mark.parametrize(
+    "scores",
+    [[True, False], np.array([True, False]), np.array([0.1, True], dtype=object)],
+)
+@pytest.mark.parametrize(
+    "api", ["histogram", "manual", "calibrate", "ece", "diagram", "vfind"]
+)
+def test_score_apis_reject_boolean_values(scores, api):
+    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
+    function, args = {
+        "histogram": (Histogram.from_data, ([0, 1],)),
+        "manual": (Histogram.from_data_and_breakpoints, ([0.0, 1.0], [0, 1])),
+        "calibrate": (calibrate_binary, (histogram,)),
+        "ece": (calibration_error, ([0, 1],)),
+        "diagram": (build_reliability_diagram, ([0, 1],)),
+        "vfind": (histogram.vfind, ()),
+    }[api]
+    with pytest.raises(ValueError, match="must not contain boolean values"):
+        function(scores, *args)
+
+
+@pytest.mark.parametrize(
+    "scores",
+    [
+        ["0.1", "0.9"],
+        np.array(["0.1", "0.9"]),
+        np.array([0.1, "0.9"], dtype=object),
+    ],
+)
+@pytest.mark.parametrize(
+    "api", ["histogram", "manual", "calibrate", "ece", "diagram", "vfind"]
+)
+def test_score_apis_reject_numeric_strings(scores, api):
+    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
+    function, args = {
+        "histogram": (Histogram.from_data, ([0, 1],)),
+        "manual": (Histogram.from_data_and_breakpoints, ([0.0, 1.0], [0, 1])),
+        "calibrate": (calibrate_binary, (histogram,)),
+        "ece": (calibration_error, ([0, 1],)),
+        "diagram": (build_reliability_diagram, ([0, 1],)),
+        "vfind": (histogram.vfind, ()),
+    }[api]
+    with pytest.raises(ValueError, match="must contain only numeric values"):
+        function(scores, *args)
+
+
+@pytest.mark.parametrize(
+    "api", ["histogram", "manual", "calibrate", "ece", "diagram", "vfind"]
+)
+def test_score_apis_reject_missing_values(api):
+    scores = np.array([0.1, pd.NA], dtype=object)
+    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
+    function, args = {
+        "histogram": (Histogram.from_data, ([0, 1],)),
+        "manual": (Histogram.from_data_and_breakpoints, ([0.0, 1.0], [0, 1])),
+        "calibrate": (calibrate_binary, (histogram,)),
+        "ece": (calibration_error, ([0, 1],)),
+        "diagram": (build_reliability_diagram, ([0, 1],)),
+        "vfind": (histogram.vfind, ()),
+    }[api]
+    with pytest.raises(ValueError, match="must not contain NaN or missing values"):
+        function(scores, *args)
+
+
 @pytest.mark.parametrize("dtype", [complex, np.complex64, np.complex128])
 @pytest.mark.parametrize("imaginary", [0, 1])
 @pytest.mark.parametrize("as_object", [False, True])
@@ -52,6 +143,27 @@ def test_histogram_rejects_complex_fields(dtype, imaginary, as_object, field):
 def test_manual_histogram_rejects_complex_breakpoints(breakpoints):
     with pytest.raises(ValueError, match="'breakpoints' must contain only real values"):
         Histogram.from_data_and_breakpoints([0.1, 0.9], breakpoints)
+
+
+@pytest.mark.parametrize(
+    "matrix_type", [coo_matrix, csr_matrix, dok_matrix, lil_matrix]
+)
+@pytest.mark.parametrize(
+    "api", ["histogram", "manual", "calibrate", "ece", "diagram", "vfind"]
+)
+def test_sparse_scores_are_rejected(matrix_type, api):
+    scores = matrix_type(np.array([[0.1], [0.9]]))
+    histogram = Histogram([0.0, 0.5, 1.0], [1, 1], [(1, 0), (0, 1)], [0, 1])
+    function, args = {
+        "histogram": (Histogram.from_data, ([0, 1],)),
+        "manual": (Histogram.from_data_and_breakpoints, ([0.0, 1.0], [0, 1])),
+        "calibrate": (calibrate_binary, (histogram,)),
+        "ece": (calibration_error, ([0, 1],)),
+        "diagram": (build_reliability_diagram, ([0, 1],)),
+        "vfind": (histogram.vfind, ()),
+    }[api]
+    with pytest.raises(ValueError, match="must not be a sparse matrix"):
+        function(scores, *args)
 
 
 @pytest.mark.parametrize(
@@ -81,6 +193,40 @@ def test_sparse_histogram_fields_are_rejected():
         histogram.find(csr_matrix([[0.5]]))
 
 
+@pytest.mark.parametrize(
+    "function",
+    [Histogram.from_data, calibration_error, build_reliability_diagram],
+)
+@pytest.mark.parametrize("labels", [[0j, 1], np.array([0, 1j], dtype=object)])
+def test_score_apis_reject_complex_labels(function, labels):
+    with pytest.raises(ValueError, match="'y' must contain only real values"):
+        function([0.1, 0.9], labels)
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        [0, np.nan],
+        np.array(["class", np.nan], dtype=object),
+        np.array(["class", pd.NA], dtype=object),
+    ],
+)
+def test_histogram_and_score_apis_reject_missing_labels(labels):
+    with pytest.raises(ValueError, match="'y' must not contain NaN or missing values"):
+        Histogram.from_data([0.1, 0.9], labels)
+    with pytest.raises(ValueError, match="'y' must not contain NaN or missing values"):
+        Histogram.from_data([0.1, 0.9], labels, method="eq-width")
+    with pytest.raises(ValueError, match="'y' must not contain NaN or missing values"):
+        Histogram.from_data_and_breakpoints([0.1, 0.9], [0.0, 1.0], labels)
+    for method in ("eq-width", "eq-freq"):
+        with pytest.raises(
+            ValueError, match="'y' must not contain NaN or missing values"
+        ):
+            calibration_error([0.1, 0.9], labels, histogram_method=method)
+    with pytest.raises(ValueError, match="'y' must not contain NaN or missing values"):
+        build_reliability_diagram([0.1, 0.9], labels)
+
+
 @pytest.mark.parametrize("missing", [np.nan, pd.NA])
 def test_histogram_rejects_missing_classes(missing):
     with pytest.raises(
@@ -92,6 +238,24 @@ def test_histogram_rejects_missing_classes(missing):
             target_freqs=[(1, 1)],
             classes=[0, missing],
         )
+
+
+@pytest.mark.parametrize(
+    ("function", "parameter"),
+    [
+        (Histogram.from_data, "max_bins"),
+        (calibration_error, "max_bins"),
+        (build_reliability_diagram, "dirac_threshold"),
+        (build_reliability_diagram, "log_plot_threshold"),
+        (build_reliability_diagram, "min_density_bar_width"),
+    ],
+)
+@pytest.mark.parametrize("value", [1 + 0j, np.complex128(1 + 2j)])
+def test_score_apis_reject_complex_options(function, parameter, value):
+    with pytest.raises(
+        ValueError, match=rf"'{parameter}' must contain only real values"
+    ):
+        function([0.1, 0.9], [0, 1], **{parameter: value})
 
 
 @pytest.mark.parametrize(
@@ -576,6 +740,22 @@ class TestHistogram:
             Histogram.from_data_and_breakpoints(
                 [base, base + 1], [base, base + 1], [0, 1]
             )
+
+    @pytest.mark.parametrize("scores", [[10**400, 10**400 + 1], [10**400, 0.5]])
+    def test_rejects_scores_outside_finite_float_range(self, scores):
+        histogram = Histogram([0.0, 1.0], [2], target_freqs=[(1, 1)], classes=[0, 1])
+        with pytest.raises(ValueError, match="within the finite floating-point range"):
+            Histogram.from_data(scores, method="eq-width")
+        with pytest.raises(ValueError, match="within the finite floating-point range"):
+            Histogram.from_data_and_breakpoints(scores, [0.0, 1.0])
+        with pytest.raises(ValueError, match="within the finite floating-point range"):
+            histogram.vfind(scores)
+        with pytest.raises(ValueError, match="within the finite floating-point range"):
+            calibration_error(scores, [0, 1], histogram=histogram)
+        with pytest.raises(ValueError, match="within the finite floating-point range"):
+            calibrate_binary(scores, histogram)
+        with pytest.raises(ValueError, match="within the finite floating-point range"):
+            build_reliability_diagram(scores, [0, 1])
 
     def test_density_for_arbitrary_precision_integer_width(self):
         endpoint = 2**1024
