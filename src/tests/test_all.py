@@ -1287,6 +1287,64 @@ def fixture_distorted_scores():
 
 
 class TestECE:
+    @pytest.mark.parametrize(
+        ("method", "norm_ord", "expected"),
+        [
+            ("label-bin", 1, 0.2),
+            ("label-bin", 2, np.sqrt(0.14 / 3)),
+            ("label-bin", np.inf, 0.3),
+            ("bin", 1, 0.2),
+            ("bin", 2, np.sqrt(0.2) / 3),
+            ("bin", np.inf, 0.4 / 3),
+        ],
+    )
+    def test_calibration_error_supports_norm_orders(self, method, norm_ord, expected):
+        histogram = Histogram([0.0, 0.5, 1.0], [2, 1], [(1, 1), (0, 1)], [0, 1])
+        assert calibration_error(
+            [0.2, 0.4, 0.8],
+            [0, 1, 1],
+            method=method,
+            histogram=histogram,
+            norm_ord=norm_ord,
+        ) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("value", [0, 0.5, -1, -np.inf, np.nan])
+    def test_calibration_error_rejects_norm_orders_below_one(self, value):
+        with pytest.raises(ValueError, match="'norm_ord' must be at least 1"):
+            calibration_error([0.1, 0.9], [0, 1], norm_ord=value)
+
+    @pytest.mark.parametrize("value", [True, "2", [2]])
+    def test_calibration_error_rejects_nonnumeric_norm_orders(self, value):
+        with pytest.raises(TypeError, match="'norm_ord' must be a real number"):
+            calibration_error([0.1, 0.9], [0, 1], norm_ord=value)
+
+    def test_calibration_error_rejects_complex_norm_order(self):
+        with pytest.raises(ValueError, match="only real values"):
+            calibration_error([0.1, 0.9], [0, 1], norm_ord=1j)
+
+    @pytest.mark.parametrize("multi_class_method", ["top-label", "classwise"])
+    def test_multiclass_calibration_error_uses_norm_order(self, multi_class_method):
+        scores = [[0.8, 0.1, 0.1], [0.2, 0.7, 0.1], [0.4, 0.3, 0.3]]
+        labels = [0, 2, 1]
+        histogram = Histogram([0.0, 1.0], [3])
+
+        ece_l1 = calibration_error(
+            scores,
+            labels,
+            multi_class_method=multi_class_method,
+            histogram=histogram,
+            norm_ord=1,
+        )
+        ece_l2 = calibration_error(
+            scores,
+            labels,
+            multi_class_method=multi_class_method,
+            histogram=histogram,
+            norm_ord=2,
+        )
+
+        assert ece_l1 != pytest.approx(ece_l2)
+
     @pytest.mark.parametrize("multi_class_method", ["top-label", "classwise"])
     @pytest.mark.parametrize("supply_histogram", [False, True])
     def test_rejects_reused_statistics_for_multiclass_scores(

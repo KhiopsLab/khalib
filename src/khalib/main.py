@@ -809,6 +809,7 @@ def calibration_error(
     multi_class_method: str = "top-label",
     histogram: Histogram | None = None,
     reuse_stats: bool = False,
+    norm_ord: float | int = 1.0,
 ):
     r"""Estimates the ECE via binning
 
@@ -828,6 +829,9 @@ def calibration_error(
         Target values (class labels).
     method : {"label-bin", "bin"}, default="label-bin"
         ECE estimation method. See below for details.
+    norm_ord : float or int, default=1.0
+        Order of the L-norm used to estimate the error. Must be at least 1; use
+        ``np.inf`` for the L-infinity norm.
     multi_class_method : {"top-label", "classwise"}, default="top-label"
         Multi-class ECE estimation method:
 
@@ -892,14 +896,19 @@ def calibration_error(
     .. rubric:: Mathematical definition
 
     We present the formulas for the two binary ECE estimators used in this function, as
-    described in [RCSM22]_. Both approximate the theoretical calibration error:
+    described in [RCSM22]_. For a norm order :math:`p \geq 1`, both approximate the
+    theoretical calibration error:
 
     .. math::
-        \mathbb{E}\left[ \left| \mathbb{P}\left[ Y = 1 | S \right] - S  \right| \right]
+        \left(\mathbb{E}\left[
+        \left| \mathbb{P}\left[ Y = 1 | S \right] - S \right|^p
+        \right]\right)^{1/p}
 
     where the pair :math:`(S, Y)` is a random vector taking values in :math:`[0, 1]
     \times \lbrace{0, 1\rbrace}`. The random variable :math:`S` represent the
-    (normalized) scores coming from a classifier, and :math:`Y` the target.
+    (normalized) scores coming from a classifier, and :math:`Y` the target. For
+    :math:`p = \infty`, the calibration error is the essential supremum of the
+    absolute difference.
 
     Let
     :math:`\lbrace {B_i} \rbrace _{i=I}^I` a binning of :math:`[0,1]` and :math:`\lbrace
@@ -909,11 +918,12 @@ def calibration_error(
     The **label-bin** ECE estimation is given by:
 
     .. math::
-        \text{ECE}_{\text{lb}} = \frac{1}{N} \sum_{n=1}^N \sum_{i = 1}^I
-           \mathbb{1}_{s_n \in B_i} \left| s_n - \bar{y_i} \right|
+        \text{ECE}_{\text{lb},p} =
+        \left(\frac{1}{N} \sum_{n=1}^N
+        \left| s_n - \bar{y}_{b(n)} \right|^p \right)^{1/p}
 
     where :math:`\bar{y_i}` is the sample conditional expectation of :math:`Y` in the
-    :math:`i`-th bin:
+    :math:`i`-th bin and :math:`b(n)` is the bin containing :math:`s_n`:
 
     .. math::
         \frac{\sum_{n=1}^N \mathbb{1}_{s_n \in B_i} \cdot y_n}{|B_i|}.
@@ -921,8 +931,10 @@ def calibration_error(
     On the other hand, the **bin** ECE estimation is given by:
 
     .. math::
-        \text{ECE}_{\text{bin}} = \sum_{i = 1}^I
-           \frac{\left| B_i \right| }{N} \left| \bar{s_i} - \bar{y_i} \right|
+        \text{ECE}_{\text{bin},p} =
+        \frac{1}{N} \left(\sum_{i = 1}^I
+        \left| \sum_{n:s_n \in B_i} s_n -
+        \sum_{n:s_n \in B_i} y_n \right|^p \right)^{1/p}
 
     where :math:`\bar{y_i}` is as above, and :math:`\bar{s_i}` is the sample
     conditional expectation of :math:`S` in the :math:`i`-th bin:
@@ -933,6 +945,9 @@ def calibration_error(
 
     The **bin** estimator is a lower bound for the real ECE for any binning used. And,
     for a given binning, it is a lower bound of the **label-bin** estimator.
+
+    For :math:`p = \infty`, the sums-and-roots in these formulas are replaced by the
+    maximum absolute discrepancy (with the same normalization).
 
     The **bin** estimator is the most common literature, usually called the *plugin*
     estimator, or even shown as the defitinion ECE. Despite this fact, we choose the
@@ -954,6 +969,19 @@ def calibration_error(
             "'multi_class_method' must be 'top-label' or 'classwise'. "
             f"Got {multi_class_method!r}."
         )
+    _check_real_values(norm_ord, "norm_ord")
+    if isinstance(norm_ord, (bool, np.bool_)) or not isinstance(
+        norm_ord, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError("'norm_ord' must be a real number.")
+    try:
+        norm_ord = float(norm_ord)
+    except OverflowError as error:
+        raise ValueError(
+            "'norm_ord' must be at least 1 or positive infinity."
+        ) from error
+    if math.isnan(norm_ord) or norm_ord < 1:
+        raise ValueError("'norm_ord' must be at least 1 or positive infinity.")
 
     # Normalize labels while preserving binary and multiclass score matrices
     y = _as_1d_array(y, "y")
@@ -986,6 +1014,7 @@ def calibration_error(
             max_bins=max_bins,
             histogram=histogram,
             reuse_stats=reuse_stats,
+            norm_ord=norm_ord,
         )
     # 2-D array with > 2 columns: Multi-class ECE
     else:
@@ -1012,6 +1041,7 @@ def calibration_error(
                 max_bins=max_bins,
                 histogram=histogram,
                 reuse_stats=reuse_stats,
+                norm_ord=norm_ord,
             )
         else:
             assert multi_class_method == "classwise"
@@ -1032,6 +1062,7 @@ def calibration_error(
                         max_bins=max_bins,
                         histogram=histogram,
                         reuse_stats=reuse_stats,
+                        norm_ord=norm_ord,
                     )
                 )
             class_probas = np.unique(y, return_counts=True)[1] / len(y)
@@ -1046,6 +1077,7 @@ def _binary_ece(
     max_bins: int = 0,
     histogram: Histogram | None = None,
     reuse_stats: bool = False,
+    norm_ord: float = 1.0,
 ):
     """Estimates the ECE for a 2-class problem
 
@@ -1098,23 +1130,29 @@ def _binary_ece(
 
     # Estimate the ECE with the histogram
     if method == "label-bin":
-        sum_diffs = 0
+        diffs = []
         for y_score, i in zip(y_scores, bin_indexes, strict=True):
-            sum_diffs += math.fabs(
-                y_score - histogram.target_freqs[i][1] / histogram.freqs[i]
+            diffs.append(
+                math.fabs(y_score - histogram.target_freqs[i][1] / histogram.freqs[i])
             )
-        return sum_diffs / len(y)
+        return float(
+            np.linalg.norm(diffs, ord=norm_ord) / math.pow(len(y), 1 / norm_ord)
+        )
     else:
         assert method == "bin"
         sum_score_by_bin = [0 for _ in histogram.bins]
         for y_score, i in zip(y_scores, bin_indexes, strict=True):
             sum_score_by_bin[i] += y_score
-        return sum(
-            [
-                math.fabs(sum_score_by_bin[i] - histogram.target_freqs[i][1])
-                for i in range(histogram.n_bins)
-            ]
-        ) / len(y)
+        return float(
+            np.linalg.norm(
+                [
+                    math.fabs(sum_score_by_bin[i] - histogram.target_freqs[i][1])
+                    / len(y)
+                    for i in range(histogram.n_bins)
+                ],
+                ord=norm_ord,
+            )
+        )
 
 
 class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
