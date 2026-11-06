@@ -8,14 +8,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-# Required permissions to deploy in GH pages
-permissions:
-  id-token: write
-  pages: write
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - name: Setup uv
@@ -37,6 +34,10 @@ jobs:
     if: github.ref_type == 'tag'
     needs: [build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pages: write
     steps:
       - name: Setup Github Pages
         uses: actions/configure-pages@v6
