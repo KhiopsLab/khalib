@@ -2,6 +2,7 @@ import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from functools import cache, partial
 
 import numpy as np
@@ -368,6 +369,72 @@ def is_target_inverted(y_fixture):
 
 
 class TestSingleCoreRunner:
+    @pytest.mark.parametrize(
+        ("platform", "original_btl", "expected_btl"),
+        [
+            ("linux", None, "self,tcp"),
+            ("linux", "self,vader", "self,tcp"),
+            ("darwin", None, None),
+            ("darwin", "self,vader", "self,vader"),
+            ("win32", None, None),
+            ("win32", "self,vader", "self,vader"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("error", "expectation"),
+        [
+            pytest.param(None, nullcontext(), id="success"),
+            pytest.param(
+                RuntimeError("Execution failed"),
+                pytest.raises(RuntimeError, match="Execution failed"),
+                id="failure",
+            ),
+        ],
+    )
+    def test_context_restores_mpi_environment(
+        self, monkeypatch, platform, original_btl, expected_btl, error, expectation
+    ):
+        monkeypatch.setattr(khalib_main.sys, "platform", platform)
+        if original_btl is None:
+            monkeypatch.delenv("OMPI_MCA_btl", raising=False)
+        else:
+            monkeypatch.setenv("OMPI_MCA_btl", original_btl)
+        runner = object()
+        monkeypatch.setattr(khalib_main, "khiops_single_core_runner", runner)
+        monkeypatch.setattr(khalib_main.kh, "get_runner", lambda: runner)
+        monkeypatch.setattr(khalib_main.kh, "set_runner", lambda runner: None)
+        with expectation, khalib_main.single_core_khiops_runner():
+            assert os.environ.get(khalib_main._OMPI_BTL_ENV) == expected_btl
+            with khalib_main.single_core_khiops_runner():
+                assert os.environ.get(khalib_main._OMPI_BTL_ENV) == expected_btl
+            assert os.environ.get(khalib_main._OMPI_BTL_ENV) == expected_btl
+            if error is not None:
+                raise error
+        assert os.environ.get(khalib_main._OMPI_BTL_ENV) == original_btl
+
+    @pytest.mark.parametrize("original_btl", [None, "self,vader"])
+    def test_context_initialization_failure_restores_mpi_environment(
+        self, monkeypatch, original_btl
+    ):
+        monkeypatch.setattr(khalib_main.sys, "platform", "linux")
+        if original_btl is None:
+            monkeypatch.delenv("OMPI_MCA_btl", raising=False)
+        else:
+            monkeypatch.setenv("OMPI_MCA_btl", original_btl)
+        monkeypatch.setattr(khalib_main, "khiops_single_core_runner", None)
+
+        def failing_runner():
+            assert os.environ[khalib_main._OMPI_BTL_ENV] == "self,tcp"
+            raise RuntimeError("Runner initialization failed")
+
+        monkeypatch.setattr(khalib_main, "KhiopsLocalRunner", failing_runner)
+        with (
+            pytest.raises(RuntimeError, match="Runner initialization failed"),
+            khalib_main.single_core_khiops_runner(),
+        ):
+            pytest.fail("Runner initialization should fail before entering")
+        assert os.environ.get(khalib_main._OMPI_BTL_ENV) == original_btl
+
     def test_context_serializes_runner_changes(self, monkeypatch):
         default_runner = object()
         single_core_runner = object()

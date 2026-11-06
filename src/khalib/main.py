@@ -30,6 +30,7 @@ from sklearn.utils.validation import check_consistent_length, check_is_fitted
 
 khiops_single_core_runner: KhiopsLocalRunner | None = None
 _khiops_runner_lock = threading.RLock()
+_OMPI_BTL_ENV = "OMPI_MCA_btl"
 
 
 def build_single_core_khiops_runner():
@@ -55,16 +56,27 @@ def build_single_core_khiops_runner():
 
 @contextmanager
 def single_core_khiops_runner():
-    """A context manager to run Khiops with a single core"""
+    """Run Khiops with one core, avoiding Open MPI shared-memory leaks on Linux."""
     with _khiops_runner_lock:
-        if khiops_single_core_runner is None:
-            build_single_core_khiops_runner()
-        default_runner = kh.get_runner()
-        kh.set_runner(khiops_single_core_runner)
+        # Work around KhiopsML/khiops#1173 for single-process Open MPI execution.
+        default_btl = os.environ.get(_OMPI_BTL_ENV)
+        if sys.platform == "linux":
+            os.environ[_OMPI_BTL_ENV] = "self,tcp"
         try:
-            yield
+            if khiops_single_core_runner is None:
+                build_single_core_khiops_runner()
+            default_runner = kh.get_runner()
+            kh.set_runner(khiops_single_core_runner)
+            try:
+                yield
+            finally:
+                kh.set_runner(default_runner)
         finally:
-            kh.set_runner(default_runner)
+            if sys.platform == "linux":
+                if default_btl is None:
+                    del os.environ[_OMPI_BTL_ENV]
+                else:
+                    os.environ[_OMPI_BTL_ENV] = default_btl
 
 
 def _check_real_values(values, name):
