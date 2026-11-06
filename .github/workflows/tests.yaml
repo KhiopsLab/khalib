@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
     - 'src/**'
+    - justfile
     - pyproject.toml
     - uv.lock
     - .github/workflows/tests.yaml
