@@ -45,6 +45,18 @@ autodoc_default_options = {
 }
 
 
+def format_inherited_score_docstring(app, what, name, obj, options, lines):
+    """Render upstream parameter mentions as literals, not object references."""
+    if name == "khalib.KhalibClassifier.score":
+        lines[:] = [
+            line.replace("`X`", "``X``").replace("`y`", "``y``") for line in lines
+        ]
+
+
+def setup(app):
+    app.connect("autodoc-process-docstring", format_inherited_score_docstring)
+
+
 ## myst_nb
 nb_execution_allow_errors = False  # Enable this to debug notebooks
 nb_execution_show_tb: True
