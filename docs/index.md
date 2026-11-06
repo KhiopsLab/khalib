@@ -30,6 +30,7 @@ See the [Quickstart](quickstart) and [API reference](api) to learn how to use th
 Home <self>
 Quickstart <quickstart>
 API Reference <api>
+Input requirements <input_requirements>
 ```
 
 ```{toctree}

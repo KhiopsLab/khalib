@@ -3,9 +3,12 @@
 import bisect
 import math
 import os
+import sys
 import tempfile
+import threading
 import warnings
 from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -15,44 +18,229 @@ from khiops.core.internals.runner import KhiopsLocalRunner
 from khiops.sklearn import KhiopsClassifier
 from matplotlib import pyplot as plt
 from matplotlib.ticker import LogLocator
-from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin
+from scipy.sparse import issparse
+from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin, clone
 from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection._search import BaseSearchCV
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, label_binarize
 from sklearn.utils._response import _get_response_values
-from sklearn.utils.validation import check_is_fitted
+from sklearn.utils.validation import check_consistent_length, check_is_fitted
 
 khiops_single_core_runner: KhiopsLocalRunner | None = None
+_khiops_runner_lock = threading.RLock()
+_OMPI_BTL_ENV = "OMPI_MCA_btl"
 
 
 def build_single_core_khiops_runner():
     """Build a Khiops runner with one core
 
     Running with a single core is faster for most of the calibration use-cases.
+    The process core limit is restored even if runner initialization fails.
     """
-    default_max_cores = os.environ.get("KHIOPS_PROC_NUMBER")
-    os.environ["KHIOPS_PROC_NUMBER"] = "1"
-    with warnings.catch_warnings():
-        warnings.filterwarnings(action="ignore", message=".*Too few cores:.*")
-        global khiops_single_core_runner
-        khiops_single_core_runner = KhiopsLocalRunner()
-        if default_max_cores is None:
-            del os.environ["KHIOPS_PROC_NUMBER"]
-        else:
-            os.environ["KHIOPS_PROC_NUMBER"] = default_max_cores
+    with _khiops_runner_lock:
+        default_max_cores = os.environ.get("KHIOPS_PROC_NUMBER")
+        os.environ["KHIOPS_PROC_NUMBER"] = "1"
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(action="ignore", message=".*Too few cores:.*")
+                global khiops_single_core_runner
+                khiops_single_core_runner = KhiopsLocalRunner()
+        finally:
+            if default_max_cores is None:
+                del os.environ["KHIOPS_PROC_NUMBER"]
+            else:
+                os.environ["KHIOPS_PROC_NUMBER"] = default_max_cores
 
 
 @contextmanager
 def single_core_khiops_runner():
-    """A context manager to run Khiops with a single core"""
-    if khiops_single_core_runner is None:
-        build_single_core_khiops_runner()
-    default_runner = kh.get_runner()
-    kh.set_runner(khiops_single_core_runner)
+    """Run Khiops with one core, avoiding Open MPI shared-memory leaks on Linux."""
+    with _khiops_runner_lock:
+        # Work around KhiopsML/khiops#1173 for single-process Open MPI execution.
+        default_btl = os.environ.get(_OMPI_BTL_ENV)
+        if sys.platform == "linux":
+            os.environ[_OMPI_BTL_ENV] = "self,tcp"
+        try:
+            if khiops_single_core_runner is None:
+                build_single_core_khiops_runner()
+            default_runner = kh.get_runner()
+            kh.set_runner(khiops_single_core_runner)
+            try:
+                yield
+            finally:
+                kh.set_runner(default_runner)
+        finally:
+            if sys.platform == "linux":
+                if default_btl is None:
+                    del os.environ[_OMPI_BTL_ENV]
+                else:
+                    os.environ[_OMPI_BTL_ENV] = default_btl
+
+
+def _check_real_values(values, name):
+    """Rejects sparse or complex values."""
+    if issparse(values):
+        raise ValueError(f"'{name}' must not be a sparse matrix.")
+    values = np.asarray(
+        values, dtype=None if isinstance(values, np.ndarray) else object
+    )
+    if values.dtype.kind == "c" or (
+        values.dtype.kind == "O"
+        and any(
+            isinstance(value, (complex, np.complexfloating)) for value in values.flat
+        )
+    ):
+        raise ValueError(f"'{name}' must contain only real values.")
+
+
+def _check_classifier_features(values):
+    """Allows sparse real feature matrices for scikit-learn estimators."""
+    if issparse(values):
+        if np.issubdtype(values.dtype, np.complexfloating):
+            raise ValueError("'X' must contain only real values.")
+    else:
+        _check_real_values(values, "X")
+
+
+def _as_1d_array(values, name):
+    """Converts a vector or single-column matrix to a 1-D array."""
+    _check_real_values(values, name)
+    values = np.asarray(values)
+    if values.ndim != 1 and not (values.ndim == 2 and values.shape[1] == 1):
+        raise ValueError(
+            f"{name} must be 1-D or a single-column matrix, "
+            f"but it has shape {values.shape}."
+        )
+    return values.reshape(-1)
+
+
+def _as_score_array(values, name):
+    """Validates real scores while preserving finite-range integer precision."""
+    _check_real_values(values, name)
+    values = np.asarray(
+        values, dtype=None if isinstance(values, np.ndarray) else object
+    )
+    _check_no_missing_values(values, name)
+    if values.dtype.kind in "SU":
+        raise ValueError(f"'{name}' must contain only numeric values.")
+    if values.dtype.kind == "b":
+        raise ValueError(f"'{name}' must not contain boolean values.")
+    integer_scores = values.dtype.kind in "iu"
+    if values.dtype.kind == "O":
+        integer_scores = True
+        for value in values.flat:
+            if isinstance(value, (str, bytes, np.str_, np.bytes_)):
+                raise ValueError(f"'{name}' must contain only numeric values.")
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError(f"'{name}' must not contain boolean values.")
+            integer_scores &= isinstance(value, (int, np.integer))
+    if values.dtype.kind in "iu":
+        values = values.astype(object)
+    elif integer_scores:
+        values = np.array([int(value) for value in values.flat], dtype=object).reshape(
+            values.shape
+        )
+
     try:
-        yield
-    finally:
-        kh.set_runner(default_runner)
+        float_values = np.asarray(values, dtype=float)
+    except OverflowError as error:
+        raise ValueError(
+            f"'{name}' must contain values within the finite floating-point range."
+        ) from error
+    return values if integer_scores else float_values
+
+
+def _check_no_infinite_values(values, name):
+    """Rejects infinite values without converting arbitrary-size integers."""
+    if any(value in (math.inf, -math.inf) for value in values.flat):
+        raise ValueError(f"'{name}' must not contain infinite values.")
+
+
+def _check_no_missing_values(values, name):
+    """Rejects NaN or missing values."""
+    if pd.isna(np.asarray(values, dtype=object)).any():
+        raise ValueError(f"'{name}' must not contain NaN or missing values.")
+
+
+def _validate_max_bins(max_bins):
+    """Validates and normalizes a nonnegative integer bin limit."""
+    _check_real_values(max_bins, "max_bins")
+    if isinstance(max_bins, (bool, np.bool_)) or not isinstance(
+        max_bins, (int, np.integer)
+    ):
+        raise ValueError("'max_bins' must be a nonnegative integer.")
+    if max_bins < 0:
+        raise ValueError(f"'max_bins' must be nonnegative. It is {max_bins}.")
+    return int(max_bins)
+
+
+def _find_bin_indexes(breakpoints, values):
+    """Finds left-open, right-closed bins with exact integer comparisons."""
+    values = np.asarray(values)
+    if values.dtype.kind in "iuO" or any(
+        isinstance(value, (int, np.integer)) for value in breakpoints
+    ):
+        boundaries = np.asarray(breakpoints, dtype=object)
+        values = np.asarray(values, dtype=object)
+    else:
+        boundaries = np.asarray(breakpoints)
+    indexes = np.searchsorted(boundaries[:-1], values, side="left") - 1
+    return np.clip(indexes, 0, len(breakpoints) - 2)
+
+
+def _count_target_frequencies(bin_indexes, class_indexes, n_bins, n_classes):
+    """Counts observations for each bin and encoded target class."""
+    target_freqs = [[0] * n_classes for _ in range(n_bins)]
+    for bin_index, class_index in zip(bin_indexes, class_indexes, strict=True):
+        target_freqs[bin_index][class_index] += 1
+    return [tuple(freqs) for freqs in target_freqs]
+
+
+def _validate_nonempty_bin_scores(histogram, y_scores, operation):
+    """Rejects score samples that map to empty bins."""
+    bin_indexes = histogram.vfind(y_scores)
+    empty_bin_samples = np.flatnonzero(np.asarray(histogram.freqs)[bin_indexes] == 0)
+    if empty_bin_samples.size:
+        raise ValueError(
+            f"Cannot {operation} scores in empty histogram bins: "
+            f"sample indices {empty_bin_samples.tolist()}, "
+            f"bin indices {bin_indexes[empty_bin_samples].tolist()}."
+        )
+    return bin_indexes
+
+
+def _get_decision_function_shape(estimator):
+    """Returns the decision score layout through pipelines and fitted searches."""
+    while isinstance(estimator, (Pipeline, BaseSearchCV)):
+        if isinstance(estimator, Pipeline):
+            estimator = estimator.steps[-1][1]
+        else:
+            estimator = estimator.best_estimator_
+    return getattr(estimator, "decision_function_shape", None)
+
+
+def _get_classifier_scores(estimator, features):
+    """Extracts real class scores, rejecting multiclass pairwise decisions."""
+    scores, _, response_method = _get_response_values(
+        estimator,
+        features,
+        response_method=["predict_proba", "decision_function"],
+        return_response_method_used=True,
+    )
+    _check_real_values(scores, "scores")
+    if (
+        len(estimator.classes_) > 2
+        and response_method == "decision_function"
+        and _get_decision_function_shape(estimator) == "ovo"
+    ):
+        raise ValueError(
+            "Multiclass calibration does not support "
+            'decision_function_shape="ovo". '
+            'Use decision_function_shape="ovr" or an estimator with predict_proba.'
+        )
+    return scores
 
 
 @dataclass()
@@ -68,17 +256,36 @@ class Histogram:
     breakpoints : list[float]
         The breakpoints defining the histogram in increasing order.
     freqs : list of float
-        The frequencies of each bin.
+        The finite, nonnegative frequencies of each bin.
     densities : list[float]
         The densities of each bin.
     classes : list
         The class labels.
     target_freqs : list[tuple], optional
-        The target frequencies in each bin. Each tuple is has the same size as
-        :paramref:`classes`.
+        The finite, nonnegative target frequencies in each bin. Each tuple has the
+        same size as :paramref:`classes`.
     target_probas : list[tuple], optional
-        The target conditional probabilites in each bin. Each tuple is has the same size
-        as :paramref:`classes`.
+        The target conditional probabilities in each bin, in class order.
+
+    Raises
+    ------
+    ValueError
+        If fields violate the :ref:`input-requirements`, have inconsistent
+        dimensions, or target frequencies do not sum to their bin frequency.
+
+    Notes
+    -----
+    .. rubric:: Integer precision
+
+    NumPy integer endpoints are stored as Python integers to avoid fixed-width
+    overflow. Integer scores and endpoints retain exact comparisons during lookup.
+
+    .. rubric:: Density limits
+
+    Positive infinite densities caused by overflow are capped at the largest
+    finite float. For capped bins, density times bin width no longer equals the
+    bin's probability mass. Widths exceeding the floating-point range are scaled
+    to preserve representable densities.
     """
 
     breakpoints: list[float]
@@ -131,7 +338,7 @@ class Histogram:
               be larger than the other ones.
             - "eq-width": All bins have the same width.
 
-            If the method is set to "eq-freq" or "eq-width" is set then 'y' is ignored.
+            For "eq-freq" and "eq-width", y does not affect the bin boundaries.
         max_bins: int, default=0
             The maximum number of bins to be created. The algorithms usually create this
             number of bins but they may create less. The default value 0 means:
@@ -141,41 +348,49 @@ class Histogram:
               intervals.
         use_finest: bool, default=False
             *Unsupervised 'khiops' histogram only*: If `True` it builds the finest
-            histogram instead of the most interpretable.
+            histogram instead of the most interpretable. If no histogram has an
+            information rate of 100, the last histogram is used.
 
         Returns
         -------
         `Histogram`
             The histogram object containing the bin limits and frequencies.
+
+        Raises
+        ------
+        ValueError
+            If scores, labels, or max_bins violate the :ref:`input-requirements`,
+            scores are empty, sample counts differ, or method is unsupported.
+        TypeError
+            ``use_finest`` is not a boolean.
         """
         # Check inputs
-        if len(x.shape) > 1 and x.shape[1] > 1:
-            raise ValueError(f"x must be 1-D but it has shape {x.shape}.")
-        if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
-            raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
-        valid_methods = ["khiops", "eq-freq", "eq-width"]
-        if method not in valid_methods:
-            raise ValueError(f"method must be in {valid_methods}. It is '{method}'")
-        if max_bins < 0:
-            raise ValueError(f"max_bins must be non-negative. It is {max_bins}")
+        if not isinstance(use_finest, (bool, np.bool_)):
+            raise TypeError("'use_finest' must be a boolean.")
+        max_bins = _validate_max_bins(max_bins)
+        x = _as_1d_array(_as_score_array(x, "x"), "x")
+        _check_no_infinite_values(x, "x")
+        if y is not None:
+            y = _as_1d_array(y, "y")
+            _check_no_missing_values(y, "y")
+            check_consistent_length(x, y)
+        if x.size == 0:
+            raise ValueError("'x' must contain at least one sample.")
 
-        # Set the y vector to be used by khiops
-        # This is necessary because for the "eq-freq" and "eq-width" methods if
-        # target is set then it uses 'khiops'.
-        y_khiops = y if method == "khiops" else None
-
-        # Transform the binning methods to the Khiops names
-        if method == "khiops":
-            khiops_method = "MODL"
-        elif method == "eq-freq":
-            khiops_method = "EqualFrequency"
-        elif method == "eq-width":
-            khiops_method = "EqualWidth"
-        else:
+        # Validate and translate the binning method to its Khiops name
+        khiops_methods = {
+            "khiops": "MODL",
+            "eq-freq": "EqualFrequency",
+            "eq-width": "EqualWidth",
+        }
+        if not isinstance(method, str) or method not in khiops_methods:
             raise ValueError(
-                f"Unknown binning method '{method}'. "
-                "Choose between 'khiops', 'eq-freq' and 'eq-width'"
+                f"method must be in {list(khiops_methods)}. It is '{method}'"
             )
+        khiops_method = khiops_methods[method]
+
+        # Supplying a target would make Khiops ignore equal-frequency/width binning
+        y_khiops = y if method == "khiops" else None
 
         # Create Khiops dictionary
         kdom = kh.DictionaryDomain()
@@ -204,9 +419,9 @@ class Histogram:
             ctx_stack.enter_context(single_core_khiops_runner())
 
             # Create data table file for khiops
-            df_spec = {"x": x if len(x.shape) == 1 else x.flatten()}
+            df_spec = {"x": x}
             if y_khiops is not None:
-                df_spec["y"] = y_khiops if len(y.shape) == 1 else y.flatten()
+                df_spec["y"] = y_khiops
             output_df = pd.DataFrame(df_spec)
             output_table_path = f"{work_dir}/hist-data.txt"
             output_df.to_csv(output_table_path, sep="\t", index=False)
@@ -248,7 +463,7 @@ class Histogram:
                 casted_target_values = [val == "True" for val in target_values]
             else:
                 casted_target_values = [type(classes[0])(val) for val in target_values]
-            target_indexes = le.transform(casted_target_values)
+            target_indexes = np.argsort(le.transform(casted_target_values))
 
         # Recover the breakpoints from the variable statistics objects
         # Normal case: There is a data grid
@@ -289,8 +504,7 @@ class Histogram:
                             score_stats.modl_histograms.information_rates.index(100)
                         )
                     else:
-                        assert len(score_stats.modl_histograms.information_rates) == 1
-                        histogram_index = 0
+                        histogram_index = -1
                     breakpoints = score_stats.modl_histograms.histograms[
                         histogram_index
                     ].bounds
@@ -300,28 +514,24 @@ class Histogram:
 
                 # Compute the supervised fields if y was provided
                 if y is not None:
-                    # Compute the class and  bin indexes
                     y_indexes = le.transform(y)
-                    x_bin_indexes = (
-                        np.searchsorted(breakpoints[:-1], x, side="left") - 1
-                    ).reshape(-1)
-                    x_bin_indexes[x_bin_indexes < 0] = 0
-
-                    # Compute the target frequencies
-                    target_freqs = [[0 for _ in le.classes_] for _ in breakpoints[:-1]]
-                    for y_score_bin_index, y_index in np.nditer(
-                        [x_bin_indexes, y_indexes]
-                    ):
-                        target_freqs[y_score_bin_index][y_index] += 1
-                    target_freqs = [tuple(tf) for tf in target_freqs]
+                    x_bin_indexes = _find_bin_indexes(breakpoints, x)
+                    target_freqs = _count_target_frequencies(
+                        x_bin_indexes, y_indexes, len(breakpoints) - 1, len(le.classes_)
+                    )
         # Otherwise there is just one interval
         else:
             # Non-informative variable: histogram with only the bin (min, max)
             if score_stats.min < score_stats.max:
                 breakpoints = [score_stats.min, score_stats.max]
-            # Single-valued variable: histogram with only the bin (min, min + eps)
+            # Keep constant-score endpoints distinct despite floating-point rounding
             else:
-                breakpoints = [score_stats.min, score_stats.min + 1.0e-9]
+                value = score_stats.min
+                upper = math.nextafter(value, math.inf)
+                if math.isfinite(upper):
+                    breakpoints = [value, upper]
+                else:
+                    breakpoints = [math.nextafter(value, -math.inf), value]
 
             # Add the total frequency and, if y was provided, the target frequencies
             freqs = [results.preparation_report.instance_number]
@@ -350,22 +560,39 @@ class Histogram:
         x : array-like of shape (n_samples,) or (n_samples, 1)
             Vector with the values to discretize for the histogram.
         breakpoints : list[float]
-            A sorted list of floats defining the bin edges.
+            The increasing bin edges.
         y : array-like of shape (n_samples,) or (n_samples, 1), optional
             Target values associated to each element in 'x'.
+
+        Raises
+        ------
+        ValueError
+            If scores, labels, or breakpoints violate the
+            :ref:`input-requirements`, scores are empty, or sample counts differ.
         """
         # Check inputs
-        if len(x.shape) > 1 and x.shape[1] > 1:
-            raise ValueError(f"x must be 1-D but it has shape {x.shape}.")
-        if y is not None and len(y.shape) > 1 and y.shape[1] > 1:
-            raise ValueError(f"y must be 1-D but it has shape {y.shape}.")
+        x = _as_1d_array(_as_score_array(x, "x"), "x")
+        _check_no_infinite_values(x, "x")
+        if y is not None:
+            y = _as_1d_array(y, "y")
+            _check_no_missing_values(y, "y")
+            check_consistent_length(x, y)
+        if x.size == 0:
+            raise ValueError("'x' must contain at least one sample.")
+        if len(breakpoints) < 2:
+            raise ValueError("`breakpoints` must contain at least two values.")
+        _check_real_values(breakpoints, "breakpoints")
+        for i, breakpoint in enumerate(breakpoints):
+            if not isinstance(breakpoint, (int, np.integer)) and math.isnan(breakpoint):
+                raise ValueError(f"`breakpoints` contains NaN at index {i}.")
+            if not isinstance(breakpoint, (int, np.integer)) and math.isinf(breakpoint):
+                raise ValueError(f"`breakpoints` contains infinity at index {i}.")
         for i in range(len(breakpoints) - 1):
             if (left := breakpoints[i]) > breakpoints[i + 1]:
                 raise ValueError(f"Breakpoint at index {i} is not sorted: {left}")
 
         # Initialize the breakpoints and bin frequencies
-        x_bin_indexes = np.searchsorted(breakpoints[:-1], x, side="left") - 1
-        x_bin_indexes[x_bin_indexes < 0] = 0
+        x_bin_indexes = _find_bin_indexes(breakpoints, x)
         freqs = [0] * (len(breakpoints) - 1)
         for x_bin_index in x_bin_indexes:
             freqs[x_bin_index] += 1
@@ -377,20 +604,38 @@ class Histogram:
             le = LabelEncoder().fit(y)
             y_indexes = le.transform(y)
 
-            # Initialize the target frequencies per bin
-            target_freqs = [[0 for _ in le.classes_] for _ in breakpoints[:-1]]
-            for x_bin_index, y_index in np.nditer([x_bin_indexes, y_indexes]):
-                target_freqs[x_bin_index][y_index] += 1
+            # Count target observations in each bin
+            target_freqs = _count_target_frequencies(
+                x_bin_indexes, y_indexes, len(breakpoints) - 1, len(le.classes_)
+            )
 
             return cls(
                 breakpoints=breakpoints,
                 freqs=freqs,
-                target_freqs=[tuple(freqs) for freqs in target_freqs],
+                target_freqs=target_freqs,
                 classes=le.classes_.tolist(),
             )
 
     def __post_init__(self):
+        # Reject complex inputs before comparisons or arithmetic can discard them
+        for name in ("breakpoints", "freqs", "target_freqs", "classes"):
+            _check_real_values(getattr(self, name), name)
+        _check_no_missing_values(self.classes, "classes")
+
+        # Preserve exact integer endpoints without fixed-width arithmetic
+        self.breakpoints = [
+            int(value) if isinstance(value, np.integer) else value
+            for value in self.breakpoints
+        ]
+
         # Check consistency of the constructor parameters
+        if len(self.breakpoints) < 2:
+            raise ValueError("`breakpoints` must contain at least two values.")
+        for i, breakpoint in enumerate(self.breakpoints):
+            if not isinstance(breakpoint, int) and math.isnan(breakpoint):
+                raise ValueError(f"`breakpoints` contains NaN at index {i}.")
+            if not isinstance(breakpoint, int) and math.isinf(breakpoint):
+                raise ValueError(f"`breakpoints` contains infinity at index {i}.")
         for i in range(n_bins := len(self.breakpoints) - 1):
             if (left := self.breakpoints[i]) >= (right := self.breakpoints[i + 1]):
                 raise ValueError(
@@ -402,7 +647,21 @@ class Histogram:
                 "`freqs` must match the size of `breakpoints` minus 1: "
                 f"{n_freqs} != {n_bins}"
             )
+        for i, freq in enumerate(self.freqs):
+            if not isinstance(freq, (int, np.integer)) and not math.isfinite(freq):
+                raise ValueError(
+                    f"`freqs` must be finite, but at bin index {i} got {freq}."
+                )
+            if freq < 0:
+                raise ValueError(
+                    f"`freqs` must be nonnegative, but at bin index {i} got {freq}."
+                )
         if self.target_freqs:
+            if len(set(self.classes)) != len(self.classes):
+                raise ValueError(
+                    "`classes` must contain unique labels when `target_freqs` are "
+                    "provided."
+                )
             if (n_target_freqs := len(self.target_freqs)) != n_freqs:
                 raise ValueError(
                     "`target_freqs` length different from that of `freqs`: "
@@ -414,19 +673,63 @@ class Histogram:
                         f"`target_freqs` at bin index {i} has a length different from "
                         f"the number of classes: {len(tfreqs)} != {len(self.classes)}."
                     )
-                if sum(tfreqs) != self.freqs[i]:
+                for k, tfreq in enumerate(tfreqs):
+                    if not isinstance(tfreq, (int, np.integer)) and not math.isfinite(
+                        tfreq
+                    ):
+                        raise ValueError(
+                            "`target_freqs` must be finite, "
+                            f"but at bin index {i}, class index {k} got {tfreq}."
+                        )
+                    if tfreq < 0:
+                        raise ValueError(
+                            "`target_freqs` must be nonnegative, "
+                            f"but at bin index {i}, class index {k} got {tfreq}."
+                        )
+                target_total = sum(
+                    int(freq) if isinstance(freq, np.integer) else freq
+                    for freq in tfreqs
+                )
+                if target_total != self.freqs[i]:
                     raise ValueError(
                         f"`target_freqs` at bin index {i} sums different from the bin "
-                        f"frequency: {sum(tfreqs)} != {self.freqs[i]}"
+                        f"frequency: {target_total} != {self.freqs[i]}"
                     )
 
+        # Promote NumPy integers to avoid fixed-width overflow during summation
+        total_freq = sum(
+            int(freq) if isinstance(freq, np.integer) else freq for freq in self.freqs
+        )
+        if not isinstance(total_freq, int) and not math.isfinite(total_freq):
+            raise ValueError("`freqs` must have a finite total frequency.")
+        if total_freq == 0:
+            raise ValueError("`freqs` must have a positive total frequency.")
+
         # Initialize the densities and target probabilities
-        self.densities = [
-            self.freqs[i]
-            / sum(self.freqs)
-            / (self.breakpoints[i + 1] - self.breakpoints[i])
-            for i in range(len(self.freqs))
-        ]
+        self.densities = []
+        for i, freq in enumerate(self.freqs):
+            left, right = self.breakpoints[i : i + 2]
+            probability = freq / total_freq
+            # Halve finite endpoints when their difference would overflow
+            if (
+                not isinstance(left, int)
+                and not isinstance(right, int)
+                and math.isfinite(left)
+                and math.isfinite(right)
+                and left < 0 < right
+                and right > sys.float_info.max + left
+            ):
+                density = (probability / 2) / (right / 2 - left / 2)
+            else:
+                width = right - left
+                if isinstance(width, int) and width.bit_length() > 1023:
+                    shift = width.bit_length() - 1023
+                    density = math.ldexp(probability / (width >> shift), -shift)
+                else:
+                    density = probability / width
+            self.densities.append(
+                sys.float_info.max if density == math.inf else density
+            )
         if self.target_freqs:
             target_probas = []
             for bin_freq, bin_target_freqs in zip(
@@ -454,13 +757,25 @@ class Histogram:
         -------
         int
             The index of the bin containing the value.
+
+        Raises
+        ------
+        ValueError
+            If value violates the score :ref:`input-requirements` or is not scalar.
         """
+        value = _as_score_array(value, "value")
+        if value.ndim != 0:
+            raise ValueError("'value' must be a scalar.")
+        _check_no_infinite_values(value, "value")
+        value = value.item()
+        if isinstance(value, np.integer):
+            value = int(value)
         if value <= self.breakpoints[0]:
             return 0
         elif value >= self.breakpoints[-1]:
             return len(self.breakpoints) - 2
         else:
-            return bisect.bisect_right(self.breakpoints, value) - 1
+            return bisect.bisect_left(self.breakpoints, value) - 1
 
     def vfind(self, values):
         """Returns the histogram bin indexes for a value sequence
@@ -474,11 +789,15 @@ class Histogram:
         -------
         :external:term:`array-like`
             The indexes of the bins containing the values.
+
+        Raises
+        ------
+        ValueError
+            If values violate the score :ref:`input-requirements`.
         """
-        indexes = np.searchsorted(self.breakpoints[:-1], values, side="right") - 1
-        indexes[np.array(values) < self.breakpoints[0]] = 0
-        indexes[np.array(values) > self.breakpoints[-2]] = self.n_bins - 1
-        return indexes
+        values = _as_score_array(values, "values")
+        _check_no_infinite_values(values, "values")
+        return _find_bin_indexes(self.breakpoints, values)
 
 
 def calibration_error(
@@ -489,6 +808,7 @@ def calibration_error(
     max_bins: int = 0,
     multi_class_method: str = "top-label",
     histogram: Histogram | None = None,
+    reuse_stats: bool = False,
 ):
     r"""Estimates the ECE via binning
 
@@ -497,10 +817,14 @@ def calibration_error(
 
     Parameters
     ----------
-    y_scores : array-like of shape (n_samples,) or (n_samples, 1) or (n_samples, 2)
-        Scores/probabilities. If it is a 2-D array the column indexed as 1 will be used
-        for the estimation.
-    y : array-like of shape (n_samples,) or (n_samples, n_classes)
+    y_scores : array-like of shape (n_samples,) or (n_samples, n_classes)
+        Scores/probabilities. For binary ECE, the positive class is the second
+        distinct label in sorted order. For two-column binary scores, column 1
+        must contain scores for that class.
+        For multiclass scores, columns must correspond to the numerical or
+        lexicographical order of the labels in y, with every class present in y.
+        Single-column binary scores are also accepted.
+    y : array-like of shape (n_samples,) or (n_samples, 1)
         Target values (class labels).
     method : {"label-bin", "bin"}, default="label-bin"
         ECE estimation method. See below for details.
@@ -508,9 +832,9 @@ def calibration_error(
         Multi-class ECE estimation method:
 
         - "top-label": Estimates the ECE for the confidence scores (ie. the predicted
-          class score).
-        - "classwise": Estimates the ECE for each class in a one-vs-rest fashion and the
-          averages it.
+          class score). Ties select the first maximal score column.
+        - "classwise": Estimates the ECE for each class in a one-vs-rest fashion and
+          averages the class ECEs weighted by each class's prevalence in ``y``.
     histogram_method : {"khiops", "eq-freq", "eq-width"}, default="khiops"
         Histogram method:
 
@@ -521,7 +845,7 @@ def calibration_error(
           larger than the other ones.
         - "eq-width": All bins have the same width.
 
-        If the method is set to "eq-freq" or "eq-width" is set then 'y' is ignored.
+        For "eq-freq" and "eq-width", y does not affect the bin boundaries.
     max_bins : int, default=0
         The maximum number of bins to be created. The algorithms usually create this
         number of bins but they may create less. The default value 0 means:
@@ -529,12 +853,44 @@ def calibration_error(
         - For "khiops": that there is no limit to the number of intervals.
         - For "eq-freq" or "eq-width": that 10 is the maximum number of intervals.
     histogram : `Histogram`, optional
-        A ready-made histogram. If set then it is used for the ECE computation and the
-        parameters histogram_method and max_bins are ignored.
+        A histogram providing the bin boundaries. If set, histogram_method and
+        max_bins are ignored. Bin and target frequencies are recomputed from
+        y_scores and y unless reuse_stats is True.
+    reuse_stats : bool, default=False
+        Reuse the supplied histogram's statistics without recomputing them. Set
+        this to True only if it was built from the same scores and labels used
+        for this ECE computation. Has no effect when histogram is None.
 
+    Raises
+    ------
+    ValueError
+        If inputs violate the :ref:`input-requirements` or the estimation and
+        histogram requirements described in Notes.
+    TypeError
+        ``reuse_stats`` is not a boolean.
 
     Notes
     -----
+    .. rubric:: Input and estimation requirements
+
+    Binary targets must contain exactly two distinct labels. Multiclass targets
+    must contain one distinct label per score column. Top-label ECE requires both
+    correct and incorrect predictions; classwise ECE requires both positive and
+    negative examples for each class. Scores and labels must have matching sample
+    counts. See :ref:`input-requirements` for common score and label rules.
+
+    Both method and multi_class_method must be supported. When no histogram is
+    supplied, max_bins must be a nonnegative integer.
+
+    .. rubric:: Histogram statistics
+
+    Reusing statistics is supported only for binary scores and requires target
+    frequencies for two classes in the same order as the sorted labels in y.
+    Scores mapping to empty histogram bins are rejected, including before any
+    supplied statistics are refreshed.
+
+    .. rubric:: Mathematical definition
+
     We present the formulas for the two binary ECE estimators used in this function, as
     described in [RCSM22]_. Both approximate the theoretical calibration error:
 
@@ -586,42 +942,68 @@ def calibration_error(
     histogram estimation of the ECE.
 
     """
-    if len(y_scores.shape) > 2:
+    # Validate estimation methods before computing histogram statistics
+    if not isinstance(reuse_stats, (bool, np.bool_)):
+        raise TypeError("'reuse_stats' must be a boolean.")
+    if histogram is None:
+        max_bins = _validate_max_bins(max_bins)
+    if method not in ("label-bin", "bin"):
+        raise ValueError(f"'method' must be 'label-bin' or 'bin'. Got {method!r}.")
+    if multi_class_method not in ("top-label", "classwise"):
+        raise ValueError(
+            "'multi_class_method' must be 'top-label' or 'classwise'. "
+            f"Got {multi_class_method!r}."
+        )
+
+    # Normalize labels while preserving binary and multiclass score matrices
+    y = _as_1d_array(y, "y")
+    _check_no_missing_values(y, "y")
+    y_scores = _as_score_array(y_scores, "y_scores")
+    if y_scores.ndim not in (1, 2) or (y_scores.ndim == 2 and y_scores.shape[1] == 0):
         raise ValueError(
             "'y_scores' must be either a 1-D or 2-D array-like object, "
             f"but its shape is {y_scores.shape}"
         )
-    # 1-D or 2-D array with 1 column: Binary ECE
-    if len(y_scores.shape) == 1 or (
-        len(y_scores.shape) == 2 and y_scores.shape[1] == 1
-    ):
+    check_consistent_length(y_scores, y)
+    _check_no_infinite_values(y_scores, "y_scores")
+
+    # Keep reusable histogram statistics restricted to binary score inputs
+    if reuse_stats and y_scores.ndim == 2 and y_scores.shape[1] > 2:
+        raise ValueError("'reuse_stats' is not supported for multiclass scores.")
+
+    # Binary ECE uses the positive-class column when two columns are supplied
+    if y_scores.ndim == 1 or y_scores.shape[1] <= 2:
+        binary_scores = y_scores if y_scores.ndim == 1 else y_scores[:, -1]
+        if len(np.unique(y)) != 2:
+            raise ValueError(
+                "Binary ECE requires exactly two distinct target labels in 'y'."
+            )
         return _binary_ece(
-            y_scores,
+            binary_scores,
             y,
             method=method,
             histogram_method=histogram_method,
             max_bins=max_bins,
             histogram=histogram,
-        )
-    # 2-D array with 2 columns: Also Binary ECE but a little pre-treatment is needed
-    elif len(y_scores.shape) == 2 and y_scores.shape[1] == 2:
-        # le = LabelEncoder().fit(y)
-        # y_binarized = label_binarize(y, classes=le.classes_)
-        return _binary_ece(
-            y_scores[:, 1],
-            y,
-            method=method,
-            histogram_method=histogram_method,
-            max_bins=max_bins,
-            histogram=histogram,
+            reuse_stats=reuse_stats,
         )
     # 2-D array with > 2 columns: Multi-class ECE
     else:
         le = LabelEncoder().fit(y)
+        if len(le.classes_) != y_scores.shape[1]:
+            raise ValueError(
+                "Number of distinct labels in 'y' must match the number of "
+                "columns in multiclass 'y_scores': "
+                f"{len(le.classes_)} != {y_scores.shape[1]}."
+            )
         if multi_class_method == "top-label":
-            prediction_indexes = np.argsort(y_scores, axis=1)[:, -1]
+            prediction_indexes = np.argmax(y_scores, axis=1)
             y_preds = (y == le.classes_[prediction_indexes]).astype(int)
             y_pred_scores = y_scores[np.arange(len(y)), prediction_indexes]
+            if len(np.unique(y_preds)) != 2:
+                raise ValueError(
+                    "Top-label ECE requires both correct and incorrect predictions."
+                )
             return _binary_ece(
                 y_pred_scores,
                 y_preds,
@@ -629,21 +1011,29 @@ def calibration_error(
                 histogram_method=histogram_method,
                 max_bins=max_bins,
                 histogram=histogram,
+                reuse_stats=reuse_stats,
             )
         else:
             assert multi_class_method == "classwise"
             y_binarized = label_binarize(y, classes=le.classes_)
-            class_eces = [
-                _binary_ece(
-                    y_scores[:, k],
-                    y_binarized[:, k],
-                    method=method,
-                    histogram_method=histogram_method,
-                    max_bins=max_bins,
-                    histogram=histogram,
+            class_eces = []
+            for k in range(y_scores.shape[1]):
+                if len(np.unique(y_binarized[:, k])) != 2:
+                    raise ValueError(
+                        "Classwise ECE requires both positive and negative examples "
+                        f"for class {le.classes_[k]!r}."
+                    )
+                class_eces.append(
+                    _binary_ece(
+                        y_scores[:, k],
+                        y_binarized[:, k],
+                        method=method,
+                        histogram_method=histogram_method,
+                        max_bins=max_bins,
+                        histogram=histogram,
+                        reuse_stats=reuse_stats,
+                    )
                 )
-                for k in range(y_scores.shape[1])
-            ]
             class_probas = np.unique(y, return_counts=True)[1] / len(y)
             return float(np.dot(class_eces, class_probas))
 
@@ -655,25 +1045,61 @@ def _binary_ece(
     histogram_method: str = "khiops",
     max_bins: int = 0,
     histogram: Histogram | None = None,
+    reuse_stats: bool = False,
 ):
     """Estimates the ECE for a 2-class problem
 
     See the function `calibration_error` docstring for more details.
     """
-    # Compute the histogram if necessary
+    # Normalize binary scores and labels
+    y_scores = _as_1d_array(y_scores, "y_scores")
+    y = _as_1d_array(y, "y")
+    assert len(np.unique(y)) == 2
+
+    # Validate supplied statistics before any refresh can populate empty bins
+    supplied_histogram = histogram is not None
+    if supplied_histogram:
+        bin_indexes = _validate_nonempty_bin_scores(
+            histogram, y_scores, operation="compute ECE for"
+        )
+
+    # Build or refresh statistics unless reuse is explicitly requested
     if histogram is None:
         histogram = Histogram.from_data(
             y_scores, y=y, method=histogram_method, max_bins=max_bins
         )
+    elif not reuse_stats:
+        histogram = Histogram.from_data_and_breakpoints(
+            y_scores,
+            histogram.breakpoints,
+            y=y,
+        )
 
-    # Check that the histogram has only two classes
+    # Require target statistics for exactly two classes
+    if not histogram.target_freqs:
+        raise ValueError("'histogram' must have target statistics.")
     if (n_classes := len(histogram.classes)) != 2:
-        raise ValueError(f"Target 'y' must have only 2 classes. It has {n_classes}.")
+        raise ValueError(
+            f"The histogram must have exactly 2 target classes. It has {n_classes}."
+        )
+    expected_classes = LabelEncoder().fit(y).classes_
+    if reuse_stats and not np.array_equal(histogram.classes, expected_classes):
+        raise ValueError(
+            "Reused binary histogram classes must match the sorted distinct labels "
+            f"in 'y'. Got {histogram.classes!r}; expected "
+            f"{expected_classes.tolist()!r}."
+        )
+
+    # Validate the constructed histogram when no statistics were supplied
+    if not supplied_histogram:
+        bin_indexes = _validate_nonempty_bin_scores(
+            histogram, y_scores, operation="compute ECE for"
+        )
 
     # Estimate the ECE with the histogram
     if method == "label-bin":
         sum_diffs = 0
-        for y_score, i in np.nditer([y_scores, histogram.vfind(y_scores)]):
+        for y_score, i in zip(y_scores, bin_indexes, strict=True):
             sum_diffs += math.fabs(
                 y_score - histogram.target_freqs[i][1] / histogram.freqs[i]
             )
@@ -681,7 +1107,7 @@ def _binary_ece(
     else:
         assert method == "bin"
         sum_score_by_bin = [0 for _ in histogram.bins]
-        for y_score, i in np.nditer([y_scores, histogram.vfind(y_scores)]):
+        for y_score, i in zip(y_scores, bin_indexes, strict=True):
             sum_score_by_bin[i] += y_score
         return sum(
             [
@@ -717,8 +1143,8 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
     estimator : estimator instance, default=None
         The classifier whose output need to be calibrated to provide more accurate
         `predict_proba` outputs. If not provided, it trains a `KhiopsClassifier`_. If
-        provided, but the estimator is not fitted then, on `fit`, it will
-        be fitted with :paramref:`train_size` elements.
+        provided and not fitted, a clone is fitted with :paramref:`train_size`
+        elements. If already fitted, the estimator is copied for calibration.
     train_size : float or int, default=0.75
         Same parameter as `~sklearn.model_selection.train_test_split`. Only used when
         :paramref:`estimator` is not provided or not fitted.
@@ -730,13 +1156,16 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
     Attributes
     ----------
     fitted_estimator_ :
-        The underlying fitted classifier. It is the same instance as
-        :paramref:`estimator` if it was provided, otherwise it is an instance of
-        `KhiopsClassifier`_.
+        The independent fitted classifier used for calibration. It is an instance
+        of `KhiopsClassifier`_ when :paramref:`estimator` is not provided.
     histograms_ : list of size 1 or n_classes
         In the binary case: a list of size 1 with the `Histogram` instance for the
         positive class. In the multi class case: A list of size n_classes containing the
         one-vs-rest `Histogram` for each class.
+    classes_ : ndarray of shape (n_classes,)
+        Class labels in the order of the columns returned by `predict_proba`. For
+        binary classification, the second class is positive and its probability is
+        returned in column 1.
 
     """
 
@@ -760,44 +1189,111 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         -------
         self
             The calling estimator instance.
-        """
-        # Check/initialize fitted estimator
-        if self.estimator is None:
-            self.fitted_estimator_ = KhiopsClassifier()
-        else:
-            self.fitted_estimator_ = self.estimator
 
-        # Fit the base predictor if not fitted
+        Raises
+        ------
+        ValueError
+            If inputs violate the :ref:`input-requirements`, calibration labels
+            do not match the estimator's classes, or multiclass decision scores
+            use an unsupported layout.
+        TypeError
+            ``random_state`` is a boolean.
+
+        Notes
+        -----
+        .. rubric:: Calibration requirements
+
+        Calibration labels must contain at least two classes and exactly match
+        the fitted estimator's classes. Features may be sparse, unlike scores
+        and labels. Multiclass decision scores must not use
+        ``decision_function_shape="ovo"``, including inside pipelines or searches.
+
+        .. rubric:: Fitted state
+
+        Fitted attributes are updated only after calibration succeeds. A failed
+        refit preserves the previous fitted state. The supplied estimator is cloned
+        before fitting, or copied if already fitted, so later changes to it do not
+        affect this classifier.
+        """
+        # Validate features and reject unsupported sparse inputs
+        _check_classifier_features(X)
+        if isinstance(self.random_state, (bool, np.bool_)):
+            raise TypeError("'random_state' must not be a boolean.")
+        for name, values in (
+            ("y", y),
+            ("train_size", self.train_size),
+            ("random_state", self.random_state),
+        ):
+            _check_real_values(values, name)
+        _check_no_missing_values(y, "y")
+
+        # Isolate the estimator from subsequent changes by its caller
+        estimator = self.estimator if self.estimator is not None else KhiopsClassifier()
         try:
-            check_is_fitted(self.fitted_estimator_)
-            x_calib, y_calib = X, y
+            check_is_fitted(estimator)
         except NotFittedError:
+            fitted_estimator = clone(estimator)
             x_train, x_calib, y_train, y_calib = train_test_split(
                 X, y, train_size=self.train_size, random_state=self.random_state
             )
-            self.fitted_estimator_.fit(x_train, y_train)
+            fitted_estimator.fit(x_train, y_train)
+        else:
+            fitted_estimator = deepcopy(estimator)
+            x_calib, y_calib = X, y
+
+        # Require calibration examples for every estimator class
+        calibration_classes = np.unique(y_calib)
+        _check_real_values(fitted_estimator.classes_, "classes")
+        if len(calibration_classes) < 2 or not np.array_equal(
+            calibration_classes, fitted_estimator.classes_
+        ):
+            raise ValueError(
+                "Calibration labels must contain at least two classes and exactly "
+                "match the fitted estimator's classes. "
+                f"Got {calibration_classes.tolist()!r}; "
+                f"expected {fitted_estimator.classes_.tolist()!r}."
+            )
 
         # Estimate the uncalibrated scores
-        scores, _ = _get_response_values(
-            self.fitted_estimator_,
-            x_calib,
-            response_method=["predict_proba", "decision_function"],
-        )
+        scores = _get_classifier_scores(fitted_estimator, x_calib)
 
         # Binary classification
-        if (n_classes := len(self.fitted_estimator_.classes_)) == 2:
-            self.histograms_ = [Histogram.from_data(scores, y_calib)]
+        if (n_classes := len(fitted_estimator.classes_)) == 2:
+            histograms = [Histogram.from_data(scores, y_calib)]
         # Multiclass classification: One-vs-Rest
         else:
-            y_binarized = label_binarize(
-                y_calib, classes=self.fitted_estimator_.classes_
-            )
-            self.histograms_ = [
-                Histogram.from_data(scores[:, k].reshape(-1, 1), y_binarized[:, k])
+            y_binarized = label_binarize(y_calib, classes=fitted_estimator.classes_)
+            histograms = [
+                Histogram.from_data(scores[:, k], y_binarized[:, k])
                 for k in range(n_classes)
             ]
 
+        # Publish matching estimator and calibration state only after success
+        self.fitted_estimator_ = fitted_estimator
+        self.histograms_ = histograms
         return self
+
+    @property
+    def classes_(self):
+        """Class labels in probability column order."""
+        check_is_fitted(self, ["fitted_estimator_", "histograms_"])
+        return self.fitted_estimator_.classes_
+
+    def predict(self, X):  # noqa: N803
+        """Predicts class labels using calibrated probabilities
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Input data.
+
+        Returns
+        -------
+        y : ndarray of shape (n_samples,)
+            Predicted class labels.
+        """
+        probabilities = self.predict_proba(X)
+        return self.classes_[np.argmax(probabilities, axis=1)]
 
     def predict_proba(self, X):  # noqa: N803
         """Estimates the calibrated classification probabilities
@@ -811,16 +1307,39 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         -------
         P : array-like of shape (n_samples, n_classes)
             The estimated calibrated probabilities for each class.
+
+        Raises
+        ------
+        ValueError
+            If features or scores violate the :ref:`input-requirements`,
+            multiclass decision scores use an unsupported layout, or zero-sum
+            calibrated probabilities have no valid fallback.
+
+        Warns
+        -----
+        UserWarning
+            If multiclass calibrated probabilities sum to zero. The uncalibrated
+            probabilities are returned for those samples instead.
+
+        Notes
+        -----
+        .. rubric:: Score layout
+
+        Multiclass decision scores must not use ``decision_function_shape="ovo"``,
+        including inside pipelines or searches. Features may be sparse.
+
+        .. rubric:: Zero-sum probabilities
+
+        If all calibrated class probabilities for a sample are zero, the fitted
+        estimator must provide finite, nonnegative ``predict_proba`` values
+        summing to one. These are used only for the affected samples.
         """
         # Check that is fitted
-        check_is_fitted(self)
+        check_is_fitted(self, ["fitted_estimator_", "histograms_"])
+        _check_classifier_features(X)
 
         # Estimate the uncalibrated scores
-        scores, _ = _get_response_values(
-            self.fitted_estimator_,
-            X,
-            response_method=["predict_proba", "decision_function"],
-        )
+        scores = _get_classifier_scores(self.fitted_estimator_, X)
 
         # Binary classification
         if len(self.histograms_) == 1:
@@ -833,9 +1352,46 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
                     scores[:, k], histogram, only_positive=True
                 )
 
-            calibrated_probas = calibrated_probas / np.sum(
-                calibrated_probas, axis=1, keepdims=True
-            )
+            # Detect zero-sum calibration
+            normalization_factors = calibrated_probas.sum(axis=1)
+            zero_sum_rows = np.flatnonzero(normalization_factors == 0)
+            if zero_sum_rows.size:
+                # Decision scores cannot serve as fallback probabilities
+                if not hasattr(self.fitted_estimator_, "predict_proba"):
+                    raise ValueError(
+                        "Cannot fall back to uncalibrated probabilities for samples "
+                        f"{zero_sum_rows.tolist()}: the fitted estimator does not "
+                        "provide predict_proba."
+                    )
+
+                # Require valid probabilities for the fallback
+                fallback_probas = scores[zero_sum_rows]
+                if (
+                    not np.all(np.isfinite(fallback_probas))
+                    or np.any(fallback_probas < 0)
+                    or not np.allclose(fallback_probas.sum(axis=1), 1)
+                ):
+                    raise ValueError(
+                        "Cannot fall back to uncalibrated probabilities for samples "
+                        f"{zero_sum_rows.tolist()}: predict_proba returned invalid "
+                        "probabilities."
+                    )
+
+                # Fall back only for affected samples
+                warnings.warn(
+                    "Calibrated probabilities sum to zero for samples "
+                    f"{zero_sum_rows.tolist()}; using uncalibrated probabilities "
+                    "for those samples.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                calibrated_probas[zero_sum_rows] = fallback_probas
+
+            # Normalize only the calibrated samples
+            nonzero_sum_rows = normalization_factors != 0
+            calibrated_probas[nonzero_sum_rows] /= normalization_factors[
+                nonzero_sum_rows, np.newaxis
+            ]
 
         return calibrated_probas
 
@@ -849,33 +1405,53 @@ def calibrate_binary(y_scores, histogram: Histogram, only_positive: bool = False
     Parameters
     ----------
     y_scores : array-like of shape (n_samples,) or (n_samples, 1)
-        Scores for the positive class.
+        Scores for the second class in ``histogram.classes``.
     histogram : `Histogram`
-        A histogram with target statistics (ie. :paramref:`Histogram.target_freqs` must
-        be non-empty).
+        Binary histogram with target statistics. Its class order defines the
+        output probability-column order; the second class is positive.
     only_positive : bool, default=False
         If ``True`` it returns only 1-D array with the probabilities of the positive
         class. Otherwise it returns a 2-D array with the probabilities for both classes.
+
+    Raises
+    ------
+    ValueError
+        If scores violate the :ref:`input-requirements`, the histogram lacks
+        binary target statistics, or scores map to empty bins.
+    TypeError
+        ``only_positive`` is not a boolean.
+
+    Notes
+    -----
+    .. rubric:: Input requirements
+
+    The histogram must have target frequencies for exactly two classes.
+    Empty score arrays are accepted. See :ref:`input-requirements` for common
+    score rules.
+
+    .. rubric:: Bin lookup
+
+    Finite scores outside the histogram range map to the nearest end bin.
+    Scores mapping to empty bins are rejected.
     """
     # Check the inputs
-    if not histogram.classes:
+    if not isinstance(only_positive, (bool, np.bool_)):
+        raise TypeError("'only_positive' must be a boolean.")
+    y_scores = _as_1d_array(_as_score_array(y_scores, "y_scores"), "y_scores")
+    if not histogram.classes or not histogram.target_freqs:
         raise ValueError("'histogram' must have target statistics.")
     if (n_classes := len(histogram.classes)) != 2:
         raise ValueError(f"'histogram' must have only 2 classes (it has {n_classes})")
 
-    # Map the scores to their corresponding bin target probability
-    y_scores_bin_indexes = histogram.vfind(y_scores)
-    it = np.nditer(y_scores_bin_indexes, flags=["f_index"])
-    if only_positive:
-        calibrated_probas = np.empty(y_scores.shape[0])
-        for bin_i in it:
-            calibrated_probas[it.index] = histogram.target_probas[bin_i][1]
-    else:
-        calibrated_probas = np.empty((y_scores.shape[0], 2))
-        for bin_i in it:
-            calibrated_probas[it.index][0] = histogram.target_probas[bin_i][0]
-            calibrated_probas[it.index][1] = histogram.target_probas[bin_i][1]
+    # Reject scores without calibration observations in their bins
+    y_scores_bin_indexes = _validate_nonempty_bin_scores(
+        histogram, y_scores, operation="calibrate"
+    )
 
+    # Map each score to its bin target probabilities
+    calibrated_probas = np.asarray(histogram.target_probas)[y_scores_bin_indexes]
+    if only_positive:
+        return calibrated_probas[:, 1]
     return calibrated_probas
 
 
@@ -893,14 +1469,13 @@ def build_reliability_diagram(
     implements a heuristic to dectect when the scores is distributed as a sum of diracs
     and changes visualization accordingly.
 
-
     Parameters
     ----------
     y_scores : array-like of shape (n_samples,) or (n_samples, 1) or (n_samples, 2)
-        Scores/probabilities. If it is a 2-D array the column indexed as 1 will be used
-        for the estimation.
-    y : array-like of shape (n_samples,) or (n_samples, n_classes)
-        Target values (class labels).
+        Positive-class scores/probabilities in [0, 1]. For a two-column array,
+        column 1 is used; a single-column array is flattened.
+    y : array-like of shape (n_samples,) or (n_samples, 1)
+        Target values containing exactly two distinct class labels.
     dirac_threshold : float, default=1.0e-06
         If a bin in the scores' unsupervised histogram is lower than this
         'dirac_threshold' then it is considered a dirac mass.
@@ -921,23 +1496,70 @@ def build_reliability_diagram(
         - A `matplotlib.figure.Figure`.
         - A `dict` containing two `matplotlib.axes.Axes` with keys, "reliability
           diagram" and "score_distribution".
+
+    Raises
+    ------
+    ValueError
+        If inputs violate the :ref:`input-requirements`, scores fall outside
+        [0, 1], labels are not binary, sample counts differ, or plotting
+        thresholds are invalid.
+    TypeError
+        A plotting threshold is not a real number.
+
+    Notes
+    -----
+    .. rubric:: Input requirements
+
+    All score columns must contain values in [0, 1], including unused columns.
+    Labels must contain exactly two distinct classes and match the score sample
+    count. Plotting thresholds must be finite, positive real numbers, not
+    booleans. See :ref:`input-requirements` for common score and label rules.
+
+    .. rubric:: Figure lifecycle
+
+    The figure remains open on success and is closed if construction fails after
+    the base plot has been created.
     """
     # Check the input parameters
-    if len(y_scores.shape) > 2:
+    for name, value in (
+        ("dirac_threshold", dirac_threshold),
+        ("log_plot_threshold", log_plot_threshold),
+        ("min_density_bar_width", min_density_bar_width),
+    ):
+        _check_real_values(value, name)
+        try:
+            is_valid = (
+                not isinstance(value, (bool, np.bool_))
+                and math.isfinite(value)
+                and value > 0.0
+            )
+        except TypeError as error:
+            raise TypeError(f"'{name}' must be a real number.") from error
+        except OverflowError:
+            is_valid = False
+        if not is_valid:
+            raise ValueError(f"'{name}' must be finite and positive.")
+    y_scores = _as_score_array(y_scores, "y_scores")
+    if y_scores.ndim not in (1, 2) or (
+        y_scores.ndim == 2 and y_scores.shape[1] not in (1, 2)
+    ):
         raise ValueError(
-            "'y_scores' must be either a 1-D or 2-D array-like object, "
+            "'y_scores' must be 1-D or 2-D with one or two columns, "
             f"but its shape is {y_scores.shape}"
         )
-    if len(y.shape) > 1:
+    y = _as_1d_array(y, "y")
+    _check_no_missing_values(y, "y")
+    check_consistent_length(y_scores, y)
+    _check_no_infinite_values(y_scores, "y_scores")
+    if np.any(y_scores < 0) or np.any(y_scores > 1):
+        raise ValueError("'y_scores' must be in the range [0, 1].")
+    if len(np.unique(y)) != 2:
         raise ValueError(
-            f"'y' must be a 1-D array-like object, but its shape is {y.shape}"
+            "Reliability diagrams require exactly two distinct target labels in 'y'."
         )
-    if dirac_threshold <= 0.0:
-        raise ValueError("'dirac_threshold' must be positive")
-    if log_plot_threshold <= 0.0:
-        raise ValueError("'log_plot_threshold' must be positive")
-    if min_density_bar_width <= 0.0:
-        raise ValueError("'min_density_bar_width' must be positive")
+    # Normalize positive-class scores for all histogram computations
+    if y_scores.ndim == 2:
+        y_scores = y_scores[:, -1]
 
     # Create the base plot
     fig, axs = plt.subplot_mosaic(
@@ -946,124 +1568,128 @@ def build_reliability_diagram(
         height_ratios=(4, 1),
         sharex=True,
     )
-    fig.subplots_adjust(hspace=0)
-    fig.suptitle("Reliability Diagram")
+    try:
+        fig.subplots_adjust(hspace=0)
+        fig.suptitle("Reliability Diagram")
 
-    # Build a unsupervised histogram
-    uhist_y_scores = Histogram.from_data(y_scores, use_finest=True)
+        # Build an unsupervised histogram and identify Dirac masses
+        uhist_y_scores = Histogram.from_data(y_scores, use_finest=True)
+        dirac_indexes = compute_dirac_indexes(uhist_y_scores, dirac_threshold)
 
-    # Compute the dirac mass indexes
-    dirac_indexes = compute_dirac_indexes(uhist_y_scores, dirac_threshold)
+        # Compute the supervised score histogram
+        hist_y_scores = Histogram.from_data(y_scores, y)
 
-    # Compute the supervised score histogram
-    hist_y_scores = Histogram.from_data(y_scores, y)
+        # Case where are only dirac masses
+        n_nonzero_bins = sum(freq > 0 for freq in uhist_y_scores.freqs)
+        if sum(dirac_indexes) == n_nonzero_bins:
+            # Compute the dirac masses plot data
+            dirac_masses = [
+                freq / sum(uhist_y_scores.freqs)
+                for freq, is_dirac in zip(
+                    uhist_y_scores.freqs, dirac_indexes, strict=False
+                )
+                if is_dirac
+            ]
+            dirac_locations = [
+                (left + right) / 2
+                for (left, right), is_dirac in zip(
+                    uhist_y_scores.bins, dirac_indexes, strict=False
+                )
+                if is_dirac
+            ]
+            indexes = hist_y_scores.vfind(dirac_locations)
+            target_probas = [hist_y_scores.target_probas[i][1] for i in indexes]
+            axs["reliability_diagram"].scatter(
+                dirac_locations, target_probas, color="tab:red", alpha=0.8
+            )
+            axs["reliability_diagram"].plot(
+                (0, 1), (0, 1), color="tab:grey", linestyle="dotted"
+            )
+            for loc, mass in zip(dirac_locations, dirac_masses, strict=False):
+                axs["score_distribution"].annotate(
+                    "",
+                    xy=(loc, mass),
+                    xytext=(loc, 0.0),
+                    label="dirac masses",
+                    arrowprops={
+                        "arrowstyle": "-|>",
+                        "shrinkA": 0,
+                        "shrinkB": 0,
+                        "color": "tab:blue",
+                    },
+                )
+            axs["score_distribution"].grid(color="gainsboro")
+            axs["score_distribution"].set_xlabel("Score Positive Class")
+            axs["score_distribution"].set_ylabel("Probability")
+        # Case where there are only proper densities or a mix of both
+        else:
+            # Plot the reliability diagram
+            x = []
+            for intv in hist_y_scores.bins:
+                x.extend(intv)
+            x[0] = 0
+            x[-1] = 1
+            y = []
+            for probas in hist_y_scores.target_probas:
+                y.extend((probas[1], probas[1]))
+            axs["reliability_diagram"].plot(x, y)
+            axs["reliability_diagram"].plot(x, x, linestyle="dotted", color="gray")
+            axs["reliability_diagram"].fill_between(x, x, y, color="tab:red", alpha=0.2)
+            axs["reliability_diagram"].set_ylabel("Positive Class Probability")
+            axs["reliability_diagram"].grid(color="gainsboro")
 
-    # Case where are only dirac masses
-    n_nonzero_bins = sum(freq > 0 for freq in uhist_y_scores.freqs)
-    if sum(dirac_indexes) == n_nonzero_bins:
-        # Compute the dirac masses plot data
-        dirac_masses = [
-            freq / sum(uhist_y_scores.freqs)
-            for freq, is_dirac in zip(uhist_y_scores.freqs, dirac_indexes, strict=False)
-            if is_dirac
-        ]
-        dirac_locations = [
-            (left + right) / 2
-            for (left, right), is_dirac in zip(
-                uhist_y_scores.bins, dirac_indexes, strict=False
-            )
-            if is_dirac
-        ]
-        indexes = hist_y_scores.vfind(dirac_locations)
-        target_probas = [hist_y_scores.target_probas[i][1] for i in indexes]
-        axs["reliability_diagram"].scatter(
-            dirac_locations, target_probas, color="tab:red", alpha=0.8
-        )
-        axs["reliability_diagram"].plot(
-            (0, 1), (0, 1), color="tab:grey", linestyle="dotted"
-        )
-        for loc, mass in zip(dirac_locations, dirac_masses, strict=False):
-            axs["score_distribution"].annotate(
-                "",
-                xy=(loc, mass),
-                xytext=(loc, 0.0),
-                label="dirac masses",
-                arrowprops={
-                    "arrowstyle": "-|>",
-                    "shrinkA": 0,
-                    "shrinkB": 0,
-                    "color": "tab:blue",
-                },
-            )
-        axs["score_distribution"].grid(color="gainsboro")
-        axs["score_distribution"].set_xlabel("Score Positive Class")
-        axs["score_distribution"].set_ylabel("Probability")
-    # Case where there are only proper densities or a mix of both
-    else:
-        # Plot the reliability diagram
-        x = []
-        for intv in hist_y_scores.bins:
-            x.extend(intv)
-        x[0] = 0
-        x[-1] = 1
-        y = []
-        for probas in hist_y_scores.target_probas:
-            y.extend((probas[1], probas[1]))
-        axs["reliability_diagram"].plot(x, y)
-        axs["reliability_diagram"].plot(x, x, linestyle="dotted", color="gray")
-        axs["reliability_diagram"].fill_between(x, x, y, color="tab:red", alpha=0.2)
-        axs["reliability_diagram"].set_ylabel("Positive Class Probability")
-        axs["reliability_diagram"].grid(color="gainsboro")
+            # Recompute the density using the most interpretable histogram
+            uhist_y_scores = Histogram.from_data(y_scores)
 
-        # Recompute the density, this time we took the most interpretable histogram
-        uhist_y_scores = Histogram.from_data(y_scores)
-
-        # Plot the density
-        density_bar_starts = [
-            left
-            for (left, _), freq in zip(
-                uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
+            # Plot the density
+            density_bar_starts = [
+                left
+                for (left, _), freq in zip(
+                    uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
+                )
+                if freq > 0
+            ]
+            density_bar_widths = [
+                right - left
+                if right - left >= min_density_bar_width
+                else min_density_bar_width
+                for (left, right), freq in zip(
+                    uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
+                )
+                if freq > 0
+            ]
+            density_bar_heights = [
+                density
+                for density, freq in zip(
+                    uhist_y_scores.densities,
+                    uhist_y_scores.freqs,
+                    strict=True,
+                )
+                if freq > 0
+            ]
+            density_bar_log_range = 0
+            if density_bar_heights:
+                density_bar_log_range = math.log10(
+                    max(density_bar_heights)
+                ) - math.log10(min(density_bar_heights))
+            axs["score_distribution"].bar(
+                x=density_bar_starts,
+                height=density_bar_heights,
+                width=density_bar_widths,
+                align="edge",
+                label="Density",
             )
-            if freq > 0
-        ]
-        density_bar_widths = [
-            right - left
-            if right - left >= min_density_bar_width
-            else min_density_bar_width
-            for (left, right), freq in zip(
-                uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
-            )
-            if freq > 0
-        ]
-        density_bar_heights = [
-            density
-            for density, freq in zip(
-                uhist_y_scores.densities,
-                uhist_y_scores.freqs,
-                strict=True,
-            )
-            if freq > 0
-        ]
-        density_bar_log_range = 0
-        if density_bar_heights:
-            density_bar_log_range = math.log10(max(density_bar_heights)) - math.log10(
-                min(density_bar_heights)
-            )
-        axs["score_distribution"].bar(
-            x=density_bar_starts,
-            height=density_bar_heights,
-            width=density_bar_widths,
-            align="edge",
-            label="Density",
-        )
-        axs["score_distribution"].grid(color="gainsboro")
-        axs["score_distribution"].set_xlabel("Score Positive Class")
-        axs["score_distribution"].set_ylabel("Density")
-        if density_bar_log_range > log_plot_threshold:
-            axs["score_distribution"].set_yscale("log")
-            axs["score_distribution"].yaxis.set_major_locator(
-                LogLocator(base=10, subs=[1], numticks=5)
-            )
+            axs["score_distribution"].grid(color="gainsboro")
+            axs["score_distribution"].set_xlabel("Score Positive Class")
+            axs["score_distribution"].set_ylabel("Density")
+            if density_bar_log_range > log_plot_threshold:
+                axs["score_distribution"].set_yscale("log")
+                axs["score_distribution"].yaxis.set_major_locator(
+                    LogLocator(base=10, subs=[1], numticks=5)
+                )
+    except Exception:
+        plt.close(fig)
+        raise
 
     return fig, axs
 
@@ -1073,45 +1699,29 @@ def compute_dirac_indexes(uhist, dirac_threshold):
 
     We declare a dirac mass bin if:
 
-    - it is surrounded by empty bins or if it is the only one
+    - it contains observations
+    - all existing neighboring bins are empty
     - its length is less than ``dirac_threshold``
 
+    Raises
+    ------
+    ValueError
+        If dirac_threshold is complex.
     """
+    _check_real_values(dirac_threshold, "dirac_threshold")
 
-    # Early return for just one bin
-    if len(uhist.freqs) == 1:
-        if uhist.bins[0][1] - uhist.bins[0][0] < dirac_threshold:
-            return [True]
-        else:
-            return [False]
-
-    # More than one bin
+    # Apply the same isolation rule to interior, edge, and single bins
     dirac_indexes = []
-    if (
-        len(uhist.freqs) > 1
-        and uhist.freqs[1] == 0
-        and (uhist.bins[0][1] - uhist.bins[0][0] < dirac_threshold)
+    for i, (freq, (left, right)) in enumerate(
+        zip(uhist.freqs, uhist.bins, strict=True)
     ):
-        dirac_indexes.append(True)
-    else:
-        dirac_indexes.append(False)
-    for i in range(1, uhist.n_bins - 1):
-        cur_left, cur_right = uhist.bins[i]
-        if (
-            uhist.freqs[i - 1] == 0
-            and uhist.freqs[i + 1] == 0
-            and (cur_right - cur_left < dirac_threshold)
-        ):
-            dirac_indexes.append(True)
-        else:
-            dirac_indexes.append(False)
-    if (
-        len(uhist.freqs) > 1
-        and uhist.freqs[-2] == 0
-        and (uhist.bins[-1][1] - uhist.bins[-1][0] < dirac_threshold)
-    ):
-        dirac_indexes.append(True)
-    else:
-        dirac_indexes.append(False)
+        dirac_indexes.append(
+            bool(
+                freq > 0
+                and (i == 0 or uhist.freqs[i - 1] == 0)
+                and (i == uhist.n_bins - 1 or uhist.freqs[i + 1] == 0)
+                and right - left < dirac_threshold
+            )
+        )
 
     return dirac_indexes

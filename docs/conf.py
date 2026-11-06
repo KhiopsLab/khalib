@@ -24,7 +24,7 @@ extensions = [
 # Basic Sphinx config
 default_role = "obj"
 templates_path = ["_templates"]
-exclude_patterns = []
+exclude_patterns = ["_build"]
 html_theme = "furo"
 html_static_path = ["_static"]
 html_title = f"<h6><center>{project} {release}</center></h6>"
@@ -43,6 +43,18 @@ autodoc_default_options = {
     "show-inheritance": True,
     "special-members": False,
 }
+
+
+def format_inherited_score_docstring(app, what, name, obj, options, lines):
+    """Render upstream parameter mentions as literals, not object references."""
+    if name == "khalib.KhalibClassifier.score":
+        lines[:] = [
+            line.replace("`X`", "``X``").replace("`y`", "``y``") for line in lines
+        ]
+
+
+def setup(app):
+    app.connect("autodoc-process-docstring", format_inherited_score_docstring)
 
 
 ## myst_nb
