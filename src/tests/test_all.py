@@ -1002,6 +1002,152 @@ class TestHistogram:
         with pytest.raises(ValueError, match=f"{argument} must be 1-D"):
             factory(**inputs)
 
+    @pytest.mark.parametrize(
+        ("x", "max_bins", "edges", "counts"),
+        [
+            pytest.param([0, 1, 2, 3, 4], 2, [0, 2.5, 4], [3, 2], id="midpoint"),
+            pytest.param([0, 0, 0, 1], 4, [0, 0.5, 1], [3, 1], id="duplicate-splits"),
+            pytest.param(
+                [0, 1, 1, 1, 10, 20],
+                3,
+                [0, 0.5, 5.5, 20],
+                [1, 3, 2],
+                id="ties-at-split",
+            ),
+            pytest.param([0, 2], 0, [0, 1, 2], [1, 1], id="default-bin-limit"),
+            pytest.param([0, 2], 20, [0, 1, 2], [1, 1], id="more-bins-than-samples"),
+            pytest.param([0, 1, 2], 1, [0, 2], [3], id="single-bin"),
+            pytest.param(
+                list(range(8)),
+                7,
+                [0, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7],
+                [2, 1, 1, 1, 1, 1, 1],
+                id="exact-quantile-ranks",
+            ),
+            pytest.param(
+                [1.0, np.nextafter(1.0, np.inf)],
+                2,
+                [1.0, np.nextafter(1.0, np.inf)],
+                [2],
+                id="no-representable-midpoint",
+            ),
+            pytest.param(
+                [2**53, 2**53 + 2, 2**53 + 4],
+                2,
+                [2**53, 2**53 + 3, 2**53 + 4],
+                [2, 1],
+                id="exact-integer-midpoint",
+            ),
+        ],
+    )
+    def test_equal_frequency_quantiles(self, x, max_bins, edges, counts):
+        histogram = Histogram.from_data(x, method="eq-freq", max_bins=max_bins)
+        assert histogram.breakpoints == edges
+        assert histogram.freqs == counts
+
+    @pytest.mark.parametrize(
+        ("x", "midpoint"),
+        [
+            pytest.param(
+                [-(2**100), 2**100 - 1], -0.5, id="negative-midpoint-cancellation"
+            ),
+            pytest.param(
+                [-(2**100) + 1, 2**100], 0.5, id="positive-midpoint-cancellation"
+            ),
+            pytest.param([0.025, 0.2], 0.1125, id="rounded-float-midpoint"),
+            pytest.param(
+                [-5.0e-324, 1.5e-323], 5.0e-324, id="subnormal-float-midpoint"
+            ),
+            pytest.param([1.0e308, 1.6e308], 1.3e308, id="overflowing-float-midpoint"),
+        ],
+    )
+    def test_equal_frequency_midpoints(self, x, midpoint):
+        histogram = Histogram.from_data(x, method="eq-freq", max_bins=2)
+        assert histogram.breakpoints == [x[0], midpoint, x[1]]
+        assert histogram.freqs == [1, 1]
+
+    @pytest.mark.parametrize(
+        ("score_counts", "edges", "counts", "target_freqs"),
+        [
+            pytest.param(
+                [49, 50, 1],
+                [0, 0.25, 1],
+                [49, 51],
+                [(49, 0), (0, 51)],
+                id="near-balanced",
+            ),
+            pytest.param(
+                [40, 50, 10],
+                [0, 0.25, 1],
+                [40, 60],
+                [(40, 0), (0, 60)],
+                id="closer-left",
+            ),
+            pytest.param(
+                [10, 50, 40],
+                [0, 0.75, 1],
+                [60, 40],
+                [(10, 50), (0, 40)],
+                id="closer-right",
+            ),
+            pytest.param(
+                [1, 0, 99],
+                [0, 0.5, 1],
+                [1, 99],
+                [(1, 0), (0, 99)],
+                id="dominant-maximum",
+            ),
+            pytest.param(
+                [99, 0, 1],
+                [0, 0.5, 1],
+                [99, 1],
+                [(99, 0), (0, 1)],
+                id="dominant-minimum",
+            ),
+        ],
+    )
+    def test_equal_frequency_balances_tied_scores(
+        self, score_counts, edges, counts, target_freqs
+    ):
+        x = np.repeat([0.0, 0.5, 1.0], score_counts)
+        y = np.repeat([0, 1, 1], score_counts)
+        histogram = Histogram.from_data(x, y, method="eq-freq", max_bins=2)
+        assert histogram.breakpoints == edges
+        assert histogram.freqs == counts
+        assert histogram.target_freqs == target_freqs
+
+    def test_supervised_equal_frequency_does_not_run_khiops(self, monkeypatch):
+        def unexpected_execution(*args, **kwargs):
+            pytest.fail("Equal-frequency binning must not invoke Khiops")
+
+        monkeypatch.setattr(khalib_main.kh, "train_predictor", unexpected_execution)
+        histogram = Histogram.from_data(
+            [0, 1, 2, 3, 4], [10, 2, 3, 10, 2], method="eq-freq", max_bins=2
+        )
+        assert histogram.breakpoints == [0, 2.5, 4]
+        assert histogram.freqs == [3, 2]
+        assert histogram.classes == [2, 3, 10]
+        assert histogram.target_freqs == [(1, 1, 1), (1, 0, 1)]
+
+    @pytest.mark.parametrize(
+        "x",
+        [
+            pytest.param([np.finfo(float).max] * 2, id="constant-float-limit"),
+            pytest.param([-np.finfo(float).max, np.finfo(float).max], id="float-span"),
+            pytest.param([2**53 + i for i in range(1, 32)], id="large-integers"),
+        ],
+    )
+    def test_equal_frequency_extreme_scores_preserve_statistics(self, x):
+        y = np.arange(len(x)) % 2
+        histogram = Histogram.from_data(x, y, method="eq-freq", max_bins=2)
+        assert histogram.n_bins <= 2
+        assert np.isfinite(histogram.breakpoints).all()
+        assert histogram.breakpoints[0] <= min(x)
+        assert histogram.breakpoints[-1] >= max(x)
+        assert histogram == Histogram.from_data_and_breakpoints(
+            x, histogram.breakpoints, y
+        )
+
     all_cases = [
         ("eq-freq", "bool", True),
         ("eq-freq", "float", True),

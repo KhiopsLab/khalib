@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Compute equal-frequency histogram bins with NumPy instead of invoking Khiops.
+  Inner boundaries are midpoints between adjacent distinct observations at quantile splits.
+  Splits choose the closest valid side of tied groups; duplicate splits and gaps without a
+  representable midpoint are merged.
+
 ## [0.7] - 2026-11-06
 
 ### Added

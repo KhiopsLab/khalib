@@ -198,6 +198,52 @@ def _count_target_frequencies(bin_indexes, class_indexes, n_bins, n_classes):
     return [tuple(freqs) for freqs in target_freqs]
 
 
+def _equal_frequency_histogram(x, n_bins):
+    """Returns counts and midpoint edges at approximately equal-frequency splits."""
+    if np.all(x == x[0]):
+        value = x[0] if isinstance(x[0], int) else float(x[0])
+        upper = math.nextafter(value, math.inf)
+        edges = (
+            [value, upper]
+            if math.isfinite(upper)
+            else [math.nextafter(value, -math.inf), value]
+        )
+        return [len(x)], edges
+
+    # Choose the closest valid side of each tied group at the quantile ranks.
+    sorted_x = np.sort(x)
+    n_bins = min(n_bins, len(x))
+    ranks = np.array(
+        [i * (len(x) - 1) // n_bins for i in range(1, n_bins)], dtype=np.intp
+    )
+    left_splits = np.searchsorted(sorted_x, sorted_x[ranks], side="left")
+    right_splits = np.searchsorted(sorted_x, sorted_x[ranks], side="right")
+    target_counts = ranks + 1
+    use_left = (left_splits > 0) & (
+        (right_splits == len(x))
+        | (target_counts - left_splits < right_splits - target_counts)
+    )
+    splits = np.unique(np.where(use_left, left_splits, right_splits))
+    lower, upper = sorted_x[[0, -1]].tolist()
+    edges = [lower]
+    for split in splits:
+        left, right = sorted_x[split - 1 : split + 1].tolist()
+        # Preserve integer precision and halve first only to avoid float overflow.
+        total = left + right
+        if isinstance(total, int):
+            midpoint = total // 2 if total % 2 == 0 else total / 2
+        elif math.isfinite(total):
+            midpoint = total / 2
+        else:
+            midpoint = left / 2 + right / 2
+        if left < midpoint < right:
+            edges.append(midpoint)
+    edges.append(upper)
+    bin_indexes = _find_bin_indexes(edges, x)
+    freqs = np.bincount(bin_indexes, minlength=len(edges) - 1)
+    return freqs.tolist(), edges
+
+
 def _validate_nonempty_bin_scores(histogram, y_scores, operation):
     """Rejects score samples that map to empty bins."""
     bin_indexes = histogram.vfind(y_scores)
@@ -321,7 +367,7 @@ class Histogram:
         max_bins: int = 0,
         use_finest: bool = False,
     ) -> "Histogram":
-        """Computes a histogram of an 1D vector via Khiops
+        """Computes a histogram of a 1D vector
 
         Parameters
         ----------
@@ -333,9 +379,8 @@ class Histogram:
             Histogram method:
 
             - "khiops": A non-parametric regularized histogram method.
-            - "eq-freq": All bins have the same number of elements. If many instances
-              have too many values the algorithm will put it in its own bin, which will
-              be larger than the other ones.
+            - "eq-freq": Bins have approximately equal frequencies, with boundaries
+              midway between adjacent distinct scores. Equal scores stay together.
             - "eq-width": All bins have the same width.
 
             For "eq-freq" and "eq-width", y does not affect the bin boundaries.
@@ -387,9 +432,24 @@ class Histogram:
             raise ValueError(
                 f"method must be in {list(khiops_methods)}. It is '{method}'"
             )
+        if method == "eq-freq":
+            freqs, breakpoints = _equal_frequency_histogram(x, max_bins or 10)
+            if y is None:
+                return cls(breakpoints=breakpoints, freqs=freqs)
+            le = LabelEncoder().fit(y)
+            bin_indexes = _find_bin_indexes(breakpoints, x)
+            target_freqs = _count_target_frequencies(
+                bin_indexes, le.transform(y), len(freqs), len(le.classes_)
+            )
+            return cls(
+                breakpoints=breakpoints,
+                freqs=freqs,
+                target_freqs=target_freqs,
+                classes=le.classes_.tolist(),
+            )
         khiops_method = khiops_methods[method]
 
-        # Supplying a target would make Khiops ignore equal-frequency/width binning
+        # Supplying a target would make Khiops ignore equal-width binning
         y_khiops = y if method == "khiops" else None
 
         # Create Khiops dictionary
@@ -485,7 +545,7 @@ class Histogram:
                 ]
             # Unsupervised khiops execution
             else:
-                # Case 'eq-freq' or 'eq-width'
+                # Case 'eq-width'
                 if score_stats.modl_histograms is None:
                     # Create the breakpoints
                     breakpoints = [
@@ -840,9 +900,8 @@ def calibration_error(
 
         - "khiops": A non-parametric regularized histogram method. It finds the best
           histogram such that the distribution of the target is constant in each bin.
-        - "eq-freq": All bins have the same number of elements. If many instances
-          have too many values the algorithm will put it in its own bin, which will be
-          larger than the other ones.
+        - "eq-freq": Bins have approximately equal frequencies, with boundaries
+          midway between adjacent distinct scores. Equal scores stay together.
         - "eq-width": All bins have the same width.
 
         For "eq-freq" and "eq-width", y does not affect the bin boundaries.
