@@ -13,6 +13,7 @@ from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from scipy.sparse import coo_matrix, csr_matrix, dok_matrix, lil_matrix
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.datasets import make_classification
 from sklearn.exceptions import NotFittedError
 from sklearn.linear_model import LogisticRegression
@@ -1964,6 +1965,12 @@ def _fail_second_histogram(monkeypatch):
     monkeypatch.setattr(Histogram, "from_data", failing_histogram)
 
 
+def _ovo_svc(probability):
+    # SVC(probability=True) is deprecated; wrap it to get predict_proba instead
+    svc = SVC(decision_function_shape="ovo", random_state=0)
+    return CalibratedClassifierCV(svc, ensemble=False) if probability else svc
+
+
 class TestKhalibClassifier:
     @pytest.mark.parametrize("random_state", [True, np.bool_(True)])
     def test_fit_rejects_boolean_random_state(self, random_state):
@@ -2106,8 +2113,8 @@ class TestKhalibClassifier:
         x = np.arange(120).reshape(-1, 1)
         y = np.tile(np.arange(n_classes), 120 // n_classes)
         estimator = search_type(
-            SVC(decision_function_shape="ovo", probability=probability, random_state=0),
-            {"C": [1.0]},
+            _ovo_svc(probability),
+            {"estimator__C": [1.0]} if probability else {"C": [1.0]},
             cv=2,
             **({"n_iter": 1} if search_type is RandomizedSearchCV else {}),
         ).fit(x, y)
@@ -2163,9 +2170,7 @@ class TestKhalibClassifier:
         # The OVO setting does not affect binary scores or predict_proba columns
         x = np.arange(120).reshape(-1, 1)
         y = np.tile(np.arange(n_classes), 120 // n_classes)
-        estimator = SVC(
-            decision_function_shape="ovo", probability=probability, random_state=0
-        )
+        estimator = _ovo_svc(probability)
         for _ in range(pipeline_depth):
             estimator = make_pipeline(StandardScaler(), estimator)
         estimator.fit(x, y)
