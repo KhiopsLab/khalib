@@ -21,7 +21,7 @@ from matplotlib.ticker import LogLocator
 from scipy.sparse import issparse
 from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin, clone
 from sklearn.exceptions import NotFittedError
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, train_test_split
 from sklearn.model_selection._search import BaseSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, label_binarize
@@ -869,6 +869,10 @@ def calibration_error(
     multi_class_method: str = "top-label",
     histogram: Histogram | None = None,
     reuse_stats: bool = False,
+    *,
+    correction: str = "v-ece",
+    n_splits: int = 5,
+    random_state=0,
 ):
     r"""Estimates the ECE via binning
 
@@ -887,7 +891,8 @@ def calibration_error(
     y : array-like of shape (n_samples,) or (n_samples, 1)
         Target values (class labels).
     method : {"label-bin", "bin"}, default="label-bin"
-        ECE estimation method. See below for details.
+        ECE estimation method. With ``correction="v-ece"``, selects either a
+        sample-wise label-bin direction or a uniform bin-level direction.
     multi_class_method : {"top-label", "classwise"}, default="top-label"
         Multi-class ECE estimation method:
 
@@ -919,6 +924,13 @@ def calibration_error(
         Reuse the supplied histogram's statistics without recomputing them. Set
         this to True only if it was built from the same scores and labels used
         for this ECE computation. Has no effect when histogram is None.
+    correction : {"none", "v-ece"}, default="v-ece"
+        Use the existing ECE estimator or the cross-fitted V-ECE heuristic.
+        V-ECE estimates the projection using fold-specific training histograms.
+    n_splits : int, default=5
+        Number of shuffled, unstratified folds used by V-ECE.
+    random_state : int, RandomState instance or None, default=0
+        Random seed used to shuffle V-ECE folds.
 
     Raises
     ------
@@ -940,6 +952,25 @@ def calibration_error(
 
     Both method and multi_class_method must be supported. When no histogram is
     supplied, max_bins must be a nonnegative integer.
+
+    V-ECE requires scores in [0, 1], does not accept a supplied histogram or
+    reused statistics, and does not support classwise multiclass estimation.
+    Its training histograms are fit independently on each training complement;
+    samples in bins empty in that complement have zero direction. Signed
+    projections are aggregated over all samples before clipping at zero. The
+    unclipped projection has zero expectation for a calibrated model under
+    independent sampling and label-independent folds; clipping generally
+    creates positive bias. Cross-fitting avoids evaluating on labels used to fit
+    the histogram but does not correct leakage from training the scored model.
+    These expectation statements use a fixed binary label encoding and do not
+    condition on the requirement that the input contains both binary outcomes
+    or, for top-label ECE, both correct and incorrect predictions.
+
+    With V-ECE, ``method="label-bin"`` compares each held-out score to the
+    training-fold label mean in its bin. ``method="bin"`` compares the training
+    fold's mean score and mean label in that bin, applying that direction to
+    every held-out sample in the bin. Cross-fitting does not remove the
+    approximation error of a coarse or misspecified histogram.
 
     .. rubric:: Histogram statistics
 
@@ -1004,6 +1035,21 @@ def calibration_error(
     # Validate estimation methods before computing histogram statistics
     if not isinstance(reuse_stats, (bool, np.bool_)):
         raise TypeError("'reuse_stats' must be a boolean.")
+    if correction not in ("none", "v-ece"):
+        raise ValueError(f"'correction' must be 'none' or 'v-ece'. Got {correction!r}.")
+    if correction == "v-ece":
+        if histogram is not None:
+            raise ValueError("'histogram' is not supported with V-ECE.")
+        if reuse_stats:
+            raise ValueError("'reuse_stats' is not supported with V-ECE.")
+        if isinstance(n_splits, (bool, np.bool_)) or not isinstance(
+            n_splits, (int, np.integer)
+        ):
+            raise ValueError("'n_splits' must be an integer of at least 2.")
+        if n_splits < 2:
+            raise ValueError(f"'n_splits' must be at least 2. It is {n_splits}.")
+        if isinstance(random_state, (bool, np.bool_)):
+            raise TypeError("'random_state' must not be a boolean.")
     if histogram is None:
         max_bins = _validate_max_bins(max_bins)
     if method not in ("label-bin", "bin"):
@@ -1025,6 +1071,12 @@ def calibration_error(
         )
     check_consistent_length(y_scores, y)
     _check_no_infinite_values(y_scores, "y_scores")
+    if correction == "v-ece" and (np.any(y_scores < 0) or np.any(y_scores > 1)):
+        raise ValueError("'y_scores' must contain values in [0, 1] with V-ECE.")
+    if correction == "v-ece" and n_splits > len(y):
+        raise ValueError(
+            f"'n_splits' must not exceed the number of samples ({len(y)})."
+        )
 
     # Keep reusable histogram statistics restricted to binary score inputs
     if reuse_stats and y_scores.ndim == 2 and y_scores.shape[1] > 2:
@@ -1037,6 +1089,17 @@ def calibration_error(
             raise ValueError(
                 "Binary ECE requires exactly two distinct target labels in 'y'."
             )
+        if correction == "v-ece":
+            binary_y = LabelEncoder().fit_transform(y)
+            return _binary_v_ece(
+                binary_scores,
+                binary_y,
+                method=method,
+                histogram_method=histogram_method,
+                max_bins=max_bins,
+                n_splits=n_splits,
+                random_state=random_state,
+            )
         return _binary_ece(
             binary_scores,
             y,
@@ -1048,6 +1111,8 @@ def calibration_error(
         )
     # 2-D array with > 2 columns: Multi-class ECE
     else:
+        if correction == "v-ece" and multi_class_method == "classwise":
+            raise ValueError("'multi_class_method' must be 'top-label' with V-ECE.")
         le = LabelEncoder().fit(y)
         if len(le.classes_) != y_scores.shape[1]:
             raise ValueError(
@@ -1062,6 +1127,16 @@ def calibration_error(
             if len(np.unique(y_preds)) != 2:
                 raise ValueError(
                     "Top-label ECE requires both correct and incorrect predictions."
+                )
+            if correction == "v-ece":
+                return _binary_v_ece(
+                    y_pred_scores,
+                    y_preds,
+                    method=method,
+                    histogram_method=histogram_method,
+                    max_bins=max_bins,
+                    n_splits=n_splits,
+                    random_state=random_state,
                 )
             return _binary_ece(
                 y_pred_scores,
@@ -1095,6 +1170,54 @@ def calibration_error(
                 )
             class_probas = np.unique(y, return_counts=True)[1] / len(y)
             return float(np.dot(class_eces, class_probas))
+
+
+def _binary_v_ece(
+    y_scores,
+    y,
+    method: str,
+    histogram_method: str,
+    max_bins: int,
+    n_splits: int,
+    random_state,
+):
+    """Estimates binary V-ECE from cross-fitted histogram directions."""
+    y_scores = np.asarray(y_scores, dtype=float)
+    y = np.asarray(y, dtype=np.int8)
+    splitter = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    signed_projection = 0.0
+
+    for train_indexes, eval_indexes in splitter.split(y_scores):
+        # Fit bins on the training complement only
+        train_scores = y_scores[train_indexes]
+        train_labels = y[train_indexes]
+        eval_scores = y_scores[eval_indexes]
+        histogram = Histogram.from_data(
+            train_scores, y=train_labels, method=histogram_method, max_bins=max_bins
+        )
+        n_bins = histogram.n_bins
+        train_bins = histogram.vfind(train_scores)
+        eval_bins = histogram.vfind(eval_scores)
+
+        # Training means per bin; empty bins get zero direction below
+        counts = np.bincount(train_bins, minlength=n_bins)
+        nonempty = counts > 0
+        label_means = np.zeros(n_bins)
+        score_means = np.zeros(n_bins)
+        label_sums = np.bincount(train_bins, weights=train_labels, minlength=n_bins)
+        score_sums = np.bincount(train_bins, weights=train_scores, minlength=n_bins)
+        label_means[nonempty] = label_sums[nonempty] / counts[nonempty]
+        score_means[nonempty] = score_sums[nonempty] / counts[nonempty]
+
+        # Out-of-fold direction times held-out residual
+        if method == "label-bin":
+            directions = np.sign(eval_scores - label_means[eval_bins])
+        else:
+            directions = np.sign(score_means[eval_bins] - label_means[eval_bins])
+        directions = np.where(nonempty[eval_bins], directions, 0)
+        signed_projection += np.dot(directions, eval_scores - y[eval_indexes])
+
+    return max(0.0, float(signed_projection / len(y)))
 
 
 def _binary_ece(
