@@ -867,8 +867,6 @@ def calibration_error(
     histogram_method: str = "khiops",
     max_bins: int = 0,
     multi_class_method: str = "top-label",
-    histogram: Histogram | None = None,
-    reuse_stats: bool = False,
     *,
     correction: str = "v-ece",
     n_splits: int = 5,
@@ -916,14 +914,6 @@ def calibration_error(
 
         - For "khiops": that there is no limit to the number of intervals.
         - For "eq-freq" or "eq-width": that 10 is the maximum number of intervals.
-    histogram : `Histogram`, optional
-        A histogram providing the bin boundaries. If set, histogram_method and
-        max_bins are ignored. Bin and target frequencies are recomputed from
-        y_scores and y unless reuse_stats is True.
-    reuse_stats : bool, default=False
-        Reuse the supplied histogram's statistics without recomputing them. Set
-        this to True only if it was built from the same scores and labels used
-        for this ECE computation. Has no effect when histogram is None.
     correction : {"none", "v-ece"}, default="v-ece"
         Use the existing ECE estimator or the cross-fitted V-ECE heuristic.
         V-ECE estimates the projection using fold-specific training histograms.
@@ -935,10 +925,10 @@ def calibration_error(
     Raises
     ------
     ValueError
-        If inputs violate the :ref:`input-requirements` or the estimation and
-        histogram requirements described in Notes.
+        If inputs violate the :ref:`input-requirements` or the estimation
+        requirements described in Notes.
     TypeError
-        ``reuse_stats`` is not a boolean.
+        ``random_state`` is a boolean.
 
     Notes
     -----
@@ -950,11 +940,11 @@ def calibration_error(
     negative examples for each class. Scores and labels must have matching sample
     counts. See :ref:`input-requirements` for common score and label rules.
 
-    Both method and multi_class_method must be supported. When no histogram is
-    supplied, max_bins must be a nonnegative integer.
+    Both method and multi_class_method must be supported, and max_bins must be a
+    nonnegative integer.
 
-    V-ECE requires scores in [0, 1], does not accept a supplied histogram or
-    reused statistics, and does not support classwise multiclass estimation.
+    V-ECE requires scores in [0, 1] and does not support classwise multiclass
+    estimation.
     Its training histograms are fit independently on each training complement;
     samples in bins empty in that complement have zero direction. Signed
     projections are aggregated over all samples before clipping at zero. The
@@ -971,13 +961,6 @@ def calibration_error(
     fold's mean score and mean label in that bin, applying that direction to
     every held-out sample in the bin. Cross-fitting does not remove the
     approximation error of a coarse or misspecified histogram.
-
-    .. rubric:: Histogram statistics
-
-    Reusing statistics is supported only for binary scores and requires target
-    frequencies for two classes in the same order as the sorted labels in y.
-    Scores mapping to empty histogram bins are rejected, including before any
-    supplied statistics are refreshed.
 
     .. rubric:: Mathematical definition
 
@@ -1033,15 +1016,9 @@ def calibration_error(
 
     """
     # Validate estimation methods before computing histogram statistics
-    if not isinstance(reuse_stats, (bool, np.bool_)):
-        raise TypeError("'reuse_stats' must be a boolean.")
     if correction not in ("none", "v-ece"):
         raise ValueError(f"'correction' must be 'none' or 'v-ece'. Got {correction!r}.")
     if correction == "v-ece":
-        if histogram is not None:
-            raise ValueError("'histogram' is not supported with V-ECE.")
-        if reuse_stats:
-            raise ValueError("'reuse_stats' is not supported with V-ECE.")
         if isinstance(n_splits, (bool, np.bool_)) or not isinstance(
             n_splits, (int, np.integer)
         ):
@@ -1050,8 +1027,7 @@ def calibration_error(
             raise ValueError(f"'n_splits' must be at least 2. It is {n_splits}.")
         if isinstance(random_state, (bool, np.bool_)):
             raise TypeError("'random_state' must not be a boolean.")
-    if histogram is None:
-        max_bins = _validate_max_bins(max_bins)
+    max_bins = _validate_max_bins(max_bins)
     if method not in ("label-bin", "bin"):
         raise ValueError(f"'method' must be 'label-bin' or 'bin'. Got {method!r}.")
     if multi_class_method not in ("top-label", "classwise"):
@@ -1078,10 +1054,6 @@ def calibration_error(
             f"'n_splits' must not exceed the number of samples ({len(y)})."
         )
 
-    # Keep reusable histogram statistics restricted to binary score inputs
-    if reuse_stats and y_scores.ndim == 2 and y_scores.shape[1] > 2:
-        raise ValueError("'reuse_stats' is not supported for multiclass scores.")
-
     # Binary ECE uses the positive-class column when two columns are supplied
     if y_scores.ndim == 1 or y_scores.shape[1] <= 2:
         binary_scores = y_scores if y_scores.ndim == 1 else y_scores[:, -1]
@@ -1106,8 +1078,6 @@ def calibration_error(
             method=method,
             histogram_method=histogram_method,
             max_bins=max_bins,
-            histogram=histogram,
-            reuse_stats=reuse_stats,
         )
     # 2-D array with > 2 columns: Multi-class ECE
     else:
@@ -1144,8 +1114,6 @@ def calibration_error(
                 method=method,
                 histogram_method=histogram_method,
                 max_bins=max_bins,
-                histogram=histogram,
-                reuse_stats=reuse_stats,
             )
         else:
             assert multi_class_method == "classwise"
@@ -1164,8 +1132,6 @@ def calibration_error(
                         method=method,
                         histogram_method=histogram_method,
                         max_bins=max_bins,
-                        histogram=histogram,
-                        reuse_stats=reuse_stats,
                     )
                 )
             class_probas = np.unique(y, return_counts=True)[1] / len(y)
@@ -1232,61 +1198,23 @@ def _binary_ece(
     method: str = "label-bin",
     histogram_method: str = "khiops",
     max_bins: int = 0,
-    histogram: Histogram | None = None,
-    reuse_stats: bool = False,
 ):
     """Estimates the ECE for a 2-class problem
 
     See the function `calibration_error` docstring for more details.
     """
-    # Normalize binary scores and labels
     y_scores = _as_1d_array(y_scores, "y_scores")
     y = _as_1d_array(y, "y")
     assert len(np.unique(y)) == 2
 
-    # Validate supplied statistics before any refresh can populate empty bins
-    supplied_histogram = histogram is not None
-    if supplied_histogram:
-        bin_indexes = _validate_nonempty_bin_scores(
-            histogram, y_scores, operation="compute ECE for"
-        )
-
-    # Build or refresh statistics unless reuse is explicitly requested
-    if histogram is None:
-        histogram = Histogram.from_data(
-            y_scores, y=y, method=histogram_method, max_bins=max_bins
-        )
-    elif not reuse_stats:
-        histogram = Histogram.from_data_and_breakpoints(
-            y_scores,
-            histogram.breakpoints,
-            y=y,
-        )
-
-    # Require target statistics for exactly two classes
-    if not histogram.target_freqs:
-        raise ValueError("'histogram' must have target statistics.")
-    if (n_classes := len(histogram.classes)) != 2:
-        raise ValueError(
-            f"The histogram must have exactly 2 target classes. It has {n_classes}."
-        )
-    expected_classes = LabelEncoder().fit(y).classes_
-    if reuse_stats and not np.array_equal(histogram.classes, expected_classes):
-        raise ValueError(
-            "Reused binary histogram classes must match the sorted distinct labels "
-            f"in 'y'. Got {histogram.classes!r}; expected "
-            f"{expected_classes.tolist()!r}."
-        )
-
-    # Validate the constructed histogram when no statistics were supplied
-    if not supplied_histogram:
-        bin_indexes = _validate_nonempty_bin_scores(
-            histogram, y_scores, operation="compute ECE for"
-        )
+    # Build the histogram and map each score to its bin
+    histogram = Histogram.from_data(
+        y_scores, y=y, method=histogram_method, max_bins=max_bins
+    )
+    bin_indexes = histogram.vfind(y_scores)
 
     # Estimate the ECE with the histogram
     y_scores = np.asarray(y_scores, dtype=float)
-    bin_indexes = np.asarray(bin_indexes, dtype=int)
     positive_freqs = np.array(
         [freqs[1] for freqs in histogram.target_freqs], dtype=float
     )

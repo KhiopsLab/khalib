@@ -9,11 +9,16 @@
 ### Changed
 
 - Make `calibration_error` use V-ECE by default. Pass `correction="none"` for the previous
-  estimator, which is required with `histogram`, `reuse_stats` or classwise multiclass ECE.
+  estimator, which is required for classwise multiclass ECE.
 - Compute equal-frequency histogram bins with NumPy instead of invoking Khiops.
   Inner boundaries are midpoints between adjacent distinct observations at quantile splits.
   Splits choose the closest valid side of tied groups; duplicate splits and gaps without a
   representable midpoint are merged.
+
+### Removed
+
+- Remove the `histogram` and `reuse_stats` parameters of `calibration_error`. The histogram is
+  always built from the supplied scores and labels.
 
 ## [0.7] - 2026-11-06
 

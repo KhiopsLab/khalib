@@ -254,16 +254,6 @@ def test_calibration_error_rejects_invalid_max_bins(value):
         calibration_error([0.1, 0.9], [0, 1], max_bins=value)
 
 
-@pytest.mark.parametrize("max_bins", [1.5, np.inf, np.nan, True, "2", -1])
-def test_calibration_error_ignores_max_bins_with_histogram(max_bins):
-    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
-    expected = legacy_ece([0.1, 0.9], [0, 1], histogram=histogram)
-    assert (
-        legacy_ece([0.1, 0.9], [0, 1], histogram=histogram, max_bins=max_bins)
-        == expected
-    )
-
-
 def test_histogram_accepts_numpy_integer_max_bins():
     histogram = Histogram.from_data([0.1, 0.9], method="eq-width", max_bins=np.int64(2))
     assert histogram.n_bins <= 2
@@ -280,22 +270,6 @@ def test_histogram_accepts_numpy_boolean_use_finest():
         [0.1, 0.9], method="eq-width", use_finest=np.bool_(True)
     )
     assert histogram.n_bins > 0
-
-
-@pytest.mark.parametrize("reuse_stats", ["yes", 1, None])
-def test_calibration_error_rejects_nonboolean_reuse_stats(reuse_stats):
-    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
-    with pytest.raises(TypeError, match="'reuse_stats' must be a boolean"):
-        calibration_error(
-            [0.1, 0.9], [0, 1], histogram=histogram, reuse_stats=reuse_stats
-        )
-
-
-def test_calibration_error_accepts_numpy_boolean_reuse_stats():
-    histogram = Histogram([0.0, 1.0], [2], [(1, 1)], [0, 1])
-    assert legacy_ece(
-        [0.1, 0.9], [0, 1], histogram=histogram, reuse_stats=np.bool_(True)
-    ) == pytest.approx(0.4)
 
 
 def test_dirac_rejects_complex_threshold():
@@ -806,7 +780,7 @@ class TestHistogram:
                 Histogram.from_data_and_breakpoints, breakpoints=[0.0, 1.0]
             ),
             "vfind": histogram.vfind,
-            "ece": partial(legacy_ece, y=[0, 1], histogram=histogram),
+            "ece": partial(legacy_ece, y=[0, 1]),
             "calibrate": partial(calibrate_binary, histogram=histogram),
             "diagram": partial(build_reliability_diagram, y=[0, 1]),
         }[api]
@@ -1574,8 +1548,6 @@ class TestECE:
             ({"n_splits": 2.5}, ValueError, "must be an integer"),
             ({"n_splits": True}, ValueError, "must be an integer"),
             ({"random_state": True}, TypeError, "must not be a boolean"),
-            ({"histogram": Histogram([0.0, 1.0], [2])}, ValueError, "not supported"),
-            ({"reuse_stats": True}, ValueError, "not supported"),
         ],
     )
     def test_v_ece_rejects_unsupported_options(self, kwargs, error, match):
@@ -1625,58 +1597,14 @@ class TestECE:
             scores, labels, **kwargs
         )
 
-    @pytest.mark.parametrize("multi_class_method", ["top-label", "classwise"])
-    @pytest.mark.parametrize("supply_histogram", [False, True])
-    def test_rejects_reused_statistics_for_multiclass_scores(
-        self, multi_class_method, supply_histogram
-    ):
-        scores = [[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]
-        histogram = Histogram(breakpoints=[0.0, 1.0], freqs=[3])
-        with pytest.raises(
-            ValueError, match="'reuse_stats' is not supported for multiclass scores"
-        ):
-            legacy_ece(
-                scores,
-                [0, 1, 2],
-                multi_class_method=multi_class_method,
-                histogram=histogram if supply_histogram else None,
-                reuse_stats=True,
-            )
-
-    @pytest.mark.parametrize("method", ["bin", "label-bin"])
-    @pytest.mark.parametrize("labels", [[0, 1], ["no", "yes"]])
-    @pytest.mark.parametrize("reuse_stats", [False, True])
-    def test_rejects_scores_in_empty_bins(self, method, labels, reuse_stats):
-        histogram = Histogram(
-            breakpoints=[0.0, 0.3, 0.7, 1.0],
-            freqs=[1, 0, 1],
-            target_freqs=[(1, 0), (0, 0), (0, 1)],
-            classes=[0, 1],
-        )
-        with pytest.raises(
-            ValueError,
-            match=(
-                r"Cannot compute ECE for scores in empty histogram bins: "
-                r"sample indices \[1\], bin indices \[1\]\."
-            ),
-        ):
-            legacy_ece(
-                [0.1, 0.5],
-                labels,
-                method=method,
-                histogram=histogram,
-                reuse_stats=reuse_stats,
-            )
-
     @pytest.mark.parametrize("method", ["bin", "label-bin"])
     def test_large_integer_scores_do_not_overflow_accumulation(self, method):
         score = 2**62
-        histogram = Histogram([score - 1, score + 1], [5])
         assert legacy_ece(
             np.full(5, score, dtype=np.int64),
             [0, 1, 0, 1, 0],
             method=method,
-            histogram=histogram,
+            histogram_method="eq-width",
         ) == pytest.approx(float(score))
 
     @pytest.mark.parametrize("parameter", ["method", "multi_class_method"])
@@ -1688,38 +1616,11 @@ class TestECE:
             ([[0.4, 0.4, 0.2], [0.1, 0.8, 0.1], [0.7, 0.2, 0.1]], [0, 1, 2]),
         ],
     )
-    @pytest.mark.parametrize("supply_histogram", [False, True])
     def test_rejects_invalid_estimation_methods(
-        self, parameter, invalid, scores, labels, supply_histogram
+        self, parameter, invalid, scores, labels
     ):
-        histogram = Histogram(breakpoints=[0.0, 1.0], freqs=[2])
         with pytest.raises(ValueError, match=rf"'{parameter}' must be"):
-            legacy_ece(
-                scores,
-                labels,
-                histogram=histogram if supply_histogram else None,
-                **{parameter: invalid},
-            )
-
-    @pytest.mark.parametrize("method", ["bin", "label-bin"])
-    @pytest.mark.parametrize("classes", [[], [0, 1]])
-    def test_rejects_reused_histogram_without_target_statistics(self, method, classes):
-        histogram = Histogram(breakpoints=[0.0, 1.0], freqs=[2], classes=classes)
-        with pytest.raises(ValueError, match="'histogram' must have target statistics"):
-            legacy_ece(
-                [0.1, 0.9], [0, 1], method=method, histogram=histogram, reuse_stats=True
-            )
-
-    @pytest.mark.parametrize(("method", "expected"), [("bin", 0.0), ("label-bin", 0.4)])
-    @pytest.mark.parametrize("classes", [[], [0, 1]])
-    def test_rebuilds_missing_histogram_target_statistics(
-        self, method, expected, classes
-    ):
-        histogram = Histogram(breakpoints=[0.0, 1.0], freqs=[2], classes=classes)
-        assert legacy_ece(
-            [0.1, 0.9], [0, 1], method=method, histogram=histogram
-        ) == pytest.approx(expected)
-        assert histogram.target_freqs == []
+            legacy_ece(scores, labels, **{parameter: invalid})
 
     @pytest.mark.parametrize(
         ("scores", "labels"),
@@ -1738,7 +1639,6 @@ class TestECE:
             calibration_error(scores, labels)
 
     @pytest.mark.parametrize("method", ["bin", "label-bin"])
-    @pytest.mark.parametrize("reuse_stats", [False, True])
     @pytest.mark.parametrize(
         ("scores", "labels", "multi_class_method"),
         [
@@ -1756,20 +1656,14 @@ class TestECE:
         ],
     )
     def test_ece_modes_do_not_bypass_nan_validation(
-        self, method, reuse_stats, scores, labels, multi_class_method
+        self, method, scores, labels, multi_class_method
     ):
-        # Supplied statistics must not bypass validation in any estimation mode
-        histogram = Histogram(
-            breakpoints=[0.0, 1.0], freqs=[2], target_freqs=[(1, 1)], classes=[0, 1]
-        )
         with pytest.raises(ValueError, match="'y_scores' must not contain NaN"):
             legacy_ece(
                 scores,
                 labels,
                 method=method,
                 multi_class_method=multi_class_method,
-                histogram=histogram,
-                reuse_stats=reuse_stats,
             )
 
     @pytest.mark.parametrize(
@@ -1787,30 +1681,17 @@ class TestECE:
     @pytest.mark.parametrize("method", ["bin", "label-bin"])
     @pytest.mark.parametrize("multi_class_method", ["top-label", "classwise"])
     @pytest.mark.parametrize(
-        ("scores", "labels", "reuse_stats"),
+        ("scores", "labels"),
         [
-            ([0.1, 0.9], [0, 1], False),
-            ([0.1, 0.9], [0, 1], True),
-            ([[0.1], [0.9]], [0, 1], False),
-            ([[0.1], [0.9]], [0, 1], True),
-            ([[0.9, 0.1], [0.1, 0.9]], [0, 1], False),
-            ([[0.9, 0.1], [0.1, 0.9]], [0, 1], True),
-            ([[0.4, 0.4, 0.2], [0.1, 0.8, 0.1], [0.7, 0.2, 0.1]], [0, 1, 2], False),
+            ([0.1, 0.9], [0, 1]),
+            ([[0.1], [0.9]], [0, 1]),
+            ([[0.9, 0.1], [0.1, 0.9]], [0, 1]),
+            ([[0.4, 0.4, 0.2], [0.1, 0.8, 0.1], [0.7, 0.2, 0.1]], [0, 1, 2]),
         ],
     )
-    def test_numeric_object_scores(
-        self, method, multi_class_method, reuse_stats, scores, labels
-    ):
+    def test_numeric_object_scores(self, method, multi_class_method, scores, labels):
         # Object scores must behave like floating-point scores in every ECE mode
-        histogram = Histogram(
-            breakpoints=[0.0, 1.0], freqs=[2], target_freqs=[(1, 1)], classes=[0, 1]
-        )
-        kwargs = {
-            "method": method,
-            "multi_class_method": multi_class_method,
-            "histogram": histogram,
-            "reuse_stats": reuse_stats,
-        }
+        kwargs = {"method": method, "multi_class_method": multi_class_method}
         expected = legacy_ece(np.array(scores, dtype=float), labels, **kwargs)
         assert legacy_ece(
             np.array(scores, dtype=object), labels, **kwargs
@@ -1823,13 +1704,11 @@ class TestECE:
     def test_top_label_ties_select_first_class(self, method, expected, labels):
         # The tied first row is correct only when the first maximum is selected
         scores = [[0.4, 0.4, 0.2], [0.1, 0.8, 0.1], [0.7, 0.2, 0.1]]
-        histogram = Histogram(breakpoints=[0.0, 1.0], freqs=[3])
         assert legacy_ece(
-            scores, labels, method=method, histogram=histogram
+            scores, labels, method=method, histogram_method="eq-width", max_bins=1
         ) == pytest.approx(expected)
 
     @pytest.mark.parametrize("multi_class_method", ["top-label", "classwise"])
-    @pytest.mark.parametrize("reuse_stats", [False, True])
     @pytest.mark.parametrize(
         ("scores", "y"),
         [
@@ -1841,24 +1720,9 @@ class TestECE:
             ([0.1, 0.5, 0.9], [0, 1]),
         ],
     )
-    def test_rejects_mismatched_sample_counts(
-        self, scores, y, multi_class_method, reuse_stats
-    ):
-        # Supplied statistics must not bypass sample-count validation
-        histogram = Histogram(
-            breakpoints=[0.0, 1.0],
-            freqs=[2],
-            target_freqs=[(1, 1)],
-            classes=[0, 1],
-        )
+    def test_rejects_mismatched_sample_counts(self, scores, y, multi_class_method):
         with pytest.raises(ValueError, match="inconsistent numbers of samples"):
-            legacy_ece(
-                scores,
-                y,
-                multi_class_method=multi_class_method,
-                histogram=histogram,
-                reuse_stats=reuse_stats,
-            )
+            legacy_ece(scores, y, multi_class_method=multi_class_method)
 
     @pytest.mark.parametrize("method", ["bin", "label-bin"])
     @pytest.mark.parametrize("multi_class_method", ["top-label", "classwise"])
@@ -1885,81 +1749,21 @@ class TestECE:
 
     @pytest.mark.parametrize("method", ["bin", "label-bin"])
     @pytest.mark.parametrize("all_correct", [False, True])
-    @pytest.mark.parametrize("histogram_source", ["internal", "boundaries"])
-    def test_top_label_rejects_single_correctness_outcome(
-        self, method, all_correct, histogram_source
-    ):
+    def test_top_label_rejects_single_correctness_outcome(self, method, all_correct):
         # Vary confidence while keeping every prediction correct or incorrect
         scores = np.array([[0.8, 0.1, 0.1], [0.1, 0.7, 0.2], [0.2, 0.2, 0.6]])
         y = np.array([0, 1, 2]) if all_correct else np.array([1, 2, 0])
-        confidence = scores.max(axis=1)
-        correctness = np.full(3, int(all_correct))
-        histogram = None
-        if histogram_source == "boundaries":
-            histogram = Histogram.from_data_and_breakpoints(
-                confidence, [0.0, 0.65, 0.75, 1.0], correctness
-            )
-
-        # Reject single-outcome data regardless of the histogram source
         with pytest.raises(
             ValueError, match="Top-label ECE requires both correct and incorrect"
         ):
-            legacy_ece(
-                scores,
-                y,
-                method=method,
-                histogram=histogram,
-            )
+            legacy_ece(scores, y, method=method)
 
     @pytest.mark.parametrize(
         "scores", [[0.8, 0.9], [[0.8], [0.9]], [[0.2, 0.8], [0.1, 0.9]]]
     )
-    @pytest.mark.parametrize("reuse_stats", [False, True])
-    def test_binary_rejects_single_class_target(self, scores, reuse_stats):
-        # A supplied two-class histogram must not bypass target validation
-        histogram = None
-        if reuse_stats:
-            histogram = Histogram(
-                breakpoints=[0.0, 1.0],
-                freqs=[2],
-                target_freqs=[(1, 1)],
-                classes=["cat", "dog"],
-            )
+    def test_binary_rejects_single_class_target(self, scores):
         with pytest.raises(ValueError, match="Binary ECE requires exactly two"):
-            legacy_ece(
-                np.array(scores),
-                np.array(["cat", "cat"]),
-                histogram=histogram,
-                reuse_stats=reuse_stats,
-            )
-
-    @pytest.mark.parametrize(
-        ("method", "expected"),
-        [("bin", 0.2666666666666666), ("label-bin", 0.3555555555555556)],
-    )
-    def test_reused_binary_histogram_requires_matching_class_order(
-        self, method, expected
-    ):
-        histogram = Histogram(
-            breakpoints=[0.0, 1.0],
-            freqs=[3],
-            target_freqs=[(2, 1)],
-            classes=[1, 0],
-        )
-        with pytest.raises(
-            ValueError, match="Reused binary histogram classes must match"
-        ):
-            legacy_ece(
-                [0.1, 0.3, 0.8],
-                [0, 1, 1],
-                method=method,
-                histogram=histogram,
-                reuse_stats=True,
-            )
-
-        assert legacy_ece(
-            [0.1, 0.3, 0.8], [0, 1, 1], method=method, histogram=histogram
-        ) == pytest.approx(expected)
+            legacy_ece(np.array(scores), np.array(["cat", "cat"]))
 
     def test_classwise_target_error_has_context(self, monkeypatch):
         # Simulate a one-vs-rest target that lacks one outcome
@@ -1985,74 +1789,10 @@ class TestECE:
         # Compare list and single-column inputs with vector inputs
         scores = np.array([0.1, 0.9])
         y = np.array([0, 1])
-        histogram = Histogram.from_data_and_breakpoints(scores, [0.0, 1.0], y)
-        expected = legacy_ece(scores, y, method=method, histogram=histogram)
+        expected = legacy_ece(scores, y, method=method)
         scores, y = convert(scores), convert(y)
 
-        assert legacy_ece(
-            scores, y, method=method, histogram=histogram
-        ) == pytest.approx(expected)
-
-    @pytest.mark.parametrize(
-        ("method", "expected"), [("bin", 0.1), ("label-bin", 2 / 15)]
-    )
-    @pytest.mark.parametrize(
-        "convert",
-        [
-            pytest.param(lambda scores: scores, id="1d"),
-            pytest.param(lambda scores: scores.reshape(-1, 1), id="column"),
-            pytest.param(
-                lambda scores: np.column_stack([1 - scores, scores]), id="binary"
-            ),
-        ],
-    )
-    def test_supplied_histogram_uses_current_data(self, method, expected, convert):
-        # Recompute statistics from current data using the supplied boundaries
-        histogram = Histogram(
-            breakpoints=[0.0, 0.3, 0.7, 1.0],
-            freqs=[10, 10, 20],
-            target_freqs=[(0, 10), (0, 10), (20, 0)],
-            classes=[0, 1],
-        )
-        scores = convert(np.array([0.1, 0.2, 0.4, 0.6, 0.8, 0.9]))
-        y = np.array([0, 0, 1, 0, 1, 1])
-
-        # Check current-data statistics and preserve the supplied histogram
-        assert legacy_ece(
-            scores, y, method=method, histogram=histogram
-        ) == pytest.approx(expected)
-        assert histogram.freqs == [10, 10, 20]
-        assert histogram.target_freqs == [(0, 10), (0, 10), (20, 0)]
-
-    @pytest.mark.parametrize(
-        ("method", "expected"), [("bin", 0.1), ("label-bin", 2 / 15)]
-    )
-    @pytest.mark.parametrize("supply_histogram", [False, True])
-    def test_histogram_statistics_are_not_recomputed(
-        self, method, expected, supply_histogram, monkeypatch
-    ):
-        # Provide same-data statistics through either histogram source
-        scores = np.array([0.1, 0.2, 0.4, 0.6, 0.8, 0.9])
-        y = np.array([0, 0, 1, 0, 1, 1])
-        histogram = Histogram.from_data_and_breakpoints(scores, [0.0, 0.3, 0.7, 1.0], y)
-        monkeypatch.setattr(Histogram, "from_data", lambda *args, **kwargs: histogram)
-
-        # Reject a second statistics pass
-        def unexpected_recomputation(*args, **kwargs):
-            pytest.fail("Histogram statistics must not be recomputed")
-
-        monkeypatch.setattr(
-            Histogram, "from_data_and_breakpoints", unexpected_recomputation
-        )
-
-        # Reuse supplied statistics or use the internally built histogram directly
-        assert legacy_ece(
-            scores,
-            y,
-            method=method,
-            histogram=histogram if supply_histogram else None,
-            reuse_stats=supply_histogram,
-        ) == pytest.approx(expected)
+        assert legacy_ece(scores, y, method=method) == pytest.approx(expected)
 
     @pytest.mark.parametrize("y_fixture", ["bool", "float", "int", "intnl", "str"])
     @pytest.mark.parametrize("y_scores_fixture", ["original", "original-2d"])
