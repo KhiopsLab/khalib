@@ -1172,6 +1172,14 @@ def calibration_error(
             return float(np.dot(class_eces, class_probas))
 
 
+def _safe_divide(numerator, denominator):
+    """Divides elementwise, returning zero where the denominator is zero."""
+    denominator = np.asarray(denominator, dtype=float)
+    return np.divide(
+        numerator, denominator, out=np.zeros_like(denominator), where=denominator > 0
+    )
+
+
 def _binary_v_ece(
     y_scores,
     y,
@@ -1202,12 +1210,10 @@ def _binary_v_ece(
         # Training means per bin; empty bins get zero direction below
         counts = np.bincount(train_bins, minlength=n_bins)
         nonempty = counts > 0
-        label_means = np.zeros(n_bins)
-        score_means = np.zeros(n_bins)
         label_sums = np.bincount(train_bins, weights=train_labels, minlength=n_bins)
         score_sums = np.bincount(train_bins, weights=train_scores, minlength=n_bins)
-        label_means[nonempty] = label_sums[nonempty] / counts[nonempty]
-        score_means[nonempty] = score_sums[nonempty] / counts[nonempty]
+        label_means = _safe_divide(label_sums, counts)
+        score_means = _safe_divide(score_sums, counts)
 
         # Out-of-fold direction times held-out residual
         if method == "label-bin":
@@ -1285,10 +1291,7 @@ def _binary_ece(
         [freqs[1] for freqs in histogram.target_freqs], dtype=float
     )
     if method == "label-bin":
-        bin_freqs = np.asarray(histogram.freqs, dtype=float)
-        bin_probas = np.divide(
-            positive_freqs, bin_freqs, out=np.zeros_like(bin_freqs), where=bin_freqs > 0
-        )
+        bin_probas = _safe_divide(positive_freqs, histogram.freqs)
         return float(np.abs(y_scores - bin_probas[bin_indexes]).sum() / len(y))
     else:
         assert method == "bin"
