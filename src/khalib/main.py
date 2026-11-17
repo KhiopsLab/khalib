@@ -1279,24 +1279,23 @@ def _binary_ece(
         )
 
     # Estimate the ECE with the histogram
+    y_scores = np.asarray(y_scores, dtype=float)
+    bin_indexes = np.asarray(bin_indexes, dtype=int)
+    positive_freqs = np.array(
+        [freqs[1] for freqs in histogram.target_freqs], dtype=float
+    )
     if method == "label-bin":
-        sum_diffs = 0
-        for y_score, i in zip(y_scores, bin_indexes, strict=True):
-            sum_diffs += math.fabs(
-                y_score - histogram.target_freqs[i][1] / histogram.freqs[i]
-            )
-        return sum_diffs / len(y)
+        bin_freqs = np.asarray(histogram.freqs, dtype=float)
+        bin_probas = np.divide(
+            positive_freqs, bin_freqs, out=np.zeros_like(bin_freqs), where=bin_freqs > 0
+        )
+        return float(np.abs(y_scores - bin_probas[bin_indexes]).sum() / len(y))
     else:
         assert method == "bin"
-        sum_score_by_bin = [0 for _ in histogram.bins]
-        for y_score, i in zip(y_scores, bin_indexes, strict=True):
-            sum_score_by_bin[i] += y_score
-        return sum(
-            [
-                math.fabs(sum_score_by_bin[i] - histogram.target_freqs[i][1])
-                for i in range(histogram.n_bins)
-            ]
-        ) / len(y)
+        sum_score_by_bin = np.bincount(
+            bin_indexes, weights=y_scores, minlength=histogram.n_bins
+        )
+        return float(np.abs(sum_score_by_bin - positive_freqs).sum() / len(y))
 
 
 class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):

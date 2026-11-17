@@ -2128,7 +2128,7 @@ class TestECE:
                 y_scores[:, [0, 1]] = y_scores[:, [1, 0]]
 
         # Estimate the ECE
-        ece = calibration_error(y_scores, y, method="label-bin")
+        ece = legacy_ece(y_scores, y, method="label-bin")
         assert ece == pytest.approx(
             distorted_scores[distortion_fun_name]["theoretical_ece"],
             **distorted_scores[distortion_fun_name]["approx_kwargs"],
@@ -2662,7 +2662,7 @@ class TestKhalibClassifier:
         if train_mode == "slow":
             # Check the resulting ECE is in the nominal range
             y_scores_calib_test = cclf.predict_proba(x_test)
-            ece = calibration_error(
+            ece = legacy_ece(
                 y_scores_calib_test, y_test, multi_class_method="top-label"
             )
             assert ece == pytest.approx(expected_ece, rel=1e-2)
