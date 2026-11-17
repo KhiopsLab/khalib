@@ -1386,23 +1386,22 @@ def fixture_distorted_scores():
     data = {"y_scores_fixtures": y_scores_fixtures}
 
     # Expected ECE values were calculated with a grid of 1e-8 intervals
-    for distortion_fun, expected_ece, tolerance in (
-        (sigmoid_stair, 0.07390433812747241, 1.0e-3),
-        (sine_cube_root, 0.2381850813972994, 1.0e-3),
-        (identity, 0, 2.5e-2),
+    for distortion_fun, expected_ece in (
+        (sigmoid_stair, 0.07390433812747241),
+        (sine_cube_root, 0.2381850813972994),
+        (identity, 0),
     ):
         # Sample a binary distribution according to the distorted probabilities
         y_cond_probas = distortion_fun(y_scores)
         y = rng.binomial(1, y_cond_probas)
 
-        # Store the label variants and their calibration expectations
+        # Store the label variants and their calibration expectation
         data[distortion_fun.__name__] = {
             "y_fixtures": {
                 "int": (y, False),
                 "str": (np.where(y == 0, "zero", "one"), True),
             },
             "theoretical_ece": expected_ece,
-            "approx_kwargs": {"abs": tolerance},
         }
 
     return data
@@ -1849,12 +1848,45 @@ class TestECE:
     @pytest.mark.parametrize(
         "distortion_fun_name", ["sine_cube_root", "sigmoid_stair", "identity"]
     )
+    # Bin-level estimators are lower bounds, and V-ECE is noisier from cross-fitting
+    @pytest.mark.parametrize(
+        ("correction", "method", "tolerances"),
+        [
+            pytest.param(
+                "none",
+                "label-bin",
+                {"sigmoid_stair": 1e-3, "sine_cube_root": 1e-3, "identity": 2.5e-2},
+                id="ece",
+            ),
+            pytest.param(
+                "none",
+                "bin",
+                {"sigmoid_stair": 2e-2, "sine_cube_root": 1e-3, "identity": 2.5e-2},
+                id="ece-bin",
+            ),
+            pytest.param(
+                "v-ece",
+                "label-bin",
+                {"sigmoid_stair": 5e-3, "sine_cube_root": 5e-3, "identity": 2.5e-2},
+                id="v-ece-label-bin",
+            ),
+            pytest.param(
+                "v-ece",
+                "bin",
+                {"sigmoid_stair": 2e-2, "sine_cube_root": 5e-3, "identity": 2.5e-2},
+                id="v-ece-bin",
+            ),
+        ],
+    )
     def test_accuracy_binary_ece(
         self,
         distorted_scores,
         distortion_fun_name,
         y_scores_fixture_name,
         y_fixture_name,
+        correction,
+        method,
+        tolerances,
     ):
         # Prepare the input data for the ECE estimation
         y_scores = distorted_scores["y_scores_fixtures"][y_scores_fixture_name].copy()
@@ -1868,10 +1900,10 @@ class TestECE:
                 y_scores[:, [0, 1]] = y_scores[:, [1, 0]]
 
         # Estimate the ECE
-        ece = legacy_ece(y_scores, y, method="label-bin")
+        ece = calibration_error(y_scores, y, method=method, correction=correction)
         assert ece == pytest.approx(
             distorted_scores[distortion_fun_name]["theoretical_ece"],
-            **distorted_scores[distortion_fun_name]["approx_kwargs"],
+            abs=tolerances[distortion_fun_name],
         )
 
 
