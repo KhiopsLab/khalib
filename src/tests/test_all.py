@@ -1501,16 +1501,15 @@ class TestECE:
             == 0.0
         )
 
+    @pytest.mark.filterwarnings("error")
     def test_v_ece_supports_single_class_training_complements(self, fixed_folds):
-        assert isinstance(
-            calibration_error(
-                [0.2, 0.3, 0.7, 0.8],
-                [0, 0, 1, 1],
-                correction="v-ece",
-                n_splits=2,
-            ),
-            float,
+        ece = calibration_error(
+            [0.2, 0.3, 0.7, 0.8],
+            [0, 0, 1, 1],
+            correction="v-ece",
+            n_splits=2,
         )
+        assert isinstance(ece, float)
 
     def test_v_ece_supports_top_label_multiclass_scores(self, fixed_folds, monkeypatch):
         fitted = []

@@ -1159,10 +1159,17 @@ def _bin_directions(
     Returns the directions (zero in bins empty in the fit data) and the fit label
     mean of each evaluated score's bin.
     """
-    # Fit bins on the fit data and locate both sets of scores
-    histogram = Histogram.from_data(
-        fit_scores, y=fit_y, method=histogram_method, max_bins=max_bins
-    )
+    # Fit bins on the fit data (Khiops yields one bin for a single-class target)
+    if histogram_method == "khiops" and np.unique(fit_y).size == 1:
+        histogram = Histogram.from_data_and_breakpoints(
+            fit_scores, breakpoints=[0.0, 1.0], y=fit_y
+        )
+    else:
+        histogram = Histogram.from_data(
+            fit_scores, y=fit_y, method=histogram_method, max_bins=max_bins
+        )
+
+    # Locate both sets of scores
     n_bins = histogram.n_bins
     fit_bins = histogram.vfind(fit_scores)
     eval_bins = histogram.vfind(eval_scores)
