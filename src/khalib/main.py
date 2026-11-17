@@ -1061,8 +1061,8 @@ def calibration_error(
             raise ValueError(
                 "Binary ECE requires exactly two distinct target labels in 'y'."
             )
+        binary_y = LabelEncoder().fit_transform(y)
         if correction == "v-ece":
-            binary_y = LabelEncoder().fit_transform(y)
             return _binary_v_ece(
                 binary_scores,
                 binary_y,
@@ -1074,7 +1074,7 @@ def calibration_error(
             )
         return _binary_ece(
             binary_scores,
-            y,
+            binary_y,
             method=method,
             histogram_method=histogram_method,
             max_bins=max_bins,
@@ -1146,6 +1146,43 @@ def _safe_divide(numerator, denominator):
     )
 
 
+def _bin_directions(
+    fit_scores,
+    fit_y,
+    eval_scores,
+    method: str,
+    histogram_method: str,
+    max_bins: int,
+):
+    """Computes bin directions for `eval_scores` from bins fitted on the fit data.
+
+    Returns the directions (zero in bins empty in the fit data) and the fit label
+    mean of each evaluated score's bin.
+    """
+    # Fit bins on the fit data and locate both sets of scores
+    histogram = Histogram.from_data(
+        fit_scores, y=fit_y, method=histogram_method, max_bins=max_bins
+    )
+    n_bins = histogram.n_bins
+    fit_bins = histogram.vfind(fit_scores)
+    eval_bins = histogram.vfind(eval_scores)
+
+    # Fit means per bin; empty bins get zero direction below
+    counts = np.bincount(fit_bins, minlength=n_bins)
+    label_sums = np.bincount(fit_bins, weights=fit_y, minlength=n_bins)
+    label_means = _safe_divide(label_sums, counts)[eval_bins]
+
+    # Compare the label mean with the score (label-bin) or mean score (bin)
+    if method == "label-bin":
+        reference = eval_scores
+    else:
+        score_sums = np.bincount(fit_bins, weights=fit_scores, minlength=n_bins)
+        reference = _safe_divide(score_sums, counts)[eval_bins]
+    directions = np.where(counts[eval_bins] > 0, np.sign(reference - label_means), 0)
+
+    return directions, label_means
+
+
 def _binary_v_ece(
     y_scores,
     y,
@@ -1161,32 +1198,17 @@ def _binary_v_ece(
     splitter = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     signed_projection = 0.0
 
+    # Project held-out residuals on directions learned from the training complement
     for train_indexes, eval_indexes in splitter.split(y_scores):
-        # Fit bins on the training complement only
-        train_scores = y_scores[train_indexes]
-        train_labels = y[train_indexes]
         eval_scores = y_scores[eval_indexes]
-        histogram = Histogram.from_data(
-            train_scores, y=train_labels, method=histogram_method, max_bins=max_bins
+        directions, _ = _bin_directions(
+            y_scores[train_indexes],
+            y[train_indexes],
+            eval_scores,
+            method,
+            histogram_method,
+            max_bins,
         )
-        n_bins = histogram.n_bins
-        train_bins = histogram.vfind(train_scores)
-        eval_bins = histogram.vfind(eval_scores)
-
-        # Training means per bin; empty bins get zero direction below
-        counts = np.bincount(train_bins, minlength=n_bins)
-        nonempty = counts > 0
-        label_sums = np.bincount(train_bins, weights=train_labels, minlength=n_bins)
-        score_sums = np.bincount(train_bins, weights=train_scores, minlength=n_bins)
-        label_means = _safe_divide(label_sums, counts)
-        score_means = _safe_divide(score_sums, counts)
-
-        # Out-of-fold direction times held-out residual
-        if method == "label-bin":
-            directions = np.sign(eval_scores - label_means[eval_bins])
-        else:
-            directions = np.sign(score_means[eval_bins] - label_means[eval_bins])
-        directions = np.where(nonempty[eval_bins], directions, 0)
         signed_projection += np.dot(directions, eval_scores - y[eval_indexes])
 
     return max(0.0, float(signed_projection / len(y)))
@@ -1199,34 +1221,19 @@ def _binary_ece(
     histogram_method: str = "khiops",
     max_bins: int = 0,
 ):
-    """Estimates the ECE for a 2-class problem
+    """Estimates the ECE for a 2-class problem with labels encoded as 0 and 1
 
     See the function `calibration_error` docstring for more details.
     """
-    y_scores = _as_1d_array(y_scores, "y_scores")
-    y = _as_1d_array(y, "y")
+    y_scores = np.asarray(_as_1d_array(y_scores, "y_scores"), dtype=float)
+    y = np.asarray(_as_1d_array(y, "y"), dtype=np.int8)
     assert len(np.unique(y)) == 2
 
-    # Build the histogram and map each score to its bin
-    histogram = Histogram.from_data(
-        y_scores, y=y, method=histogram_method, max_bins=max_bins
+    # In-sample, the direction-weighted gap to the bin label mean is the L1 ECE
+    directions, label_means = _bin_directions(
+        y_scores, y, y_scores, method, histogram_method, max_bins
     )
-    bin_indexes = histogram.vfind(y_scores)
-
-    # Estimate the ECE with the histogram
-    y_scores = np.asarray(y_scores, dtype=float)
-    positive_freqs = np.array(
-        [freqs[1] for freqs in histogram.target_freqs], dtype=float
-    )
-    if method == "label-bin":
-        bin_probas = _safe_divide(positive_freqs, histogram.freqs)
-        return float(np.abs(y_scores - bin_probas[bin_indexes]).sum() / len(y))
-    else:
-        assert method == "bin"
-        sum_score_by_bin = np.bincount(
-            bin_indexes, weights=y_scores, minlength=histogram.n_bins
-        )
-        return float(np.abs(sum_score_by_bin - positive_freqs).sum() / len(y))
+    return float(np.dot(directions, y_scores - label_means) / len(y))
 
 
 class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
