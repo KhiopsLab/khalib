@@ -29,6 +29,8 @@ jobs:
       - name: Setup just
         uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
       - name: Build docs
+        env:
+          PYTHONWARNINGS: "ignore:Khiops ended correctly but there were minor issues,ignore:Sample datasets location does not exist"
         run: |
           mkdir docs/_static
           just docs
