@@ -1779,31 +1779,24 @@ def build_reliability_diagram(
             uhist_y_scores = Histogram.from_data(y_scores)
 
             # Plot the density
-            density_bar_starts = [
-                left
-                for (left, _), freq in zip(
-                    uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
-                )
-                if freq > 0
-            ]
-            density_bar_widths = [
-                right - left
-                if right - left >= min_density_bar_width
-                else min_density_bar_width
-                for (left, right), freq in zip(
-                    uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
-                )
-                if freq > 0
-            ]
-            density_bar_heights = [
-                density
-                for density, freq in zip(
+            populated_bins = [
+                (left, right, density)
+                for (left, right), density, freq in zip(
+                    uhist_y_scores.bins,
                     uhist_y_scores.densities,
                     uhist_y_scores.freqs,
                     strict=True,
                 )
                 if freq > 0
             ]
+            density_bar_starts = [left for left, _, _ in populated_bins]
+            density_bar_widths = [
+                right - left
+                if right - left >= min_density_bar_width
+                else min_density_bar_width
+                for left, right, _ in populated_bins
+            ]
+            density_bar_heights = [density for _, _, density in populated_bins]
             density_bar_log_range = 0
             if density_bar_heights:
                 density_bar_log_range = math.log10(
