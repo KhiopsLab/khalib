@@ -1,6 +1,12 @@
 name: Docs
 on:
   workflow_dispatch:
+    inputs:
+      publish_docs:
+        description: Publish docs to GitHub Pages
+        required: false
+        default: false
+        type: boolean
   pull_request:
 
 # Cancel any ongoing run of this workflow on the same PR or ref
@@ -31,7 +37,7 @@ jobs:
         with:
           path: ./docs/_build/html
   publish:
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_docs
     needs: [build]
     runs-on: ubuntu-latest
     permissions:
