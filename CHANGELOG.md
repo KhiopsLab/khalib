@@ -4,21 +4,20 @@
 
 ### Added
 
-- Add cross-fitted V-ECE calibration error estimators with sample-wise and bin-level directions.
+- Add cross-fitted V-ECE estimation to `calibration_error`, with sample-wise (`label-bin`) and
+  bin-level directions.
 
 ### Changed
 
-- Make `calibration_error` use V-ECE by default. Pass `correction="none"` for the previous
-  estimator, which is required for classwise multiclass ECE.
-- Compute equal-frequency histogram bins with NumPy instead of invoking Khiops.
-  Inner boundaries are midpoints between adjacent distinct observations at quantile splits.
-  Splits choose the closest valid side of tied groups; duplicate splits and gaps without a
-  representable midpoint are merged.
+- Use cross-fitted V-ECE by default in `calibration_error`. Pass `correction="none"` to select
+  in-sample estimators; classwise multiclass ECE is available only in this mode.
+- Build equal-frequency histogram bins with NumPy instead of Khiops, keeping tied scores together
+  and merging duplicate splits or gaps without a representable midpoint.
 
 ### Removed
 
-- Remove the `histogram` and `reuse_stats` parameters of `calibration_error`. The histogram is
-  always built from the supplied scores and labels.
+- Remove the `histogram` and `reuse_stats` parameters from `calibration_error`; it always builds
+  histogram statistics from the supplied scores and labels.
 
 ## [0.7] - 2026-11-06
 

@@ -23,7 +23,7 @@ specify the number and width of the bins, as they are automatically estimated fr
 <!-- start-install -->
 ## Installation
 
-Requires Python 3.11 through 3.14. Khiops is installed automatically; no separate installation is needed.
+Requires Python 3.11 through 3.15. Khiops is installed automatically; no separate installation is needed.
 
 ```sh
 pip install khalib
