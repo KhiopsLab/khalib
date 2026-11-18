@@ -192,10 +192,12 @@ def _find_bin_indexes(breakpoints, values):
 
 def _count_target_frequencies(bin_indexes, class_indexes, n_bins, n_classes):
     """Counts observations for each bin and encoded target class."""
-    target_freqs = [[0] * n_classes for _ in range(n_bins)]
-    for bin_index, class_index in zip(bin_indexes, class_indexes, strict=True):
-        target_freqs[bin_index][class_index] += 1
-    return [tuple(freqs) for freqs in target_freqs]
+    bin_indexes = np.asarray(bin_indexes)
+    class_indexes = np.asarray(class_indexes)
+    check_consistent_length(bin_indexes, class_indexes)
+    target_indexes = bin_indexes * n_classes + class_indexes
+    counts = np.bincount(target_indexes, minlength=n_bins * n_classes)
+    return [tuple(freqs) for freqs in counts.reshape(n_bins, n_classes).tolist()]
 
 
 def _equal_frequency_histogram(x, n_bins):
@@ -653,9 +655,7 @@ class Histogram:
 
         # Initialize the breakpoints and bin frequencies
         x_bin_indexes = _find_bin_indexes(breakpoints, x)
-        freqs = [0] * (len(breakpoints) - 1)
-        for x_bin_index in x_bin_indexes:
-            freqs[x_bin_index] += 1
+        freqs = np.bincount(x_bin_indexes, minlength=len(breakpoints) - 1).tolist()
 
         if y is None:
             return cls(breakpoints=breakpoints, freqs=freqs)
