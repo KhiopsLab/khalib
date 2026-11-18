@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.8]
 
 ### Added
 
@@ -76,7 +76,8 @@
 - `calibration_error` function
 - `build_reliability_diagram` function
 
-[Unreleased]: https://github.com/khiopslab/khalib/compare/0.7...HEAD
+[Unreleased]: https://github.com/khiopslab/khalib/compare/0.8...HEAD
+[0.8]: https://github.com/khiopslab/khalib/compare/0.7...0.8
 [0.7]: https://github.com/khiopslab/khalib/compare/0.6...0.7
 [0.6]: https://github.com/khiopslab/khalib/compare/0.5...0.6
 [0.5]: https://github.com/khiopslab/khalib/compare/0.4...0.5
