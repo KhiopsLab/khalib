@@ -30,3 +30,7 @@ API Reference
    in Calibration Error Estimation . <i>Proceedings of The 25th International Conference on
    Artificial Intelligence and Statistics</i>, in <i>Proceedings of Machine Learning Research</i>
    151:4036-4054 Available from https://proceedings.mlr.press/v151/roelofs22a.html.
+
+.. [BBBJH26] Berta, E., Braun, S., Bach, F., Jordan, M.I. &amp; Holzmüller, D. (2026).
+   V-ECE: Estimating General Expected Calibration Errors.
+   https://arxiv.org/abs/2602.24230.

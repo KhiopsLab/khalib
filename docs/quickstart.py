@@ -18,17 +18,18 @@
 #
 #  {download}`⬇️  Download this Notebook <./quickstart.ipynb>`
 #
-#  ## KhalibClassifier Scikit-Learn Estimator
+#  ## KhalibClassifier scikit-learn Estimator
 #
-#  We first create our train, calibration and test datasets. We use 45k as test to
-#  ensure good error estimations. The rest is divided evenly into train and calibration.
+#  We begin by creating a synthetic dataset with 35,000 samples. We reserve 2,500 for
+#  training and 2,500 for calibration, then use the remaining 30,000 as a held-out test
+#  set for measuring calibration error.
 
 # %%
 from sklearn.datasets import make_classification
 from sklearn.model_selection import train_test_split
 
 X, y = make_classification(
-    n_samples=50_000, n_features=20, n_informative=2, n_redundant=10, random_state=42
+    n_samples=35_000, n_features=20, n_informative=2, n_redundant=10, random_state=42
 )
 X_train, X_not_train, y_train, y_not_train = train_test_split(
     X, y, train_size=2500, random_state=42
@@ -38,55 +39,58 @@ X_calib, X_test, y_calib, y_test = train_test_split(
 )
 
 # %% [markdown]
-# We now train a `GaussianNB` classifier. This kind of model is usually uncalibrated
-# because data never fullfill its hypotheses. We also estimate its expected calibration
-# error (ECE):
+# Next, we fit a `GaussianNB` classifier. Gaussian Naive Bayes assumes conditionally
+# independent features with Gaussian class-conditional distributions. Our data include
+# redundant features, so they violate the conditional-independence assumption. We
+# measure the model's calibration error with `calibration_error`, which computes
+# cross-validated V-ECE by default:
 
 # %%
 from sklearn.naive_bayes import GaussianNB
 
 import khalib
 
-# Compute the positive scores with a Gaussian Naive Bayes model
+# We fit the model and compute the positive-class scores on the test set:
 gnb = GaussianNB()
 gnb.fit(X_train, y_train)
 y_scores_test = gnb.predict_proba(X_test)[:, 1]
 
-# Compute and display the ECE
+# We compute and display the raw model's calibration error:
 ece_test = khalib.calibration_error(y_scores_test, y_test)
 print("RAW GNB ECE:", ece_test)
 
 
 # %% [markdown]
-# To calibrate our `GaussianNB` we create an instance of `KhalibClassifier` with it:
+# Before calibrating the model, we inspect its reliability diagram:
 
 # %% [markdown]
-# We can also plot the reliability diagram using the `build_reliability_diagram`
-# function:
+# We build the diagram with `build_reliability_diagram`, which also plots the score
+# distribution:
 
 # %%
 # %config InlineBackend.figure_formats = ['svg']
 _ = khalib.build_reliability_diagram(y_scores_test, y_test)
 
 # %% [markdown]
-# We now calibrate the model with a `KhalibClassifier` object. It uses the uncalibrated
-# model as parameter. We then `fit` it on the `calib` split.
+# Now we wrap the fitted `GaussianNB` model in `KhalibClassifier` and fit the wrapper
+# on the calibration split. This learns the calibration mapping without retraining the
+# classifier on calibration data.
 
 # %%
-# Train the calibrated classifier and obtain the calibrated scores
+# We fit the wrapper and compute calibrated scores for the test set:
 calib_gnb = khalib.KhalibClassifier(gnb)
 calib_gnb.fit(X_calib, y_calib)
 y_calib_scores_test = calib_gnb.predict_proba(X_test)[:, 1]
 
-# Compute the ECE
+# We compute and display the calibrated model's error and its relative reduction:
 calib_ece_test = khalib.calibration_error(y_calib_scores_test, y_test)
-print("CALIB ECE:", calib_ece_test)
+print("CALIBRATED GNB ECE:", calib_ece_test)
 print("Reduction:", (ece_test - calib_ece_test) / ece_test)
 
 # %% [markdown]
-# We observe that `khalib` reduced the ECE by ~90%. We now plot the reliability diagram
-# for the calibrated scores. The `reliability_diagram` uses a heuristic to detect when
-# the scores are distributed as Dirac deltas and changes the visualization accordingly:
+# In this run, we see the calibration error fall by about 90%. We now plot the
+# calibrated scores. The reliability diagram detects point-mass score distributions
+# and displays those masses as Dirac deltas:
 
 # %%
 _ = khalib.build_reliability_diagram(y_calib_scores_test, y_test)
@@ -94,22 +98,23 @@ _ = khalib.build_reliability_diagram(y_calib_scores_test, y_test)
 # %% [markdown]
 # ## calibrate_binary function + Histogram class
 #
-# We can achieve the same result "manually" by using the function `calibrate_binary`
-# which calibrates the scores with a `Histogram` object.
+# We also apply the same calibration directly with `calibrate_binary` and a
+# `Histogram` object. This lets us build and inspect the histogram ourselves.
 
 # %%
-# Obtain the scores on the calib split and build a supervised histogram with it
+# First, we compute scores on the calibration split and build a supervised histogram
+# from those scores and labels:
 y_scores_calib = gnb.predict_proba(X_calib)[:, 1]
 hist = khalib.Histogram.from_data(y_scores_calib, y=y_calib)
 
-# Calibrate the scores of the test split
+# Then, we apply the histogram to the test scores:
 calib_hist_y_test_scores = khalib.calibrate_binary(
     y_scores_test, hist, only_positive=True
 )
 
-# Print the error and plot the reliability diagram
+# Finally, we compute the error and plot the resulting reliability diagram:
 calib_hist_ece_test = khalib.calibration_error(calib_hist_y_test_scores, y=y_test)
-print("CALIB HIST ECE:", calib_hist_ece_test)
+print("CALIBRATED HISTOGRAM ECE:", calib_hist_ece_test)
 print("Reduction     :", (ece_test - calib_ece_test) / ece_test)
 _ = khalib.build_reliability_diagram(calib_hist_y_test_scores, y_test)
 

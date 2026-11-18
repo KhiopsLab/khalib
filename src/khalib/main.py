@@ -1,4 +1,4 @@
-"""Classifier calibration with Khiops"""
+"""Classifier calibration with Khiops."""
 
 import bisect
 import math
@@ -21,7 +21,7 @@ from matplotlib.ticker import LogLocator
 from scipy.sparse import issparse
 from sklearn.base import BaseEstimator, ClassifierMixin, MetaEstimatorMixin, clone
 from sklearn.exceptions import NotFittedError
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, train_test_split
 from sklearn.model_selection._search import BaseSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, label_binarize
@@ -34,9 +34,9 @@ _OMPI_BTL_ENV = "OMPI_MCA_btl"
 
 
 def build_single_core_khiops_runner():
-    """Build a Khiops runner with one core
+    """Build a Khiops runner with one core.
 
-    Running with a single core is faster for most of the calibration use-cases.
+    Single-core execution is faster for typical calibration workloads.
     The process core limit is restored even if runner initialization fails.
     """
     with _khiops_runner_lock:
@@ -192,10 +192,58 @@ def _find_bin_indexes(breakpoints, values):
 
 def _count_target_frequencies(bin_indexes, class_indexes, n_bins, n_classes):
     """Counts observations for each bin and encoded target class."""
-    target_freqs = [[0] * n_classes for _ in range(n_bins)]
-    for bin_index, class_index in zip(bin_indexes, class_indexes, strict=True):
-        target_freqs[bin_index][class_index] += 1
-    return [tuple(freqs) for freqs in target_freqs]
+    bin_indexes = np.asarray(bin_indexes)
+    class_indexes = np.asarray(class_indexes)
+    check_consistent_length(bin_indexes, class_indexes)
+    target_indexes = bin_indexes * n_classes + class_indexes
+    counts = np.bincount(target_indexes, minlength=n_bins * n_classes)
+    return [tuple(freqs) for freqs in counts.reshape(n_bins, n_classes).tolist()]
+
+
+def _equal_frequency_histogram(x, n_bins):
+    """Returns counts and midpoint edges at quantile-based splits."""
+    if np.all(x == x[0]):
+        value = x[0] if isinstance(x[0], int) else float(x[0])
+        upper = math.nextafter(value, math.inf)
+        edges = (
+            [value, upper]
+            if math.isfinite(upper)
+            else [math.nextafter(value, -math.inf), value]
+        )
+        return [len(x)], edges
+
+    # Choose the closest valid side of each tied group at the quantile ranks.
+    sorted_x = np.sort(x)
+    n_bins = min(n_bins, len(x))
+    ranks = np.array(
+        [i * (len(x) - 1) // n_bins for i in range(1, n_bins)], dtype=np.intp
+    )
+    left_splits = np.searchsorted(sorted_x, sorted_x[ranks], side="left")
+    right_splits = np.searchsorted(sorted_x, sorted_x[ranks], side="right")
+    target_counts = ranks + 1
+    use_left = (left_splits > 0) & (
+        (right_splits == len(x))
+        | (target_counts - left_splits < right_splits - target_counts)
+    )
+    splits = np.unique(np.where(use_left, left_splits, right_splits))
+    lower, upper = sorted_x[[0, -1]].tolist()
+    edges = [lower]
+    for split in splits:
+        left, right = sorted_x[split - 1 : split + 1].tolist()
+        # Preserve integer precision and halve first only to avoid float overflow.
+        total = left + right
+        if isinstance(total, int):
+            midpoint = total // 2 if total % 2 == 0 else total / 2
+        elif math.isfinite(total):
+            midpoint = total / 2
+        else:
+            midpoint = left / 2 + right / 2
+        if left < midpoint < right:
+            edges.append(midpoint)
+    edges.append(upper)
+    bin_indexes = _find_bin_indexes(edges, x)
+    freqs = np.bincount(bin_indexes, minlength=len(edges) - 1)
+    return freqs.tolist(), edges
 
 
 def _validate_nonempty_bin_scores(histogram, y_scores, operation):
@@ -245,27 +293,27 @@ def _get_classifier_scores(estimator, features):
 
 @dataclass()
 class Histogram:
-    """A histogram with optional target variable statistics
+    """A histogram with optional target variable statistics.
 
     .. note::
-        To obtain instances from real data, prefer the factory method `from_data` rather
-        than the base constructor.
+        Use the factory method `from_data` rather than the constructor to build
+        histograms from data.
 
     Attributes
     ----------
     breakpoints : list[float]
-        The breakpoints defining the histogram in increasing order.
+        Strictly increasing bin breakpoints.
     freqs : list of float
-        The finite, nonnegative frequencies of each bin.
+        Finite, nonnegative bin frequencies.
     densities : list[float]
-        The densities of each bin.
+        Bin densities.
     classes : list
-        The class labels.
+        Class labels.
     target_freqs : list[tuple], optional
-        The finite, nonnegative target frequencies in each bin. Each tuple has the
-        same size as :paramref:`classes`.
+        Finite, nonnegative target frequencies per bin. Each tuple has the same
+        length as :paramref:`classes`.
     target_probas : list[tuple], optional
-        The target conditional probabilities in each bin, in class order.
+        Target conditional probabilities per bin, in class order.
 
     Raises
     ------
@@ -321,7 +369,7 @@ class Histogram:
         max_bins: int = 0,
         use_finest: bool = False,
     ) -> "Histogram":
-        """Computes a histogram of an 1D vector via Khiops
+        """Computes a histogram of a 1-D vector.
 
         Parameters
         ----------
@@ -332,29 +380,28 @@ class Histogram:
         method : {"khiops", "eq-freq", "eq-width"}, default="khiops"
             Histogram method:
 
-            - "khiops": A non-parametric regularized histogram method.
-            - "eq-freq": All bins have the same number of elements. If many instances
-              have too many values the algorithm will put it in its own bin, which will
-              be larger than the other ones.
-            - "eq-width": All bins have the same width.
+            - "khiops": Non-parametric regularized histogram method (MODL).
+            - "eq-freq": Equal-frequency quantile bins, with boundaries midway
+              between adjacent distinct scores. Tied scores stay in the same bin,
+              so bin counts can differ.
+            - "eq-width": Equal-width bins.
 
-            For "eq-freq" and "eq-width", y does not affect the bin boundaries.
-        max_bins: int, default=0
-            The maximum number of bins to be created. The algorithms usually create this
-            number of bins but they may create less. The default value 0 means:
+            For "eq-freq" and "eq-width", ``y`` does not affect bin boundaries.
+        max_bins : int, default=0
+            Upper bound on the number of bins; fewer bins are created when the
+            data or regularization supports fewer splits. ``0`` means:
 
-            - For "khiops": that there is no limit to the number of intervals.
-            - For "eq-freq" or "eq-width": that 10 is the maximum number of
-              intervals.
-        use_finest: bool, default=False
-            *Unsupervised 'khiops' histogram only*: If `True` it builds the finest
-            histogram instead of the most interpretable. If no histogram has an
-            information rate of 100, the last histogram is used.
+            - For "khiops": no limit on the number of bins.
+            - For "eq-freq" or "eq-width": a maximum of 10 bins.
+        use_finest : bool, default=False
+            *Unsupervised 'khiops' histogram only*: If ``True``, builds the finest
+            histogram instead of the most interpretable one. If no histogram has an
+            information rate of 100, uses the last histogram.
 
         Returns
         -------
         `Histogram`
-            The histogram object containing the bin limits and frequencies.
+            Histogram containing the bin edges and frequencies.
 
         Raises
         ------
@@ -387,9 +434,24 @@ class Histogram:
             raise ValueError(
                 f"method must be in {list(khiops_methods)}. It is '{method}'"
             )
+        if method == "eq-freq":
+            freqs, breakpoints = _equal_frequency_histogram(x, max_bins or 10)
+            if y is None:
+                return cls(breakpoints=breakpoints, freqs=freqs)
+            le = LabelEncoder().fit(y)
+            bin_indexes = _find_bin_indexes(breakpoints, x)
+            target_freqs = _count_target_frequencies(
+                bin_indexes, le.transform(y), len(freqs), len(le.classes_)
+            )
+            return cls(
+                breakpoints=breakpoints,
+                freqs=freqs,
+                target_freqs=target_freqs,
+                classes=le.classes_.tolist(),
+            )
         khiops_method = khiops_methods[method]
 
-        # Supplying a target would make Khiops ignore equal-frequency/width binning
+        # Supplying a target would make Khiops ignore equal-width binning
         y_khiops = y if method == "khiops" else None
 
         # Create Khiops dictionary
@@ -485,7 +547,7 @@ class Histogram:
                 ]
             # Unsupervised khiops execution
             else:
-                # Case 'eq-freq' or 'eq-width'
+                # Case 'eq-width'
                 if score_stats.modl_histograms is None:
                     # Create the breakpoints
                     breakpoints = [
@@ -553,16 +615,16 @@ class Histogram:
     def from_data_and_breakpoints(
         cls, x, breakpoints: list[float], y=None
     ) -> "Histogram":
-        """Builds a histogram from a list of breakpoints and data
+        """Builds a histogram from breakpoints and data.
 
         Parameters
         ----------
         x : array-like of shape (n_samples,) or (n_samples, 1)
-            Vector with the values to discretize for the histogram.
+            Values to discretize.
         breakpoints : list[float]
-            The increasing bin edges.
+            Strictly increasing bin edges.
         y : array-like of shape (n_samples,) or (n_samples, 1), optional
-            Target values associated to each element in 'x'.
+            Target values corresponding to ``x``.
 
         Raises
         ------
@@ -593,9 +655,7 @@ class Histogram:
 
         # Initialize the breakpoints and bin frequencies
         x_bin_indexes = _find_bin_indexes(breakpoints, x)
-        freqs = [0] * (len(breakpoints) - 1)
-        for x_bin_index in x_bin_indexes:
-            freqs[x_bin_index] += 1
+        freqs = np.bincount(x_bin_indexes, minlength=len(breakpoints) - 1).tolist()
 
         if y is None:
             return cls(breakpoints=breakpoints, freqs=freqs)
@@ -746,17 +806,17 @@ class Histogram:
             self.target_probas = target_probas
 
     def find(self, value: float) -> int:
-        """Returns the histogram bin index for a value
+        """Returns the histogram bin index for a scalar value.
 
         Parameters
         ----------
         value : float
-            The value to look up in the histogram bins.
+            Value to look up in the histogram bins.
 
         Returns
         -------
         int
-            The index of the bin containing the value.
+            Index of the bin containing ``value``.
 
         Raises
         ------
@@ -778,17 +838,17 @@ class Histogram:
             return bisect.bisect_left(self.breakpoints, value) - 1
 
     def vfind(self, values):
-        """Returns the histogram bin indexes for a value sequence
+        """Returns the histogram bin indexes for an array of values.
 
         Parameters
         ----------
-        value : :external:term:`array-like`
-            The values to look up in the histogram bins.
+        values : :external:term:`array-like`
+            Values to look up in the histogram bins.
 
         Returns
         -------
         :external:term:`array-like`
-            The indexes of the bins containing the values.
+            Indexes of the bins containing ``values``.
 
         Raises
         ------
@@ -807,146 +867,184 @@ def calibration_error(
     histogram_method: str = "khiops",
     max_bins: int = 0,
     multi_class_method: str = "top-label",
-    histogram: Histogram | None = None,
-    reuse_stats: bool = False,
+    *,
+    correction: str = "v-ece",
+    n_splits: int = 5,
+    random_state=0,
 ):
-    r"""Estimates the ECE via binning
+    r"""Estimates calibration error via binning.
 
-    The default binning method "khiops" finds a regularized histogram for which the
-    distribution of the target as pure as possible.
+    By default, uses cross-validated V-ECE with ``method="label-bin"``. Set
+    ``correction="none"`` to use the in-sample ECE estimators. The default binning
+    method ``"khiops"`` builds a regularized histogram with pure target
+    distributions per bin.
 
     Parameters
     ----------
     y_scores : array-like of shape (n_samples,) or (n_samples, n_classes)
-        Scores/probabilities. For binary ECE, the positive class is the second
-        distinct label in sorted order. For two-column binary scores, column 1
-        must contain scores for that class.
-        For multiclass scores, columns must correspond to the numerical or
-        lexicographical order of the labels in y, with every class present in y.
-        Single-column binary scores are also accepted.
+        Scores or probabilities. For binary ECE, the positive class is the second
+        distinct label in sorted order; for two-column binary scores, column 1
+        contains scores for that class, and single-column binary scores are also
+        accepted. For multiclass scores, columns correspond to the numerical or
+        lexicographical order of the labels in ``y``, with every class present in
+        ``y``.
     y : array-like of shape (n_samples,) or (n_samples, 1)
-        Target values (class labels).
+        Target class labels.
     method : {"label-bin", "bin"}, default="label-bin"
-        ECE estimation method. See below for details.
+        ECE estimation method. With ``correction="v-ece"``, selects either a
+        sample-wise label-bin direction or a uniform bin-level direction.
     multi_class_method : {"top-label", "classwise"}, default="top-label"
-        Multi-class ECE estimation method:
+        Multiclass ECE estimation method:
 
-        - "top-label": Estimates the ECE for the confidence scores (ie. the predicted
-          class score). Ties select the first maximal score column.
-        - "classwise": Estimates the ECE for each class in a one-vs-rest fashion and
-          averages the class ECEs weighted by each class's prevalence in ``y``.
+        - "top-label": Estimates ECE on the predicted-class confidence scores.
+          Ties select the first maximal score column.
+        - "classwise": Estimates one-vs-rest ECE per class and averages them
+          weighted by class prevalence in ``y``.
     histogram_method : {"khiops", "eq-freq", "eq-width"}, default="khiops"
         Histogram method:
 
-        - "khiops": A non-parametric regularized histogram method. It finds the best
-          histogram such that the distribution of the target is constant in each bin.
-        - "eq-freq": All bins have the same number of elements. If many instances
-          have too many values the algorithm will put it in its own bin, which will be
-          larger than the other ones.
-        - "eq-width": All bins have the same width.
+        - "khiops": Non-parametric regularized histogram method (MODL) that
+          partitions scores so the target distribution is constant within each bin.
+        - "eq-freq": Equal-frequency quantile bins, with boundaries midway
+          between adjacent distinct scores. Tied scores stay in the same bin, so
+          bin counts can differ.
+        - "eq-width": Equal-width bins.
 
-        For "eq-freq" and "eq-width", y does not affect the bin boundaries.
+        For "eq-freq" and "eq-width", ``y`` does not affect bin boundaries.
     max_bins : int, default=0
-        The maximum number of bins to be created. The algorithms usually create this
-        number of bins but they may create less. The default value 0 means:
+        Upper bound on the number of bins; fewer bins are created when the data
+        or regularization supports fewer splits. ``0`` means:
 
-        - For "khiops": that there is no limit to the number of intervals.
-        - For "eq-freq" or "eq-width": that 10 is the maximum number of intervals.
-    histogram : `Histogram`, optional
-        A histogram providing the bin boundaries. If set, histogram_method and
-        max_bins are ignored. Bin and target frequencies are recomputed from
-        y_scores and y unless reuse_stats is True.
-    reuse_stats : bool, default=False
-        Reuse the supplied histogram's statistics without recomputing them. Set
-        this to True only if it was built from the same scores and labels used
-        for this ECE computation. Has no effect when histogram is None.
+        - For "khiops": no limit on the number of bins.
+        - For "eq-freq" or "eq-width": a maximum of 10 bins.
+    correction : {"none", "v-ece"}, default="v-ece"
+        Selects the in-sample ECE estimator (``"none"``) or the cross-fitted
+        V-ECE heuristic (``"v-ece"``), which estimates directions from
+        fold-specific training histograms.
+    n_splits : int, default=5
+        Number of shuffled, unstratified folds used by V-ECE.
+    random_state : int, RandomState instance or None, default=0
+        Random seed used to shuffle V-ECE folds.
 
     Raises
     ------
     ValueError
-        If inputs violate the :ref:`input-requirements` or the estimation and
-        histogram requirements described in Notes.
+        If inputs violate the :ref:`input-requirements` or the input
+        requirements described in Notes.
     TypeError
-        ``reuse_stats`` is not a boolean.
+        ``random_state`` is a boolean.
 
     Notes
     -----
-    .. rubric:: Input and estimation requirements
+    .. rubric:: Input requirements
 
-    Binary targets must contain exactly two distinct labels. Multiclass targets
-    must contain one distinct label per score column. Top-label ECE requires both
-    correct and incorrect predictions; classwise ECE requires both positive and
-    negative examples for each class. Scores and labels must have matching sample
-    counts. See :ref:`input-requirements` for common score and label rules.
+    Top-label ECE requires both correct and incorrect predictions, and classwise
+    ECE requires both positive and negative examples per class. With
+    ``correction="v-ece"``, scores must lie in [0, 1], ``multi_class_method``
+    must be ``"top-label"``, and ``n_splits`` must be an integer in
+    ``[2, n_samples]``. See :ref:`input-requirements` for common score, label,
+    and option rules.
 
-    Both method and multi_class_method must be supported. When no histogram is
-    supplied, max_bins must be a nonnegative integer.
+    .. rubric:: In-sample ECE
 
-    .. rubric:: Histogram statistics
-
-    Reusing statistics is supported only for binary scores and requires target
-    frequencies for two classes in the same order as the sorted labels in y.
-    Scores mapping to empty histogram bins are rejected, including before any
-    supplied statistics are refreshed.
-
-    .. rubric:: Mathematical definition
-
-    We present the formulas for the two binary ECE estimators used in this function, as
-    described in [RCSM22]_. Both approximate the theoretical calibration error:
+    The in-sample estimators described in [RCSM22]_ approximate the theoretical
+    calibration error:
 
     .. math::
         \mathbb{E}\left[ \left| \mathbb{P}\left[ Y = 1 | S \right] - S  \right| \right]
 
-    where the pair :math:`(S, Y)` is a random vector taking values in :math:`[0, 1]
-    \times \lbrace{0, 1\rbrace}`. The random variable :math:`S` represent the
-    (normalized) scores coming from a classifier, and :math:`Y` the target.
+    where :math:`(S, Y)` is a random vector in
+    :math:`[0, 1] \times \lbrace{0, 1\rbrace}`, :math:`S` represents the
+    normalized classifier score, and :math:`Y` is the target.
 
-    Let
-    :math:`\lbrace {B_i} \rbrace _{i=I}^I` a binning of :math:`[0,1]` and :math:`\lbrace
-    (s_n, y_n) \rbrace_{n=1}^N` a sample following the distribution of :math:`(S, Y)`.
+    Let :math:`\lbrace {B_i} \rbrace _{i=1}^I` be a binning of :math:`[0,1]` and
+    :math:`\lbrace (s_n, y_n) \rbrace_{n=1}^N` be a sample drawn from :math:`(S, Y)`.
 
-
-    The **label-bin** ECE estimation is given by:
+    The **label-bin** ECE estimator is:
 
     .. math::
         \text{ECE}_{\text{lb}} = \frac{1}{N} \sum_{n=1}^N \sum_{i = 1}^I
            \mathbb{1}_{s_n \in B_i} \left| s_n - \bar{y_i} \right|
 
-    where :math:`\bar{y_i}` is the sample conditional expectation of :math:`Y` in the
-    :math:`i`-th bin:
+    where :math:`\bar{y_i}` is the sample mean of :math:`Y` in bin :math:`B_i`:
 
     .. math::
         \frac{\sum_{n=1}^N \mathbb{1}_{s_n \in B_i} \cdot y_n}{|B_i|}.
 
-    On the other hand, the **bin** ECE estimation is given by:
+    The **bin** ECE estimator is:
 
     .. math::
         \text{ECE}_{\text{bin}} = \sum_{i = 1}^I
            \frac{\left| B_i \right| }{N} \left| \bar{s_i} - \bar{y_i} \right|
 
     where :math:`\bar{y_i}` is as above, and :math:`\bar{s_i}` is the sample
-    conditional expectation of :math:`S` in the :math:`i`-th bin:
+    mean of :math:`S` in bin :math:`B_i`:
 
     .. math::
         \frac{\sum_{n=1}^N \mathbb{1}_{s_n \in B_i} \cdot s_n}{|B_i|}.
 
+    The **bin** estimator is a lower bound on the true ECE for any binning, and a
+    lower bound on the **label-bin** estimator for a fixed binning.
 
-    The **bin** estimator is a lower bound for the real ECE for any binning used. And,
-    for a given binning, it is a lower bound of the **label-bin** estimator.
+    .. rubric:: Cross-validated V-ECE
 
-    The **bin** estimator is the most common literature, usually called the *plugin*
-    estimator, or even shown as the defitinion ECE. Despite this fact, we choose the
-    **label-bin** estimator as default method because it is exact when the conditional
-    distribution :math:`\mathbb{P}\left[ Y = 1 | S = s \right]` is piecewise constant on
-    :math:`s`. These piecewise constant models are exactly the hypothesis space of any
-    histogram estimation of the ECE.
+    The cross-validated **V-ECE** variant [BBBJH26]_ estimates directions from
+    fold-specific training histograms. For fold :math:`m`, let :math:`\mathcal{F}_m`
+    denote its held-out samples, and let :math:`\bar{y}_{i,-m}` and
+    :math:`\bar{s}_{i,-m}` be the training-complement label and score means in bin
+    :math:`B_i` of that fold's histogram.
 
+    The **label-bin** V-ECE compares each held-out score with its training-bin label
+    mean:
+
+    .. math::
+        \text{V-ECE}_{\text{lb}} = \max\left(0, \frac{1}{N}
+        \sum_m \sum_{n \in \mathcal{F}_m}
+        \sum_{i=1}^{I_{-m}} \mathbb{1}_{s_n \in B_i}
+        \operatorname{sign}(s_n-\bar{y}_{i,-m})(s_n-y_n)\right).
+
+    The **bin** V-ECE applies the direction from the training-bin mean score and
+    label to every held-out sample in the bin:
+
+    .. math::
+        \text{V-ECE}_{\text{bin}} = \max\left(0, \frac{1}{N}
+        \sum_m \sum_{n \in \mathcal{F}_m}
+        \sum_{i=1}^{I_{-m}} \mathbb{1}_{s_n \in B_i}
+        \operatorname{sign}(\bar{s}_{i,-m}-\bar{y}_{i,-m})(s_n-y_n)\right).
+
+    The direction is zero for an empty training bin.
+
+    Cross-fitting makes the signed projection unbiased before zero clipping
+    [BBBJH26]_. Evaluating both directions and residuals on the full sample
+    without fold splitting recovers the in-sample estimators.
+
+    .. rubric:: Default parameters
+
+    The default configuration is **V-ECE** with **label-bin** error estimation and
+    **khiops** binning:
+
+    - **V-ECE** has an unbiased signed estimate before zero clipping and is more
+      accurate when CE is small, where in-sample estimators perform poorly. The
+      trade-off is lower accuracy overall and greater computational cost.
+    - **label-bin** is exact when the conditional probability
+      :math:`\mathbb{P}\left[ Y = 1 | S = s\right]` is piecewise constant in
+      :math:`s`. The **bin** method is systematically biased in this case.
+    - **khiops** binning produces a conditional-probability estimate that
+      converges to the ground truth as the sample size grows.
     """
     # Validate estimation methods before computing histogram statistics
-    if not isinstance(reuse_stats, (bool, np.bool_)):
-        raise TypeError("'reuse_stats' must be a boolean.")
-    if histogram is None:
-        max_bins = _validate_max_bins(max_bins)
+    if correction not in ("none", "v-ece"):
+        raise ValueError(f"'correction' must be 'none' or 'v-ece'. Got {correction!r}.")
+    if correction == "v-ece":
+        if isinstance(n_splits, (bool, np.bool_)) or not isinstance(
+            n_splits, (int, np.integer)
+        ):
+            raise ValueError("'n_splits' must be an integer of at least 2.")
+        if n_splits < 2:
+            raise ValueError(f"'n_splits' must be at least 2. It is {n_splits}.")
+        if isinstance(random_state, (bool, np.bool_)):
+            raise TypeError("'random_state' must not be a boolean.")
+    max_bins = _validate_max_bins(max_bins)
     if method not in ("label-bin", "bin"):
         raise ValueError(f"'method' must be 'label-bin' or 'bin'. Got {method!r}.")
     if multi_class_method not in ("top-label", "classwise"):
@@ -966,10 +1064,12 @@ def calibration_error(
         )
     check_consistent_length(y_scores, y)
     _check_no_infinite_values(y_scores, "y_scores")
-
-    # Keep reusable histogram statistics restricted to binary score inputs
-    if reuse_stats and y_scores.ndim == 2 and y_scores.shape[1] > 2:
-        raise ValueError("'reuse_stats' is not supported for multiclass scores.")
+    if correction == "v-ece" and (np.any(y_scores < 0) or np.any(y_scores > 1)):
+        raise ValueError("'y_scores' must contain values in [0, 1] with V-ECE.")
+    if correction == "v-ece" and n_splits > len(y):
+        raise ValueError(
+            f"'n_splits' must not exceed the number of samples ({len(y)})."
+        )
 
     # Binary ECE uses the positive-class column when two columns are supplied
     if y_scores.ndim == 1 or y_scores.shape[1] <= 2:
@@ -978,17 +1078,28 @@ def calibration_error(
             raise ValueError(
                 "Binary ECE requires exactly two distinct target labels in 'y'."
             )
+        binary_y = LabelEncoder().fit_transform(y)
+        if correction == "v-ece":
+            return _binary_v_ece(
+                binary_scores,
+                binary_y,
+                method=method,
+                histogram_method=histogram_method,
+                max_bins=max_bins,
+                n_splits=n_splits,
+                random_state=random_state,
+            )
         return _binary_ece(
             binary_scores,
-            y,
+            binary_y,
             method=method,
             histogram_method=histogram_method,
             max_bins=max_bins,
-            histogram=histogram,
-            reuse_stats=reuse_stats,
         )
     # 2-D array with > 2 columns: Multi-class ECE
     else:
+        if correction == "v-ece" and multi_class_method == "classwise":
+            raise ValueError("'multi_class_method' must be 'top-label' with V-ECE.")
         le = LabelEncoder().fit(y)
         if len(le.classes_) != y_scores.shape[1]:
             raise ValueError(
@@ -1004,14 +1115,22 @@ def calibration_error(
                 raise ValueError(
                     "Top-label ECE requires both correct and incorrect predictions."
                 )
+            if correction == "v-ece":
+                return _binary_v_ece(
+                    y_pred_scores,
+                    y_preds,
+                    method=method,
+                    histogram_method=histogram_method,
+                    max_bins=max_bins,
+                    n_splits=n_splits,
+                    random_state=random_state,
+                )
             return _binary_ece(
                 y_pred_scores,
                 y_preds,
                 method=method,
                 histogram_method=histogram_method,
                 max_bins=max_bins,
-                histogram=histogram,
-                reuse_stats=reuse_stats,
             )
         else:
             assert multi_class_method == "classwise"
@@ -1030,12 +1149,93 @@ def calibration_error(
                         method=method,
                         histogram_method=histogram_method,
                         max_bins=max_bins,
-                        histogram=histogram,
-                        reuse_stats=reuse_stats,
                     )
                 )
             class_probas = np.unique(y, return_counts=True)[1] / len(y)
             return float(np.dot(class_eces, class_probas))
+
+
+def _safe_divide(numerator, denominator):
+    """Divides elementwise, returning zero where the denominator is zero."""
+    denominator = np.asarray(denominator, dtype=float)
+    return np.divide(
+        numerator, denominator, out=np.zeros_like(denominator), where=denominator > 0
+    )
+
+
+def _bin_directions(
+    fit_scores,
+    fit_y,
+    eval_scores,
+    method: str,
+    histogram_method: str,
+    max_bins: int,
+):
+    """Computes bin directions for `eval_scores` from bins fitted on the fit data.
+
+    Returns the directions (zero in bins empty in the fit data) and the fit label
+    mean of each evaluated score's bin.
+    """
+    # Fit bins on the fit data (Khiops yields one bin for a single-class target)
+    if histogram_method == "khiops" and np.unique(fit_y).size == 1:
+        histogram = Histogram.from_data_and_breakpoints(
+            fit_scores, breakpoints=[0.0, 1.0], y=fit_y
+        )
+    else:
+        histogram = Histogram.from_data(
+            fit_scores, y=fit_y, method=histogram_method, max_bins=max_bins
+        )
+
+    # Locate both sets of scores
+    n_bins = histogram.n_bins
+    fit_bins = histogram.vfind(fit_scores)
+    eval_bins = histogram.vfind(eval_scores)
+
+    # Fit means per bin; empty bins get zero direction below
+    counts = np.bincount(fit_bins, minlength=n_bins)
+    label_sums = np.bincount(fit_bins, weights=fit_y, minlength=n_bins)
+    label_means = _safe_divide(label_sums, counts)[eval_bins]
+
+    # Compare the label mean with the score (label-bin) or mean score (bin)
+    if method == "label-bin":
+        reference = eval_scores
+    else:
+        score_sums = np.bincount(fit_bins, weights=fit_scores, minlength=n_bins)
+        reference = _safe_divide(score_sums, counts)[eval_bins]
+    directions = np.where(counts[eval_bins] > 0, np.sign(reference - label_means), 0)
+
+    return directions, label_means
+
+
+def _binary_v_ece(
+    y_scores,
+    y,
+    method: str,
+    histogram_method: str,
+    max_bins: int,
+    n_splits: int,
+    random_state,
+):
+    """Estimates binary V-ECE from cross-fitted histogram directions."""
+    y_scores = np.asarray(y_scores, dtype=float)
+    y = np.asarray(y, dtype=np.int8)
+    splitter = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    signed_projection = 0.0
+
+    # Project held-out residuals on directions learned from the training complement
+    for train_indexes, eval_indexes in splitter.split(y_scores):
+        eval_scores = y_scores[eval_indexes]
+        directions, _ = _bin_directions(
+            y_scores[train_indexes],
+            y[train_indexes],
+            eval_scores,
+            method,
+            histogram_method,
+            max_bins,
+        )
+        signed_projection += np.dot(directions, eval_scores - y[eval_indexes])
+
+    return max(0.0, float(signed_projection / len(y)))
 
 
 def _binary_ece(
@@ -1044,151 +1244,90 @@ def _binary_ece(
     method: str = "label-bin",
     histogram_method: str = "khiops",
     max_bins: int = 0,
-    histogram: Histogram | None = None,
-    reuse_stats: bool = False,
 ):
-    """Estimates the ECE for a 2-class problem
+    """Estimates binary ECE with labels encoded as 0 and 1.
 
-    See the function `calibration_error` docstring for more details.
+    See `calibration_error` for details.
     """
-    # Normalize binary scores and labels
-    y_scores = _as_1d_array(y_scores, "y_scores")
-    y = _as_1d_array(y, "y")
+    y_scores = np.asarray(_as_1d_array(y_scores, "y_scores"), dtype=float)
+    y = np.asarray(_as_1d_array(y, "y"), dtype=np.int8)
     assert len(np.unique(y)) == 2
 
-    # Validate supplied statistics before any refresh can populate empty bins
-    supplied_histogram = histogram is not None
-    if supplied_histogram:
-        bin_indexes = _validate_nonempty_bin_scores(
-            histogram, y_scores, operation="compute ECE for"
-        )
-
-    # Build or refresh statistics unless reuse is explicitly requested
-    if histogram is None:
-        histogram = Histogram.from_data(
-            y_scores, y=y, method=histogram_method, max_bins=max_bins
-        )
-    elif not reuse_stats:
-        histogram = Histogram.from_data_and_breakpoints(
-            y_scores,
-            histogram.breakpoints,
-            y=y,
-        )
-
-    # Require target statistics for exactly two classes
-    if not histogram.target_freqs:
-        raise ValueError("'histogram' must have target statistics.")
-    if (n_classes := len(histogram.classes)) != 2:
-        raise ValueError(
-            f"The histogram must have exactly 2 target classes. It has {n_classes}."
-        )
-    expected_classes = LabelEncoder().fit(y).classes_
-    if reuse_stats and not np.array_equal(histogram.classes, expected_classes):
-        raise ValueError(
-            "Reused binary histogram classes must match the sorted distinct labels "
-            f"in 'y'. Got {histogram.classes!r}; expected "
-            f"{expected_classes.tolist()!r}."
-        )
-
-    # Validate the constructed histogram when no statistics were supplied
-    if not supplied_histogram:
-        bin_indexes = _validate_nonempty_bin_scores(
-            histogram, y_scores, operation="compute ECE for"
-        )
-
-    # Estimate the ECE with the histogram
-    if method == "label-bin":
-        sum_diffs = 0
-        for y_score, i in zip(y_scores, bin_indexes, strict=True):
-            sum_diffs += math.fabs(
-                y_score - histogram.target_freqs[i][1] / histogram.freqs[i]
-            )
-        return sum_diffs / len(y)
-    else:
-        assert method == "bin"
-        sum_score_by_bin = [0 for _ in histogram.bins]
-        for y_score, i in zip(y_scores, bin_indexes, strict=True):
-            sum_score_by_bin[i] += y_score
-        return sum(
-            [
-                math.fabs(sum_score_by_bin[i] - histogram.target_freqs[i][1])
-                for i in range(histogram.n_bins)
-            ]
-        ) / len(y)
+    # In-sample, the direction-weighted gap to the bin label mean is the L1 ECE
+    directions, label_means = _bin_directions(
+        y_scores, y, y_scores, method, histogram_method, max_bins
+    )
+    return float(np.dot(directions, y_scores - label_means) / len(y))
 
 
 class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
-    """Classifier calibration via Khiops
+    """Classifier calibration via Khiops.
 
-    This estimator uses the Khiops regularized histogram construction method (MODL) to
-    calibrate the probabilities/scores coming from a classifier.
+    Calibrates classifier probabilities or decision scores using Khiops
+    regularized histograms (MODL).
 
-    For binary classifiers, it fits a Khiops histogram for the scores for the positive
-    class. Then, for a given score, it estimates its calibrated probability as the
-    positive class probability of the bin in which the score falls.
+    For binary classifiers, fits a Khiops histogram on the positive-class scores
+    and maps each score to the positive-class probability of its bin.
 
-    For multi-class classifiers, it fits khiops histogram for each class in a
-    one-vs-rest fashion. Then, given a score vector, it estimates its calibrated
-    probabilities by applying in each one-vs-rest the binary method described above and
-    then normalizing to one.
+    For multiclass classifiers, fits a one-vs-rest Khiops histogram per class,
+    applies binary calibration to each class score, and normalizes the resulting
+    probabilities to sum to one.
 
-    This class emulates closely the `~sklearn.calibration.CalibratedClassifierCV`
-    interface but without cross-validation, as the Khiops models are regularized and do
-    not need it.
+    Follows the `~sklearn.calibration.CalibratedClassifierCV` interface without
+    cross-validation, because MODL histograms are regularized.
 
     .. _KhiopsClassifier: https://khiops.org/11.0.0-b.0/api-docs/python-api/api/sklearn/generated/khiops.sklearn.estimators.html#khiops.sklearn.estimators.KhiopsClassifier
 
     Parameters
     ----------
     estimator : estimator instance, default=None
-        The classifier whose output need to be calibrated to provide more accurate
-        `predict_proba` outputs. If not provided, it trains a `KhiopsClassifier`_. If
-        provided and not fitted, a clone is fitted with :paramref:`train_size`
-        elements. If already fitted, the estimator is copied for calibration.
+        Classifier whose outputs are calibrated for `predict_proba`. If ``None``,
+        trains a `KhiopsClassifier`_. If unfitted, fits a clone on
+        :paramref:`train_size` samples. If already fitted, copies the estimator
+        for calibration.
     train_size : float or int, default=0.75
-        Same parameter as `~sklearn.model_selection.train_test_split`. Only used when
-        :paramref:`estimator` is not provided or not fitted.
-    random_state : int, default=None
-        Same parameter as `~sklearn.model_selection.train_test_split`. Only used when
-        :paramref:`estimator` is not provided or not fitted.
-
+        Training-split size passed to `~sklearn.model_selection.train_test_split`.
+        Used only when :paramref:`estimator` is ``None`` or unfitted.
+    random_state : int, RandomState instance or None, default=None
+        Random seed passed to `~sklearn.model_selection.train_test_split`. Used
+        only when :paramref:`estimator` is ``None`` or unfitted.
 
     Attributes
     ----------
     fitted_estimator_ :
-        The independent fitted classifier used for calibration. It is an instance
-        of `KhiopsClassifier`_ when :paramref:`estimator` is not provided.
+        Independent fitted classifier used for calibration; an instance of
+        `KhiopsClassifier`_ when :paramref:`estimator` is ``None``.
     histograms_ : list of size 1 or n_classes
-        In the binary case: a list of size 1 with the `Histogram` instance for the
-        positive class. In the multi class case: A list of size n_classes containing the
-        one-vs-rest `Histogram` for each class.
+        For binary classification, a single-element list with the positive-class
+        `Histogram`. For multiclass classification, a list of ``n_classes``
+        one-vs-rest `Histogram` instances.
     classes_ : ndarray of shape (n_classes,)
-        Class labels in the order of the columns returned by `predict_proba`. For
-        binary classification, the second class is positive and its probability is
-        returned in column 1.
-
+        Class labels in the column order returned by `predict_proba`. For binary
+        classification, the second class is positive and its probability is in
+        column 1.
     """
 
     def __init__(self, estimator=None, train_size=0.75, random_state=None):
-        """See class docstring"""
+        """See class docstring."""
         self.estimator = estimator
         self.train_size = train_size
         self.random_state = random_state
 
     def fit(self, X, y):  # noqa: N803
-        """Fits the calibrated model
+        """Fits the calibrated model.
 
         Parameters
         ----------
         X : array-like of shape (n_samples, n_features)
-            Training data.
+            Training features (or calibration features when :paramref:`estimator`
+            is already fitted).
         y : array-like of shape (n_samples,)
-            Target values.
+            Target class labels.
 
         Returns
         -------
         self
-            The calling estimator instance.
+            Fitted estimator instance.
 
         Raises
         ------
@@ -1204,16 +1343,16 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         .. rubric:: Calibration requirements
 
         Calibration labels must contain at least two classes and exactly match
-        the fitted estimator's classes. Features may be sparse, unlike scores
+        the fitted estimator's classes. Features can be sparse, unlike scores
         and labels. Multiclass decision scores must not use
         ``decision_function_shape="ovo"``, including inside pipelines or searches.
 
         .. rubric:: Fitted state
 
-        Fitted attributes are updated only after calibration succeeds. A failed
+        Fitted attributes are updated only after calibration succeeds; a failed
         refit preserves the previous fitted state. The supplied estimator is cloned
-        before fitting, or copied if already fitted, so later changes to it do not
-        affect this classifier.
+        before fitting, or copied if already fitted, isolating this classifier from
+        later changes to it.
         """
         # Validate features and reject unsupported sparse inputs
         _check_classifier_features(X)
@@ -1280,12 +1419,12 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         return self.fitted_estimator_.classes_
 
     def predict(self, X):  # noqa: N803
-        """Predicts class labels using calibrated probabilities
+        """Predicts class labels from calibrated probabilities.
 
         Parameters
         ----------
         X : array-like of shape (n_samples, n_features)
-            Input data.
+            Input features.
 
         Returns
         -------
@@ -1296,17 +1435,17 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         return self.classes_[np.argmax(probabilities, axis=1)]
 
     def predict_proba(self, X):  # noqa: N803
-        """Estimates the calibrated classification probabilities
+        """Estimates calibrated class probabilities.
 
         Parameters
         ----------
         X : array-like of shape (n_samples, n_features)
-            Training data.
+            Input features.
 
         Returns
         -------
         P : array-like of shape (n_samples, n_classes)
-            The estimated calibrated probabilities for each class.
+            Estimated calibrated probabilities per class.
 
         Raises
         ------
@@ -1318,7 +1457,7 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         Warns
         -----
         UserWarning
-            If multiclass calibrated probabilities sum to zero. The uncalibrated
+            If multiclass calibrated probabilities sum to zero. Uncalibrated
             probabilities are returned for those samples instead.
 
         Notes
@@ -1326,13 +1465,13 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
         .. rubric:: Score layout
 
         Multiclass decision scores must not use ``decision_function_shape="ovo"``,
-        including inside pipelines or searches. Features may be sparse.
+        including inside pipelines or searches. Features can be sparse.
 
         .. rubric:: Zero-sum probabilities
 
         If all calibrated class probabilities for a sample are zero, the fitted
         estimator must provide finite, nonnegative ``predict_proba`` values
-        summing to one. These are used only for the affected samples.
+        summing to one, which are used for the affected samples.
         """
         # Check that is fitted
         check_is_fitted(self, ["fitted_estimator_", "histograms_"])
@@ -1397,10 +1536,10 @@ class KhalibClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimator):
 
 
 def calibrate_binary(y_scores, histogram: Histogram, only_positive: bool = False):
-    """Calibrates a binary score with an histogram
+    """Calibrates binary scores with a histogram.
 
-    This function may be used to calibrate binary classification scores without the use
-    of the `KhalibClassifier` estimator.
+    Calibrates binary classification scores directly without fitting a
+    `KhalibClassifier` estimator.
 
     Parameters
     ----------
@@ -1410,8 +1549,8 @@ def calibrate_binary(y_scores, histogram: Histogram, only_positive: bool = False
         Binary histogram with target statistics. Its class order defines the
         output probability-column order; the second class is positive.
     only_positive : bool, default=False
-        If ``True`` it returns only 1-D array with the probabilities of the positive
-        class. Otherwise it returns a 2-D array with the probabilities for both classes.
+        If ``True``, returns a 1-D array of positive-class probabilities;
+        otherwise returns a 2-D array of probabilities for both classes.
 
     Raises
     ------
@@ -1425,9 +1564,8 @@ def calibrate_binary(y_scores, histogram: Histogram, only_positive: bool = False
     -----
     .. rubric:: Input requirements
 
-    The histogram must have target frequencies for exactly two classes.
-    Empty score arrays are accepted. See :ref:`input-requirements` for common
-    score rules.
+    The histogram must have target frequencies for two classes. Empty score
+    arrays are accepted. See :ref:`input-requirements` for common score rules.
 
     .. rubric:: Bin lookup
 
@@ -1462,40 +1600,39 @@ def build_reliability_diagram(
     log_plot_threshold=3.0,
     min_density_bar_width=2.5e-03,
 ):
-    """Builds a reliability diagram with the target score distribution below
+    """Builds a reliability diagram with the score distribution below.
 
-    To build the diagram this function uses Khiops supervised histograms. To build the
-    score distribution, it uses Khiops unsupervised histograms. Using the latter, it
-    implements a heuristic to dectect when the scores is distributed as a sum of diracs
-    and changes visualization accordingly.
+    Builds the reliability diagram from a Khiops supervised histogram and the
+    score distribution from a Khiops unsupervised histogram. Detects Dirac
+    point-mass score distributions from the unsupervised histogram and adapts the
+    score plot accordingly.
 
     Parameters
     ----------
     y_scores : array-like of shape (n_samples,) or (n_samples, 1) or (n_samples, 2)
-        Positive-class scores/probabilities in [0, 1]. For a two-column array,
+        Positive-class scores or probabilities in [0, 1]. For a two-column array,
         column 1 is used; a single-column array is flattened.
     y : array-like of shape (n_samples,) or (n_samples, 1)
-        Target values containing exactly two distinct class labels.
+        Target values containing two distinct class labels.
     dirac_threshold : float, default=1.0e-06
-        If a bin in the scores' unsupervised histogram is lower than this
-        'dirac_threshold' then it is considered a dirac mass.
+        Isolated nonempty bins in the unsupervised score histogram narrower than
+        ``dirac_threshold`` are treated as Dirac point masses.
     log_plot_threshold : float, default=3.0
-        *Density plot only:* If the log-difference between the maximal and minimal
-        positive density values is larger than 'log_plot_threshold' then the density
-        plot uses a log scale in the y-axis.
+        *Density plot only*: Uses a logarithmic y-axis when the base-10 log
+        difference between the maximum and minimum positive densities exceeds
+        ``log_plot_threshold``.
     min_density_bar_width : float, default=2.5e-03
-        *Density plot only:* If a bin of the scores' unsupervised histogram has a width
-        lower than 'min_density_bar_width' then it is plotted as having a width of
-        'min_density_bar_width'.
+        *Density plot only*: Plots bins narrower than ``min_density_bar_width``
+        with width ``min_density_bar_width``.
 
     Returns
     -------
     tuple
-        A 2-tuple containing:
+        2-tuple containing:
 
         - A `matplotlib.figure.Figure`.
-        - A `dict` containing two `matplotlib.axes.Axes` with keys, "reliability
-          diagram" and "score_distribution".
+        - A `dict` of two `matplotlib.axes.Axes` keyed by
+          ``"reliability_diagram"`` and ``"score_distribution"``.
 
     Raises
     ------
@@ -1511,14 +1648,14 @@ def build_reliability_diagram(
     .. rubric:: Input requirements
 
     All score columns must contain values in [0, 1], including unused columns.
-    Labels must contain exactly two distinct classes and match the score sample
-    count. Plotting thresholds must be finite, positive real numbers, not
-    booleans. See :ref:`input-requirements` for common score and label rules.
+    Labels must contain two distinct classes and match the score sample count.
+    Plotting thresholds must be finite, positive real numbers, not booleans. See
+    :ref:`input-requirements` for common score and label rules.
 
     .. rubric:: Figure lifecycle
 
     The figure remains open on success and is closed if construction fails after
-    the base plot has been created.
+    creating the base plot.
     """
     # Check the input parameters
     for name, value in (
@@ -1642,31 +1779,24 @@ def build_reliability_diagram(
             uhist_y_scores = Histogram.from_data(y_scores)
 
             # Plot the density
-            density_bar_starts = [
-                left
-                for (left, _), freq in zip(
-                    uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
-                )
-                if freq > 0
-            ]
-            density_bar_widths = [
-                right - left
-                if right - left >= min_density_bar_width
-                else min_density_bar_width
-                for (left, right), freq in zip(
-                    uhist_y_scores.bins, uhist_y_scores.freqs, strict=True
-                )
-                if freq > 0
-            ]
-            density_bar_heights = [
-                density
-                for density, freq in zip(
+            populated_bins = [
+                (left, right, density)
+                for (left, right), density, freq in zip(
+                    uhist_y_scores.bins,
                     uhist_y_scores.densities,
                     uhist_y_scores.freqs,
                     strict=True,
                 )
                 if freq > 0
             ]
+            density_bar_starts = [left for left, _, _ in populated_bins]
+            density_bar_widths = [
+                right - left
+                if right - left >= min_density_bar_width
+                else min_density_bar_width
+                for left, right, _ in populated_bins
+            ]
+            density_bar_heights = [density for _, _, density in populated_bins]
             density_bar_log_range = 0
             if density_bar_heights:
                 density_bar_log_range = math.log10(
@@ -1695,18 +1825,18 @@ def build_reliability_diagram(
 
 
 def compute_dirac_indexes(uhist, dirac_threshold):
-    """Computes the dirac mass indexes of a histogram
+    """Identifies Dirac point-mass bins in an unsupervised histogram.
 
-    We declare a dirac mass bin if:
+    A bin is classified as a Dirac point mass if:
 
-    - it contains observations
-    - all existing neighboring bins are empty
-    - its length is less than ``dirac_threshold``
+    - it contains observations,
+    - all existing neighboring bins are empty, and
+    - its width is less than ``dirac_threshold``.
 
     Raises
     ------
     ValueError
-        If dirac_threshold is complex.
+        If ``dirac_threshold`` is complex.
     """
     _check_real_values(dirac_threshold, "dirac_threshold")
 

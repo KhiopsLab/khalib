@@ -17,8 +17,8 @@ Integer scores retain exact comparisons during histogram bin lookup.
 
 Histogram construction requires at least one score. Binary calibration also
 accepts empty score arrays and returns empty probability arrays.
-Only reliability diagrams require scores in the range [0, 1]; elsewhere finite
-scores outside histogram boundaries map to the nearest end bin.
+Only V-ECE and reliability diagrams require scores in the range [0, 1];
+elsewhere finite scores outside histogram boundaries map to the nearest end bin.
 
 Labels
 ------
